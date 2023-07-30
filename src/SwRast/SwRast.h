@@ -16,7 +16,6 @@ struct ProfilerStats {
     uint32_t TrianglesDrawn;
     uint32_t TrianglesClipped;
     uint32_t BinsFilled;
-    int64_t TotalElapsed[2];
     int64_t VertexSetup[2];
     int64_t Rasterize[2];
 
@@ -54,16 +53,20 @@ struct Framebuffer {
     static const uint32_t kTileSize = 4, kTileShift = 2, kTileMask = kTileSize - 1, kTileNumPixels = kTileSize * kTileSize;
 
     uint32_t Width, Height, TileStride;
-    std::unique_ptr<uint32_t[]> ColorBuffer;
-    std::unique_ptr<float[]> DepthBuffer;
+    uint32_t* ColorBuffer;
+    float* DepthBuffer;
 
     Framebuffer(uint32_t width, uint32_t height) {
         Width = (width + kTileMask) & ~kTileMask;
         Height = (height + kTileMask) & ~kTileMask;
         TileStride = Width / kTileSize;
 
-        ColorBuffer = std::make_unique<uint32_t[]>(Width * Height);
-        DepthBuffer = std::make_unique<float[]>(Width * Height);
+        ColorBuffer = (uint32_t*)_mm_malloc(Width * Height * 4, 64);
+        DepthBuffer = (float*)_mm_malloc(Width * Height * 4, 64);
+    }
+    ~Framebuffer() {
+        _mm_free(ColorBuffer);
+        _mm_free(DepthBuffer);
     }
 
     void Clear(uint32_t color, float depth) {
@@ -374,8 +377,6 @@ public:
 
     template<ShaderDef TShader>
     void DrawIndexed(VertexReader& vertexData, const TShader& shader) {
-        STAT_TIME_BEGIN(TotalElapsed);
-
         uint32_t pos = 0;
         uint32_t count = vertexData.Count / 3;
 
@@ -421,7 +422,6 @@ public:
                 (void*)&shader
             );
         }
-        STAT_TIME_END(TotalElapsed);
     }
 };
 

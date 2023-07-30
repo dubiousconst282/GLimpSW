@@ -43,9 +43,6 @@ struct PhongShader {
         swr::VFloat v = vars.GetSmooth(1);
         swr::VFloat4 diffuseColor = DiffuseTex->SampleNearest(u, v);
 
-        // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
-        // Re-orthogonalize T with respect to N
-
         swr::VFloat3 norm = swr::simd::normalize({ vars.GetSmooth(2), vars.GetSmooth(3), vars.GetSmooth(4) });
         swr::VFloat3 lightDir = swr::simd::normalize({
             LightPos.x - vars.GetSmooth(6),
@@ -60,7 +57,6 @@ struct PhongShader {
             diffuseColor.z * NdotL,
             diffuseColor.w,
         };
-        // auto color = swr::VFloat4{vars.W1, vars.W2, 1.0f - vars.W1 - vars.W2, 1.0f};
 
         auto rgba = swr::simd::PackRGBA(color);
         uint16_t alphaMask = _mm512_cmpgt_epu32_mask(rgba, _mm512_set1_epi32(128 << 24));
@@ -92,6 +88,8 @@ public:
     }
 
     void Render() {
+        auto renderStart = std::chrono::high_resolution_clock::now();
+
         _cam.Update();
 
         PhongShader shader = {
@@ -116,20 +114,11 @@ public:
             _lightPos = _cam.Position;
         }
 
-        // Vertex vertices[16];
-        // uint16_t indices[16];
-        // vertices[0] = { .x = -1.0f, .y = -1.0f, .z = -2.0f, .nx = 127 };
-        // vertices[1] = { .x = +1.0f, .y = -1.0f, .z = -2.0f, .ny = 127 };
-        // vertices[2] = { .x = +1.0f, .y = +1.0f, .z = -2.0f, .nz = 127 };
-
-        // indices[0] = 0;
-        // indices[1] = 1;
-        // indices[2] = 2;
-        // auto rd = swr::VertexReader((uint8_t*)vertices, (uint8_t*)indices, 3, swr::VertexReader::U16);
-        // _rast->DrawIndexed(rd, shader);
-
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
         _glTex->SetPixels(_tempPixels.get(), _fb->Width);
+
+        double totalElapsed = (std::chrono::high_resolution_clock::now() - renderStart).count() / 1000000.0;
+        swr::ProfilerStats& stats = swr::g_Stats;
 
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
 
@@ -137,10 +126,7 @@ public:
         drawList->AddImage(texId, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 1), ImVec2(1, 0));
 
         ImGui::Begin("Rasterizer Stats");
-
-        swr::ProfilerStats& stats = swr::g_Stats;
-        double totalTime = stats.TotalElapsed[0] / 1000000.0;
-        ImGui::Text("Frame: %.2fms (%.0f FPS) @ %dx%d", totalTime, 1000.0 / totalTime, _fb->Width, _fb->Height);
+        ImGui::Text("Frame: %.2fms (%.0f FPS) @ %dx%d", totalElapsed, 1000.0 / totalElapsed, _fb->Width, _fb->Height);
         ImGui::Text("Vertex setup: %.2fms", stats.VertexSetup[0] / 1000000.0);
         ImGui::Text("Rasterize: %.2fms", stats.Rasterize[0] / 1000000.0);
         ImGui::Text("Triangles: %.1fK (%.1fK clipped)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0);
@@ -148,8 +134,6 @@ public:
         ImGui::Checkbox("Wireframe", &_rast->EnableWireframe);
         stats.Reset();
         ImGui::End();
-
-        ImGui::ShowMetricsWindow();
     }
 };
 
