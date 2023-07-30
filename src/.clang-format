@@ -1,0 +1,15 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 140
+DerivePointerAlignment: false
+PointerAlignment: Left
+IndentAccessModifiers: false
+AccessModifierOffset: -4
+SpaceAfterTemplateKeyword: false
+
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortEnumsOnASingleLine: true
+Cpp11BracedListStyle: false
+BreakBeforeBinaryOperators: None
+
+# https://clang.llvm.org/docs/ClangFormatStyleOptions.html
