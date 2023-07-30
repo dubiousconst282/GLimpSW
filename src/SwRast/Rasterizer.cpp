@@ -3,7 +3,6 @@
 #include <execution>
 #include <ranges>
 #include <chrono>
-#include <unordered_set>
 
 #include "Misc.h"
 #include "SwRast.h"
@@ -22,14 +21,14 @@ static VInt EdgeWeight(VInt a, VInt x, VInt b, VInt y) {
     return w >> 4;
 }
 
-static VInt ComputeMinBB(VInt a, VInt b, VInt c, int vpSize) {
-    VInt r = simd::max(simd::min(simd::min(a, b), c), (vpSize << 4) / -2);
+static VInt ComputeMinBB(VInt a, VInt b, VInt c, int32_t vpSize) {
+    VInt r = simd::min(simd::max(simd::min(simd::min(a, b), c), (vpSize << 4) / -2), (vpSize << 4) / +2);
     r = (r + 15) >> 4;                // round up to int
-    r = r & ~Framebuffer::kTileMask;  // align min bb coords to tile boundary
+    r = r & ~(int32_t)Framebuffer::kTileMask;  // align min bb coords to tile boundary
     return r;
 }
-static VInt ComputeMaxBB(VInt a, VInt b, VInt c, int vpSize) {
-    VInt r = simd::min(simd::max(simd::max(a, b), c), (vpSize << 4) / +2);
+static VInt ComputeMaxBB(VInt a, VInt b, VInt c, int32_t vpSize) {
+    VInt r = simd::min(simd::max(simd::max(simd::max(a, b), c), (vpSize << 4) / -2), (vpSize << 4) / +2);
     r = (r + 15) >> 4;  // round up to int
     return r;
 }
@@ -42,7 +41,7 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
         pos = { pos.x * rw, pos.y * rw, pos.z * rw, rw };
     }
 
-    const auto LoadFixedPos = [&](int axis, float scale) -> std::array<VInt, 3> {
+    const auto LoadFixedPos = [&](uint32_t axis, float scale) -> std::array<VInt, 3> {
         return {
             simd::round2i(*(&Vertices[0].Position.x + axis) * scale),
             simd::round2i(*(&Vertices[1].Position.x + axis) * scale),
@@ -71,7 +70,7 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
 
     // Prepare attributes for interpolation
     for (uint32_t i = 0; i <= numAttribs; i++) {
-        int32_t j = i < numAttribs ? i : VaryingBuffer::AttribZ;
+        int32_t j = i < numAttribs ? (int32_t)i : VaryingBuffer::AttribZ;
 
         VFloat v0 = Vertices[0].Attribs[j];
         Vertices[1].Attribs[j] -= v0;
@@ -94,18 +93,22 @@ Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb)
     _fb = std::move(fb); 
 }
 
-void Rasterizer::SetupTriangles(TrianglePacket* tris, uint32_t mask, uint32_t numAttribs)
+void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs)
 {
-    tris->Setup(_fb->Width, _fb->Height, numAttribs);
+    int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
+    tris.Setup(width, height, numAttribs);
+
+    //TODO: backface culling (need to flip vertices or smt)
+    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ); //skip zero area triangles
 
     for (uint32_t i : BitIter(mask)) {
-        uint32_t minX = (tris->MinX[i] + _fb->Width / 2) >> kBinSizeLog2;
-        uint32_t minY = (tris->MinY[i] + _fb->Height / 2) >> kBinSizeLog2;
-        uint32_t maxX = (tris->MaxX[i] + _fb->Width / 2) >> kBinSizeLog2;
-        uint32_t maxY = (tris->MaxY[i] + _fb->Height / 2) >> kBinSizeLog2;
+        uint32_t minX = (uint32_t)((tris.MinX[i] + width / 2) >> kBinSizeLog2);
+        uint32_t minY = (uint32_t)((tris.MinY[i] + height / 2) >> kBinSizeLog2);
+        uint32_t maxX = (uint32_t)((tris.MaxX[i] + width / 2) >> kBinSizeLog2);
+        uint32_t maxY = (uint32_t)((tris.MaxY[i] + height / 2) >> kBinSizeLog2);
 
-        uint16_t triangleId = (uint16_t)((tris - _triangles.get()) * VFloat::Length + i);
-        uint32_t binStride = _fb->Width >> kBinSizeLog2;
+        uint16_t triangleId = (uint16_t)((&tris - _triangles.get()) * VFloat::Length + i);
+        uint32_t binStride = (uint32_t)width >> kBinSizeLog2;
 
         for (uint32_t y = minY; y <= maxY; y++) {
             for (uint32_t x = minX; x <= maxX; x++) {
@@ -114,11 +117,11 @@ void Rasterizer::SetupTriangles(TrianglePacket* tris, uint32_t mask, uint32_t nu
             }
         }
     }
-    STAT_INCREMENT(TrianglesDrawn, std::popcount(mask));
+    STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
 }
 
 // This impl performs no clipping and is intended for debugging only.
-void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, int i, uint32_t color = 0xFF'0000FF) {
+void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint32_t color = 0xFF'0000FF) {
     float sx = fb.Width * 0.5f, sy = fb.Height * 0.5f;
 
     for (uint32_t vi = 0; vi < 3; vi++) {
@@ -159,12 +162,17 @@ void Rasterizer::RenderBins(BinDrawFn drawFn, void* shaderPtr)
 
     auto binRange = std::ranges::iota_view(0u, _binsW * _binsH);
 
-#if DRAW_WIREFRAME
-    std::unordered_set<uint16_t> triangleIds;
-    for (uint32_t bid : binRange) {
-        triangleIds.insert(_bins[bid].begin(), _bins[bid].end());
+    std::vector<uint32_t> wireframeTids;
+
+    if (EnableWireframe) {
+        wireframeTids.resize(65536 / 32);
+
+        for (uint32_t bid : binRange) {
+            for (uint16_t tid : _bins[bid]) {
+                wireframeTids[tid / 32] |= 1u << (tid % 32);
+            }
+        }
     }
-#endif
 
     std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
         std::vector<uint16_t>& bin = _bins[bid];
@@ -180,19 +188,24 @@ void Rasterizer::RenderBins(BinDrawFn drawFn, void* shaderPtr)
         bin.clear();
     });
 
-#if DRAW_WIREFRAME
-    for (uint16_t tid : triangleIds) {
-        RenderWireframe(*_fb, _triangles[tid / VFloat::Length], tid % VFloat::Length);
+    // TODO: This is slow and shitty, maybe use some math magic to draw wireframe in the rasterizer?
+    //       https://math.stackexchange.com/questions/3748903/closest-point-to-triangle-edge-with-barycentric-coordinates
+    for (uint32_t i = 0; i < wireframeTids.size(); i++) {
+        if (wireframeTids[i] == 0) continue;
+
+        for (uint32_t j : BitIter(wireframeTids[i])) {
+            uint32_t tid = i * 32 + j;
+            RenderWireframe(*_fb, _triangles[tid / VFloat::Length], tid % VFloat::Length);
+        }
     }
-#endif
 
     STAT_TIME_END(Rasterize);
 }
 
 ProfilerStats g_Stats = {};
 
-void ProfilerStats::MeasureTime(uint64_t key[2], bool begin) {
-    uint64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+void ProfilerStats::MeasureTime(int64_t key[2], bool begin) {
+    int64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
 
     if (begin) {
         assert(key[1] == 0 && "STAT_TIME_X() must be called in pairs");

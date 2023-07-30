@@ -16,12 +16,12 @@ struct ProfilerStats {
     uint32_t TrianglesDrawn;
     uint32_t TrianglesClipped;
     uint32_t BinsFilled;
-    uint64_t TotalElapsed[2];
-    uint64_t VertexSetup[2];
-    uint64_t Rasterize[2];
+    int64_t TotalElapsed[2];
+    int64_t VertexSetup[2];
+    int64_t Rasterize[2];
 
     void Reset() { *this = {}; }
-    static void MeasureTime(uint64_t key[2], bool begin);
+    static void MeasureTime(int64_t key[2], bool begin);
 };
 extern ProfilerStats g_Stats;
 
@@ -51,7 +51,7 @@ private:
 
 struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
-    static const int kTileSize = 4, kTileShift = 2, kTileMask = kTileSize - 1, kTileNumPixels = kTileSize * kTileSize;
+    static const uint32_t kTileSize = 4, kTileShift = 2, kTileMask = kTileSize - 1, kTileNumPixels = kTileSize * kTileSize;
 
     uint32_t Width, Height, TileStride;
     std::unique_ptr<uint32_t[]> ColorBuffer;
@@ -158,7 +158,7 @@ struct VertexReader {
                 uint32_t elemSize = sizeof(A) * 8;
                 bool sign = elemSize != 32 && std::is_signed<A>();
 
-                for (int32_t pos = 0; pos < 32 && i < count; pos += elemSize, i++) {
+                for (uint32_t pos = 0; pos < 32 && i < count; pos += elemSize, i++) {
                     dest[i] = sign ? UnpackSNorm(data, pos, elemSize) : UnpackUNorm(data, pos, elemSize);
                 }
             }
@@ -166,26 +166,30 @@ struct VertexReader {
     }
 
     static VFloat UnpackUNorm(VInt data, uint32_t bitPos, uint32_t bitCount) {
-        uint32_t mask = (1 << bitCount) - 1;
+        assert(bitCount != 32);
+
+        int32_t mask = (1 << bitCount) - 1;
         VInt attr = (data >> bitPos) & mask;
         return simd::conv2f(attr) * (1.0f / mask);
     }
     static VFloat UnpackSNorm(VInt data, uint32_t bitPos, uint32_t bitCount) {
-        uint32_t scale = (1 << bitCount) / 2 - 1;
+        assert(bitCount != 32);
+
+        int32_t scale = (1 << bitCount) / 2 - 1;
         VInt attr = (data << (32 - bitCount - bitPos)) >> (32 - bitCount);
         return simd::conv2f(attr) * (1.0f / scale);
     }
 };
 
 struct ShadedVertexPacket {
-    static const int MaxAttribs = 12;
+    static const uint32_t MaxAttribs = 12;
 
     VFloat4 Position;
     VFloat Attribs[MaxAttribs];
 };
 
 struct VaryingBuffer {
-    static const int AttribX = -4, AttribY = -3, AttribZ = -2, AttribW = -1;  //&Position.z == &Attribs[-2];
+    static const int32_t AttribX = -4, AttribY = -3, AttribZ = -2, AttribW = -1;  //&Position.z == &Attribs[-2];
 
     const float* Attribs;
     uint32_t TileOffset;
@@ -206,10 +210,10 @@ struct VaryingBuffer {
     // Returns the value of the specified vertex attribute, without interpolation.
     // If `vertexId != 0`, returns `attr[vertexId] - attr[0]`.
     VFloat GetFlat(int32_t attrId, uint32_t vertexId = 0) const {
-        assert(attrId >= -4 && attrId < ShadedVertexPacket::MaxAttribs);
+        assert(attrId >= -4 && attrId < (int32_t)ShadedVertexPacket::MaxAttribs);
         assert(vertexId >= 0 && vertexId < 3);
 
-        int32_t idx = attrId * (sizeof(VFloat) / 4) + vertexId * (sizeof(ShadedVertexPacket) / 4);
+        int32_t idx = attrId * (int32_t)VFloat::Length + (int32_t)(vertexId * (sizeof(ShadedVertexPacket) / 4));
         return Attribs[idx];
     }
 
@@ -289,7 +293,7 @@ class Rasterizer {
     using BinDrawFn = void (*)(swr::Rasterizer&, void* shaderPtr, const BinnedTriangle&);
 
     // Setup edges and distribute to bins
-    void SetupTriangles(TrianglePacket* tris, uint32_t mask, uint32_t numAttribs);
+    void SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs);
 
     void RenderBins(BinDrawFn drawFn, void* shaderPtr);
 
@@ -299,20 +303,22 @@ class Rasterizer {
         Framebuffer& fb = *_fb.get();
         uint32_t i = bin.TriangleId % VFloat::Length;
 
-        uint32_t minX = tri.MinX[i] + fb.Width / 2;
-        uint32_t minY = tri.MinY[i] + fb.Height / 2;
-        uint32_t maxX = std::min(tri.MaxX[i] + fb.Width / 2, bin.X + kBinSize - 4);
-        uint32_t maxY = std::min(tri.MaxY[i] + fb.Height / 2, bin.Y + kBinSize - 4);
+        int32_t centerX = (int32_t)(fb.Width / 2), centerY = (int32_t)(fb.Height / 2);
+
+        uint32_t minX = (uint32_t)(tri.MinX[i] + centerX);
+        uint32_t minY = (uint32_t)(tri.MinY[i] + centerY);
+        uint32_t maxX = std::min((uint32_t)(tri.MaxX[i] + centerX), bin.X + kBinSize - 4);
+        uint32_t maxY = std::min((uint32_t)(tri.MaxY[i] + centerY), bin.Y + kBinSize - 4);
 
         VInt tileOffsX = VInt::ramp() & 3;
         VInt tileOffsY = VInt::ramp() >> 2;
 
         if (minX < bin.X) {
-            tileOffsX += (bin.X - minX);
+            tileOffsX += (int32_t)(bin.X - minX);
             minX = bin.X;
         }
         if (minY < bin.Y) {
-            tileOffsY += (bin.Y - minY);
+            tileOffsY += (int32_t)(bin.Y - minY);
             minY = bin.Y;
         }
 
@@ -362,6 +368,8 @@ class Rasterizer {
     }
 
 public:
+    bool EnableWireframe = false;
+
     Rasterizer(std::shared_ptr<Framebuffer> fb);
 
     template<ShaderDef TShader>
@@ -393,13 +401,13 @@ public:
                 _clipper.ClipTriangles(tri, shader.NumCustomAttribs + 4, renderMask, addedTriangles);
 
                 if (renderMask != 0) {
-                    SetupTriangles(tri, renderMask, shader.NumCustomAttribs);
+                    SetupTriangles(*tri, renderMask, shader.NumCustomAttribs);
                 }
                 if (renderMask != 0 || addedTriangles > 0) tri++;
 
                 for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
                     renderMask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
-                    SetupTriangles(tri++, renderMask, shader.NumCustomAttribs);
+                    SetupTriangles(*tri++, renderMask, shader.NumCustomAttribs);
                 }
             }
             STAT_TIME_END(VertexSetup);

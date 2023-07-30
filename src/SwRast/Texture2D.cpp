@@ -14,8 +14,8 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
     Height = height;
     Stride = width + 1;
 
-    uint32_t nominalMips = std::bit_width(std::min(width, height));
-    MipLevels = std::max(std::min(std::min(mipLevels, nominalMips), (uint32_t)VInt::Length), 1u);
+    uint32_t nominalMips = (uint32_t)std::bit_width(std::min(width, height));
+    MipLevels = std::max(std::min(std::min(mipLevels, nominalMips), VInt::Length), 1u);
 
     uint32_t offset = 0;
 
@@ -27,11 +27,11 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
 
     _scaleU = (float)width;
     _scaleV = (float)height;
-    _maskU = width - 1;
-    _maskV = height - 1;
+    _maskU = (int32_t)width - 1;
+    _maskV = (int32_t)height - 1;
 
-    _maskLerpU = width * (1 << kLerpFracBits) - 1;
-    _maskLerpV = height * (1 << kLerpFracBits) - 1;
+    _maskLerpU = (int32_t)(width << kLerpFracBits) - 1;
+    _maskLerpV = (int32_t)(height << kLerpFracBits) - 1;
     _scaleLerpU = (float)(_maskLerpU + 1);
     _scaleLerpV = (float)(_maskLerpV + 1);
 }
@@ -106,16 +106,16 @@ VFloat4 Texture2D::SampleNearest(VFloat u, VFloat v) const {
     VFloat su = u * _scaleU, sv = v * _scaleV;
     VInt ix = simd::round2i(su) & _maskU;
     VInt iy = simd::round2i(sv) & _maskV;
-    VInt stride = VInt(Stride);
+    VInt stride = (int32_t)Stride;
 
     VInt level = simd::trunc2i(CalcMipLevel(su, sv));
 
     if (_mm512_cmpgt_epi32_mask(level, VInt(0))) {
-        level = simd::min(simd::max(level, 0), MipLevels - 1);
+        level = simd::min(simd::max(level, 0), (int32_t)MipLevels - 1);
 
         ix = simd::shrl(ix, level) + VInt(_mm512_permutexvar_epi32(level, _mipOffsets.reg));
         iy = simd::shrl(iy, level);
-        stride = simd::shrl(Width, level) + 1;
+        stride = simd::shrl((int32_t)Width, level) + 1;
     }
     VInt colors = GatherPixels(ix + iy * stride);
     float scale = 1.0f / 255;
@@ -144,7 +144,7 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
 
     // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
     // Row 1
-    VInt indices00 = ix + iy * Stride;
+    VInt indices00 = ix + iy * (int32_t)Stride;
     VInt indices10 = indices00 + 1;
     VInt colors00 = GatherPixels(indices00);
     VInt colors10 = GatherPixels(indices10);
@@ -157,8 +157,8 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
     VInt gaRow1 = simd::lerp16(ga00, ga10, fx2);
 
     // Row 2
-    VInt colors01 = GatherPixels(indices00 + Stride);
-    VInt colors11 = GatherPixels(indices10 + Stride);
+    VInt colors01 = GatherPixels(indices00 + (int32_t)Stride);
+    VInt colors11 = GatherPixels(indices10 + (int32_t)Stride);
     VInt rb01 = colors01 & oddByteMask;
     VInt rb11 = colors11 & oddByteMask;
     VInt ga01 = (colors01 >> 8) & oddByteMask;

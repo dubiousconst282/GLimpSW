@@ -78,8 +78,8 @@ _SIMD_DEF_OPERATORS(VFloat, ps, mul_ps, ps);
 inline VFloat operator/(VFloat a, VFloat b) { return _mm512_div_ps(a, b); }
 
 _SIMD_DEF_OPERATORS(VInt, epi32, mullo_epi32, si512);
-inline VInt operator>>(VInt a, int b) { return _mm512_srai_epi32(a, b); }
-inline VInt operator<<(VInt a, int b) { return _mm512_slli_epi32(a, b); }
+inline VInt operator>>(VInt a, uint32_t b) { return _mm512_srai_epi32(a, b); }
+inline VInt operator<<(VInt a, uint32_t b) { return _mm512_slli_epi32(a, b); }
 
 inline VFloat operator-(VFloat a) { return a ^ -0.0f; }
 
@@ -153,7 +153,7 @@ static VFloat cos(VFloat a) {
     u = fma(u, s, +0.8323502727e-2f);
     u = fma(u, s, -0.1666651368e+0f);
     u = fma(s * d, u, d);
-    u = u ^ re2f(shrl(~0u ^ q, 31));  // if ((q & 1) == 0) u = -u;
+    u = u ^ re2f(shrl(~0 ^ q, 31));  // if ((q & 1) == 0) u = -u;
     return u;
 }
 

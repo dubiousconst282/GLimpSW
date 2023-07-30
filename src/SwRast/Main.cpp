@@ -145,6 +145,7 @@ public:
         ImGui::Text("Rasterize: %.2fms", stats.Rasterize[0] / 1000000.0);
         ImGui::Text("Triangles: %.1fK (%.1fK clipped)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0);
         ImGui::Text("Bins filled: %.1fK", stats.BinsFilled / 1000.0);
+        ImGui::Checkbox("Wireframe", &_rast->EnableWireframe);
         stats.Reset();
         ImGui::End();
 

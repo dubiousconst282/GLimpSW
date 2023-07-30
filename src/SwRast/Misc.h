@@ -13,7 +13,7 @@ public:
         _mask &= (_mask - 1);
         return *this;
     }
-    uint32_t operator*() const { return std::countr_zero(_mask); }
+    uint32_t operator*() const { return (uint32_t)std::countr_zero(_mask); }
     friend bool operator!=(const BitIter& a, const BitIter& b) { return a._mask != b._mask; }
 
     BitIter begin() const { return *this; }

@@ -12,8 +12,8 @@ Texture2D Texture2D::LoadImage(std::string_view filename, uint32_t mipLevels) {
     int width, height, channels;
     auto pixels = stbi_load(filename.data(), &width, &height, &channels, 4);
 
-    auto tex = Texture2D(width, height, mipLevels);
-    tex.SetPixels((uint32_t*)pixels, width);
+    auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
+    tex.SetPixels((uint32_t*)pixels, tex.Width);
 
     stbi_image_free(pixels);
 
@@ -35,7 +35,7 @@ void Framebuffer::GetPixels(uint32_t* __restrict dest, uint32_t stride) const {
 void Framebuffer::SaveImage(std::string_view filename) const {
     auto pixels = std::make_unique<uint32_t[]>(Width * Height);
     GetPixels(pixels.get(), Width);
-    stbi_write_png(filename.data(), Width, Height, 4, pixels.get(), Width * 4);
+    stbi_write_png(filename.data(), (int)Width, (int)Height, 4, pixels.get(), (int)Width * 4);
 }
 
 };  // namespace swr

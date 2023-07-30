@@ -14,8 +14,7 @@ static float GetPlaneDist(const Clipper::Vertex& vtx, Clipper::Plane plane, floa
 void Clipper::ClipAroundPlane(Plane plane, uint32_t numAttribs) {
     if (Count < 3) return;  // triangle was fully clipped away
 
-    float planeDist = 1.0f;
-    //float planeDist = plane < Plane::Near ? GuardBandPlaneDistXY[(uint32_t)plane / 2] : 1.0f;
+    float planeDist = plane < Plane::Near ? GuardBandPlaneDistXY[(uint32_t)plane / 2] : 1.0f;
     uint8_t tempIndices[24];
     uint32_t j = 0;
 
@@ -94,6 +93,7 @@ void Clipper::ClipTriangles(TrianglePacket* tris, uint32_t numAttribs, uint32_t&
             auto c = _mm_maskz_mov_epi8(m, _mm_set1_epi8(1 << (int)p));
             outcode = _mm_or_si128(outcode, c);
         };
+        //TODO: consider guard-band here to avoid pointless clipper invocations
         MaskN(pos.x, Clipper::Plane::Left);
         MaskP(pos.x, Clipper::Plane::Right);
         MaskN(pos.y, Clipper::Plane::Bottom);
@@ -127,7 +127,7 @@ void Clipper::ClipTriangles(TrianglePacket* tris, uint32_t numAttribs, uint32_t&
 
         // Triangulate result polygon
         for (uint32_t j = 0; j < Count - 2; j++) {
-            uint32_t freeIdx = std::countr_one(renderMask | (nonTrivialMask & (~1 << i)));
+            uint32_t freeIdx = (uint32_t)std::countr_one(renderMask | (nonTrivialMask & (~1 << i)));
 
             if (freeIdx < VFloat::Length) {
                 StoreTriangle(*tris, freeIdx, j, numAttribs);
