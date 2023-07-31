@@ -126,23 +126,10 @@ struct VertexReader {
         return 0;
     }
 
-    // TODO: Optimize index buffer loads using 16x3 transposes
-    //       https://stackoverflow.com/questions/29519222/how-to-transpose-a-16x16-matrix-using-simd-instructions
-    VInt ReadIndices(size_t offset) {
-        VInt indices;
-
-        switch (IndexFormat) {
-            case U32: indices = _mm512_loadu_epi32(&IndexBuffer[offset * 4]); break;
-            case U16: indices = _mm512_cvtepu16_epi32(_mm256_loadu_epi16(&IndexBuffer[offset * 2]));
-            case U8: indices = _mm512_cvtepu8_epi32(_mm_loadu_epi8(&IndexBuffer[offset * 1]));
-            default: assert(!"Unknown index buffer format");
-        }
-        // Mask-out reads beyond buffer size to zero to prevent rasterizer from rendering garbage
-        if (offset + VInt::Length > Count) {
-            indices = _mm512_maskz_mov_epi32(_mm512_cmplt_epi32_mask(VInt::ramp(), VInt(Count - offset)), indices);
-        }
-        return indices;
-    }
+    VInt ReadIndices(size_t offset);
+    
+    // Reads and de-interleaves indices for 3x16 vertices.
+    void ReadTriangleIndices(size_t offset, VInt indices[3]);
 
     VFloat ReadAttribF(int offset, int stride) const {
         return VFloat::gather((float*)&VertexBuffer[offset], _Indices * stride);
@@ -394,12 +381,12 @@ public:
             auto endTri = _triangles.get() + kTriangleBatchSize - 24;  // reserve 24*vec tris for clipping
 
             for (; pos < count && tri < endTri; pos += VFloat::Length) {
+                VInt indices[3];
+                vertexData.ReadTriangleIndices(pos * 3, indices);
+
                 // Shade vertices
                 for (uint32_t vi = 0; vi < 3; vi++) {
-                    for (uint32_t i = 0; i < VFloat::Length; i++) {
-                        uint32_t j = pos * 3 + i * 3 + vi;
-                        vertexData._Indices[i] = (int32_t)vertexData.ReadIndex(j);
-                    }
+                    vertexData._Indices = indices[vi];
                     shader.ShadeVertices(vertexData, tri->Vertices[vi]);
                 }
                 
