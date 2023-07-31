@@ -12,7 +12,7 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
 
     Width = width;
     Height = height;
-    Stride = width + 1;
+    StrideLog2 = (uint32_t)std::countr_zero(width);
 
     uint32_t nominalMips = (uint32_t)std::bit_width(std::min(width, height));
     MipLevels = std::max(std::min(std::min(mipLevels, nominalMips), VInt::Length), 1u);
@@ -21,9 +21,9 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
 
     for (uint32_t i = 0; i < MipLevels; i++) {
         _mipOffsets[i] = (int32_t)offset;
-        offset += ((Height >> i) + 1) * ((Width >> i) + 1);
+        offset += (Height >> i) * (Width >> i);
     }
-    Data = std::make_unique<uint32_t[]>(offset);
+    Data = std::make_unique<uint32_t[]>(offset + 16); //add a bit of padding because the mipmap downsampler works with 8x2 blocks
 
     _scaleU = (float)width;
     _scaleV = (float)height;
@@ -37,15 +37,9 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
 }
 
 void Texture2D::SetPixels(const uint32_t* pixels, uint32_t stride) {
-    for (uint32_t y = 0; y <= Height; y++) {
-        uint32_t srcY = y == Height ? y - 1 : y;
-        auto srcRow = &pixels[srcY * stride];
-        auto dstRow = &Data[y * Stride];
-
-        std::memcpy(dstRow, srcRow, Width * 4);
-        Data[Width + y * Stride] = pixels[Width - 1];
+    for (uint32_t y = 0; y < Height; y++) {
+        std::memcpy(&Data[y * Width], &pixels[y * stride], Width * 4);
     }
-
     GenerateMips();
 }
 
@@ -53,29 +47,21 @@ void Texture2D::SetPixels(const uint32_t* pixels, uint32_t stride) {
 void Texture2D::GenerateMips() {
     for (uint32_t i = 0; i < MipLevels - 1; i++) {
         uint32_t* src = &Data[(size_t)_mipOffsets[i]];
-        uint32_t* dest = &Data[(size_t)_mipOffsets[i + 1]];
-        uint32_t stride = (Width >> i) + 1;
-        uint32_t dstride = (stride / 2) + 1;
+        uint32_t* dst = &Data[(size_t)_mipOffsets[i + 1]];
         uint32_t w = Width >> i, h = Height >> i;
 
         for (uint32_t y = 0; y < h; y += 2) {
-            uint32_t* destRow = &dest[(y / 2) * dstride];
-
             for (uint32_t x = 0; x < w; x += 8) {
-                auto rows = _mm256_avg_epu8(_mm256_loadu_si256((__m256i*)&src[x + (y + 0) * stride]),
-                                            _mm256_loadu_si256((__m256i*)&src[x + (y + 1) * stride]));
+                auto rows = _mm256_avg_epu8(_mm256_loadu_si256((__m256i*)&src[x + (y + 0) * w]),
+                                            _mm256_loadu_si256((__m256i*)&src[x + (y + 1) * w]));
 
                 auto cols = _mm256_avg_epu8(rows, _mm256_bsrli_epi128(rows, 4));
                 auto res = _mm256_permutevar8x32_epi32(cols, _mm256_setr_epi32(0, 2, 4, 6, -1, -1, -1, -1));
 
-                _mm_storeu_si128((__m128i*)&destRow[x / 2], _mm256_castsi256_si128(res));
+                _mm_storeu_si128((__m128i*)dst, _mm256_castsi256_si128(res));
+                dst += 4;
             }
-            destRow[w / 2] = destRow[w / 2 - 1];
         }
-
-        uint32_t* lastRow = &dest[(h / 2 - 1) * dstride];
-        uint32_t* padRow = &dest[(h / 2) * dstride];
-        std::memcpy(padRow, lastRow, dstride * 4);
     }
 }
 
@@ -102,22 +88,24 @@ static VFloat CalcMipLevel(VFloat scaledU, VFloat scaledV) {
     return simd::approx_log2(maxDeltaSq) * 0.5f;
 }
 
+// TODO: experiment with tiling/swizzling - https://lemire.me/blog/2018/01/09/how-fast-can-you-bit-interleave-32-bit-integers-simd-edition/
+
 VFloat4 Texture2D::SampleNearest(VFloat u, VFloat v) const {
     VFloat su = u * _scaleU, sv = v * _scaleV;
     VInt ix = simd::round2i(su) & _maskU;
     VInt iy = simd::round2i(sv) & _maskV;
-    VInt stride = (int32_t)Stride;
 
     VInt level = simd::trunc2i(CalcMipLevel(su, sv));
+    VInt stride = (int32_t)StrideLog2;
 
     if (_mm512_cmpgt_epi32_mask(level, VInt(0))) {
         level = simd::min(simd::max(level, 0), (int32_t)MipLevels - 1);
 
         ix = simd::shrl(ix, level) + VInt(_mm512_permutexvar_epi32(level, _mipOffsets.reg));
         iy = simd::shrl(iy, level);
-        stride = simd::shrl((int32_t)Width, level) + 1;
+        stride -= level;
     }
-    VInt colors = GatherPixels(ix + iy * stride);
+    VInt colors = GatherPixels(ix + (iy << stride));
     float scale = 1.0f / 255;
 
     return {
@@ -144,8 +132,10 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
 
     // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
     // Row 1
-    VInt indices00 = ix + iy * (int32_t)Stride;
-    VInt indices10 = indices00 + 1;
+    VInt indices00 = ix + (iy << StrideLog2);
+    // indices10 = indices00 + (ix < Width - 1)
+    //           = indices00 - (ix < Width - 1 ? -1 : 0)
+    VInt indices10 = _mm512_sub_epi32(indices00, _mm512_movm_epi32(_mm512_cmplt_epi32_mask(ix, _mm512_set1_epi32((int32_t)Width - 1))));
     VInt colors00 = GatherPixels(indices00);
     VInt colors10 = GatherPixels(indices10);
     VInt oddByteMask = 0x00FF'00FF;
@@ -157,8 +147,8 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
     VInt gaRow1 = simd::lerp16(ga00, ga10, fx2);
 
     // Row 2
-    VInt colors01 = GatherPixels(indices00 + (int32_t)Stride);
-    VInt colors11 = GatherPixels(indices10 + (int32_t)Stride);
+    VInt colors01 = GatherPixels(indices00 + (int32_t)Width);
+    VInt colors11 = GatherPixels(indices10 + (int32_t)Width);
     VInt rb01 = colors01 & oddByteMask;
     VInt rb11 = colors11 & oddByteMask;
     VInt ga01 = (colors01 >> 8) & oddByteMask;
@@ -178,6 +168,15 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
         simd::conv2f((rbCol >> 16) & 0xFF) * scale,
         simd::conv2f((gaCol >> 16) & 0xFF) * scale,
     };
+}
+
+VFloat4 Texture2D::SampleHybrid(VFloat u, VFloat v) const {
+    VFloat level = CalcMipLevel(u * _scaleU, v * _scaleV);
+
+    if (_mm512_cmp_ps_mask(level, VFloat(1.25f), _CMP_GT_OQ)) [[likely]] {
+        return SampleNearest(u, v);
+    }
+    return SampleLinear(u, v);
 }
 
 }; // namespace swr

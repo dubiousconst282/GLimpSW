@@ -81,6 +81,9 @@ _SIMD_DEF_OPERATORS(VInt, epi32, mullo_epi32, si512);
 inline VInt operator>>(VInt a, uint32_t b) { return _mm512_srai_epi32(a, b); }
 inline VInt operator<<(VInt a, uint32_t b) { return _mm512_slli_epi32(a, b); }
 
+inline VInt operator>>(VInt a, VInt b) { return _mm512_srav_epi32(a, b); }
+inline VInt operator<<(VInt a, VInt b) { return _mm512_sllv_epi32(a, b); }
+
 inline VFloat operator-(VFloat a) { return a ^ -0.0f; }
 
 namespace simd {
@@ -102,6 +105,9 @@ inline VFloat max(VFloat x, VFloat y) { return _mm512_max_ps(x, y); }
 inline VFloat fma(VFloat x, VFloat y, VFloat z) { return _mm512_fmadd_ps(x, y, z); }
 //x * y - z
 inline VFloat fms(VFloat x, VFloat y, VFloat z) { return _mm512_fmsub_ps(x, y, z); }
+
+// approximate sqrt
+inline VFloat sqrt14(VFloat x) { return _mm512_rcp14_ps(_mm512_rsqrt14_ps(x)); }
 
 // 16-bit linear interpolation with 15-bit interpolant: a + (b - a) * t
 // mulhrs(a, b) = (a * b + (1 << 14)) >> 15

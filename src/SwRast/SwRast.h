@@ -26,8 +26,9 @@ struct ProfilerStats {
 extern ProfilerStats g_Stats;
 
 struct Texture2D {
-    uint32_t Width, Height, Stride, MipLevels;
-    std::unique_ptr<uint32_t[]> Data; //RGBA8 pixel data. Last row and columns are duplicated for simplicity during linear sampling.
+    uint32_t Width, Height, MipLevels;
+    uint32_t StrideLog2; //Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
+    std::unique_ptr<uint32_t[]> Data;  // RGBA8 pixel data.
 
     Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels);
 
@@ -35,8 +36,14 @@ struct Texture2D {
 
     void SetPixels(const uint32_t* pixels, uint32_t stride);
 
+    // NearestMipmapNearest
     VFloat4 __vectorcall SampleNearest(VFloat u, VFloat v) const;
+
+    // Linear (no mipmap)
     VFloat4 __vectorcall SampleLinear(VFloat u, VFloat v) const;
+
+    // Mag: Linear, Min: NearestMipmapNearest
+    VFloat4 __vectorcall SampleHybrid(VFloat u, VFloat v) const;
 
 private:
     float _scaleU, _scaleV, _scaleLerpU, _scaleLerpV;
