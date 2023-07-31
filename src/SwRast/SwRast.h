@@ -3,6 +3,7 @@
 #include <memory>
 #include <string_view>
 #include <vector>
+#include <functional>
 
 #include "SIMD.h"
 
@@ -191,6 +192,19 @@ struct ShadedVertexPacket {
     VFloat Attribs[MaxAttribs];
 };
 
+struct TrianglePacket {
+    VInt MinX, MinY, MaxX, MaxY;
+    VInt Weight0, Weight1, Weight2;
+    VInt A01, A12, A20;
+    VInt B01, B12, B20;
+    VFloat RcpArea;
+
+    ShadedVertexPacket Vertices[3];
+
+    // Computes edge variables based on shaded vertices.
+    void Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttribs);
+};
+
 struct VaryingBuffer {
     static const int32_t AttribX = -4, AttribY = -3, AttribZ = -2, AttribW = -1;  //&Position.z == &Attribs[-2];
 
@@ -221,7 +235,7 @@ struct VaryingBuffer {
     }
 
     void ApplyPerspectiveCorrection() {
-        // Perspective correction - https://stackoverflow.com/a/24460895
+        // https://stackoverflow.com/a/24460895
         VFloat v0 = GetFlat(AttribW, 0);
         VFloat v1 = GetFlat(AttribW, 1);
         VFloat v2 = GetFlat(AttribW, 2);
@@ -230,19 +244,6 @@ struct VaryingBuffer {
         W1 *= vp * v1;
         W2 *= vp * v2;
     }
-};
-
-struct TrianglePacket {
-    VInt MinX, MinY, MaxX, MaxY;
-    VInt Weight0, Weight1, Weight2;
-    VInt A01, A12, A20;
-    VInt B01, B12, B20;
-    VFloat RcpArea;
-
-    ShadedVertexPacket Vertices[3];
-
-    // Computes edge variables based on shaded vertices.
-    void Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttribs);
 };
 
 struct Clipper {
@@ -281,24 +282,22 @@ concept ShaderDef =
     };
 
 class Rasterizer {
-    static const int kTriangleBatchSize = 4096 / VFloat::Length, kBinSizeLog2 = 6, kBinSize = 1 << kBinSizeLog2;
+    static const int kTriangleBatchSize = 8192 / VFloat::Length, kBinSizeLog2 = 7, kBinSize = 1 << kBinSizeLog2;
 
     std::shared_ptr<Framebuffer> _fb;
     std::unique_ptr<TrianglePacket[]> _triangles;    // Working triangle batch
     std::unique_ptr<std::vector<uint16_t>[]> _bins;  // Bins containing triangle indices
-    uint32_t _binsW, _binsH;
+    uint32_t _binsW, _binsH, _numBins;
     Clipper _clipper;
 
     struct BinnedTriangle {
         uint32_t X, Y;
         uint16_t TriangleId;
     };
-    using BinDrawFn = void (*)(swr::Rasterizer&, void* shaderPtr, const BinnedTriangle&);
-
     // Setup edges and distribute to bins
     void SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs);
 
-    void RenderBins(BinDrawFn drawFn, void* shaderPtr);
+    void RenderBins(std::function<void(const BinnedTriangle&)> drawFn);
 
     template<ShaderDef TShader>
     void DrawBinnedTriangle(const TShader& shader, const BinnedTriangle& bin) {
@@ -413,14 +412,8 @@ public:
             }
             STAT_TIME_END(VertexSetup);
 
-            // Render bins
             // clang-format off
-            RenderBins(
-                [](auto rast, auto shaderPtr, auto bin) {
-                    rast.DrawBinnedTriangle(*(TShader*)shaderPtr, bin);
-                },
-                (void*)&shader
-            );
+            RenderBins([&](auto& bt) { DrawBinnedTriangle(shader, bt); });
         }
     }
 };

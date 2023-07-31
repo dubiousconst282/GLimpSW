@@ -78,21 +78,6 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
     }
 }
 
-Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb)
-{
-    _triangles = std::make_unique<TrianglePacket[]>(kTriangleBatchSize);
-
-    _binsW = (fb->Width + kBinSize - 1) >> kBinSizeLog2;
-    _binsH = (fb->Height + kBinSize - 1) >> kBinSizeLog2;
-    _bins = std::make_unique<std::vector<uint16_t>[]>(_binsW * _binsH);
-
-    const float maxViewSize = 2048.0f;
-    _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb->Width;
-    _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb->Height;
-
-    _fb = std::move(fb); 
-}
-
 void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs)
 {
     int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
@@ -120,8 +105,23 @@ void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t nu
     STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
 }
 
+Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
+    _triangles = std::make_unique<TrianglePacket[]>(kTriangleBatchSize);
+
+    _binsW = (fb->Width + kBinSize - 1) >> kBinSizeLog2;
+    _binsH = (fb->Height + kBinSize - 1) >> kBinSizeLog2;
+    _numBins = _binsW * _binsH;
+    _bins = std::make_unique<std::vector<uint16_t>[]>(_numBins);
+
+    const float maxViewSize = 2048.0f;
+    _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb->Width;
+    _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb->Height;
+
+    _fb = std::move(fb);
+}
+
 // This impl performs no clipping and is intended for debugging only.
-void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint32_t color = 0xFF'0000FF) {
+static void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint32_t color = 0xFF'0000FF) {
     float sx = fb.Width * 0.5f, sy = fb.Height * 0.5f;
 
     for (uint32_t vi = 0; vi < 3; vi++) {
@@ -156,8 +156,7 @@ void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uin
     }
 }
 
-void Rasterizer::RenderBins(BinDrawFn drawFn, void* shaderPtr)
-{
+void Rasterizer::RenderBins(std::function<void(const BinnedTriangle&)> drawFn) {
     STAT_TIME_BEGIN(Rasterize);
 
     auto binRange = std::ranges::iota_view(0u, _binsW * _binsH);
@@ -176,14 +175,14 @@ void Rasterizer::RenderBins(BinDrawFn drawFn, void* shaderPtr)
 
     std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
         std::vector<uint16_t>& bin = _bins[bid];
-        BinnedTriangle info = {
+
+        BinnedTriangle bt = {
             .X = (bid % _binsW) * kBinSize,
             .Y = (bid / _binsW) * kBinSize,
         };
-
         for (uint16_t triangleId : bin) {
-            info.TriangleId = triangleId;
-            drawFn(*this, shaderPtr, info);
+            bt.TriangleId = triangleId;
+            drawFn(bt);
         }
         bin.clear();
     });

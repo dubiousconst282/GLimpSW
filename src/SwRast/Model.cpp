@@ -41,9 +41,12 @@ std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
 
 Model::Model(std::string_view path) {
     const auto processFlags = aiProcess_Triangulate | aiProcess_GenNormals | aiProcess_CalcTangentSpace |
-                              aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices | aiProcess_FlipUVs;
+                              aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices | aiProcess_FlipUVs |
+                              aiProcess_SplitLargeMeshes;
 
     Assimp::Importer imp;
+    imp.SetPropertyInteger(AI_CONFIG_PP_SLM_VERTEX_LIMIT, 65535);
+
     const aiScene* scene = imp.ReadFile(path.data(), processFlags);
 
     if (!scene || !scene->HasMeshes()) {

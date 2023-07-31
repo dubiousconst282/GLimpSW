@@ -3,8 +3,6 @@
 #include "SwRast.h"
 #include <glm/gtx/euler_angles.hpp>
 
-//https://github.com/syoyo/tinygltf
-//https://learnopengl.com/Getting-started/Camera
 struct Camera {
     glm::vec3 Position, _ViewPosition;
     glm::quat Rotation;
@@ -23,10 +21,11 @@ struct Camera {
         float sensitivity = io.DeltaTime * 0.25f;
         float speed = io.DeltaTime * MoveSpeed;
         float pitchRange = glm::pi<float>() / 2.0f;
-        float damping = 0.3f; //TODO: calculate this based on dt
+        float damping = 1.0f - powf(0.00001f, io.DeltaTime);  // https://www.construct.net/en/blogs/ashleys-blog-2/using-lerp-delta-time-924
+
         glm::vec3 mv(0);
 
-        if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow)) {
+        if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) && !ImGuizmo::IsUsing()) {
             if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 float rx = io.MouseDelta.x * sensitivity;
                 float ry = io.MouseDelta.y * sensitivity;
@@ -51,12 +50,6 @@ struct Camera {
         Rotation = glm::slerp(Rotation, destRotation, damping);
 
         AspectRatio = io.DisplaySize.x / io.DisplaySize.y;
-
-        ImGui::Begin("Camera");
-        ImGui::Text("D %.3f  %f", damping, MoveSpeed);
-        ImGui::InputFloat3("Pos", &Position.x);
-        ImGui::InputFloat2("Rot", &Euler.x);
-        ImGui::End();
     }
 
     static float NormalizeRadians(float ang) {

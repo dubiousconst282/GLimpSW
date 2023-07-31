@@ -26,7 +26,7 @@ struct Vertex {
 
 class Model {
 public:
-    using VertexIndex = uint32_t;
+    using VertexIndex = uint16_t;
 
     std::string BasePath;
 

@@ -9,6 +9,7 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <ImGuizmo.h>
 
 #include "Camera.h"
 
@@ -21,6 +22,7 @@ struct PhongShader {
     glm::mat4 ProjMat;
     glm::vec3 LightPos;
     const swr::Texture2D* DiffuseTex;
+    const swr::Texture2D* NormalTex;
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
         auto pos = swr::VFloat4{ .w = 1.0f };
@@ -79,9 +81,10 @@ public:
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _model = std::make_unique<Model>("Models/Sponza/Sponza.gltf");
+        //_model = std::make_unique<Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<Model>("Models/San_Miguel/san-miguel-low-poly.obj");
         _cam = Camera();
-        _cam.MoveSpeed = 20.0f;
+        _cam.MoveSpeed = 15.0f;
 
         _glTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
@@ -134,6 +137,23 @@ public:
         ImGui::Checkbox("Wireframe", &_rast->EnableWireframe);
         stats.Reset();
         ImGui::End();
+
+        DrawTranslationGizmo(_lightPos);
+    }
+
+    void DrawTranslationGizmo(glm::vec3& pos) {
+        ImGuizmo::BeginFrame();
+
+        ImGuiIO& io = ImGui::GetIO();
+        ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+
+        glm::mat4 viewMat = _cam.GetViewMatrix();
+        glm::mat4 projMat = _cam.GetProjectionMatrix();
+        glm::mat4 lightMat = glm::translate(glm::identity<glm::mat4>(), pos);
+
+        if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, &lightMat[0].x)) {
+            pos = lightMat[3];
+        }
     }
 };
 
