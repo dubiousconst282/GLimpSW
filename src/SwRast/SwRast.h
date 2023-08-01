@@ -79,8 +79,9 @@ struct Framebuffer {
 
     void Clear(uint32_t color, float depth) {
         std::fill(&ColorBuffer[0], &ColorBuffer[Width * Height], color);
-        std::fill(&DepthBuffer[0], &DepthBuffer[Width * Height], depth);
+        ClearDepth(depth);
     }
+    void ClearDepth(float depth) { std::fill(&DepthBuffer[0], &DepthBuffer[Width * Height], depth); }
 
     size_t GetPixelOffset(uint32_t x, uint32_t y) const {
         size_t tileId = (x >> kTileShift) + (y >> kTileShift) * TileStride;
@@ -91,6 +92,18 @@ struct Framebuffer {
     void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) const {
         _mm512_mask_storeu_epi32(&ColorBuffer[offset], mask, color);
         _mm512_mask_storeu_ps(&DepthBuffer[offset], mask, depth);
+    }
+
+    VFloat SampleDepth(VFloat x, VFloat y) const {
+        VInt ix = simd::round2i(x * (int32_t)Width);
+        VInt iy = simd::round2i(y * (int32_t)Height);
+
+        VInt tileId = (ix >> kTileShift) + (iy >> kTileShift) * (int32_t)TileStride;
+        VInt pixelOffset = (ix & kTileMask) + (iy & kTileMask) * kTileSize;
+        VInt indices = tileId * kTileNumPixels + pixelOffset;
+        uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
+
+        return _mm512_mask_i32gather_ps(_mm512_setzero_ps(), boundMask, indices, DepthBuffer, 4);
     }
 
     void GetPixels(uint32_t* dest, uint32_t stride) const;

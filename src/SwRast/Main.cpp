@@ -17,15 +17,17 @@
 #include "QuickGL.h"
 
 struct PhongShader {
-    static const uint32_t NumCustomAttribs = 9;
+    static const uint32_t NumCustomAttribs = 12;
 
     glm::mat4 ProjMat;
     glm::vec3 LightPos;
+    glm::mat4 ShadowProjMat;
+    const swr::Framebuffer* ShadowBuffer;
     const swr::Texture2D* DiffuseTex;
     const swr::Texture2D* NormalTex;
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        auto pos = swr::VFloat4{ .w = 1.0f };
+        swr::VFloat4 pos = { .w = 1.0f };
         data.ReadAttribs(&Vertex::x, &pos.x, 3);
         vars.Position = swr::simd::TransformVector(ProjMat, pos);
 
@@ -36,6 +38,16 @@ struct PhongShader {
         vars.Attribs[6] = pos.x;
         vars.Attribs[7] = pos.y;
         vars.Attribs[8] = pos.z;
+
+        if (ShadowBuffer != nullptr) {
+            swr::VFloat4 shadowPos = swr::simd::TransformVector(ShadowProjMat, pos);
+            swr::VFloat shadowRcpW = _mm512_rcp14_ps(shadowPos.w);
+            swr::VFloat bias = 0.0008f;
+
+            vars.Attribs[9] = shadowPos.x * shadowRcpW * 0.5f + 0.5f;
+            vars.Attribs[10] = shadowPos.y * shadowRcpW * 0.5f + 0.5f;
+            vars.Attribs[11] = shadowPos.z * shadowRcpW - bias;
+        }
     }
 
     void ShadePixels(const swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
@@ -77,12 +89,23 @@ struct PhongShader {
             LightPos.y - vars.GetSmooth(7),
             LightPos.z - vars.GetSmooth(8),
         });
-        swr::VFloat NdotL = swr::simd::max(swr::simd::dot(N, lightDir), 0.0f);
+        swr::VFloat diffuseLight = swr::simd::max(swr::simd::dot(N, lightDir), 0.0f);
+        swr::VFloat shadowLight = 1.0f;
+
+        if (ShadowBuffer != nullptr) [[unlikely]] {
+            swr::VFloat sx = vars.GetSmooth(9);
+            swr::VFloat sy = vars.GetSmooth(10);
+            swr::VFloat currentDepth = vars.GetSmooth(11);
+            swr::VFloat closestDepth = ShadowBuffer->SampleDepth(sx, sy);
+            // closestDepth > pos.z ? 1.0 : 0.0
+            shadowLight = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(closestDepth, currentDepth, _CMP_GE_OQ), shadowLight);
+        }
+        swr::VFloat combinedLight = diffuseLight * shadowLight + 0.3;
 
         swr::VFloat4 color = {
-            diffuseColor.x * NdotL,
-            diffuseColor.y * NdotL,
-            diffuseColor.z * NdotL,
+            diffuseColor.x * combinedLight,
+            diffuseColor.y * combinedLight,
+            diffuseColor.z * combinedLight,
             diffuseColor.w,
         };
 
@@ -91,25 +114,55 @@ struct PhongShader {
         fb.WriteTile(vars.TileOffset, vars.TileMask & alphaMask, rgba, vars.Depth);
     }
 };
+struct DepthOnlyShader {
+    static const uint32_t NumCustomAttribs = 0;
+
+    glm::mat4 ProjMat;
+
+    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+        swr::VFloat4 pos = { .w = 1.0f };
+        data.ReadAttribs(&Vertex::x, &pos.x, 3);
+        vars.Position = swr::simd::TransformVector(ProjMat, pos);
+    }
+
+    void ShadePixels(const swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+        _mm512_mask_storeu_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
+    }
+};
 
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
-    std::unique_ptr<Model> _model;
+    std::unique_ptr<Model> _model, _shadowModel;
     Camera _cam;
     std::unique_ptr<ogl::Texture2D> _glTex;
     std::unique_ptr<uint32_t[]> _tempPixels;
-    glm::vec3 _lightPos;
+    glm::vec3 _lightPos, _lightDir;
+    glm::mat4 _shadowProjMat;
+
+    std::shared_ptr<swr::Framebuffer> _shadowFb;
+    std::unique_ptr<swr::Rasterizer> _shadowRast;
+
+    std::unique_ptr<ogl::Texture2D> _glTex2;
 
 public:
     SwRenderer() {
         _model = std::make_unique<Model>("Models/Sponza/Sponza.gltf");
+        _shadowModel = std::make_unique<Model>("Models/Sponza/Sponza_LowPoly.gltf");
+
         //_model = std::make_unique<Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<Model>("Models/San_Miguel/san-miguel-low-poly.obj");
         _cam = Camera();
         _cam.MoveSpeed = 10.0f;
 
-        InitRasterizer(1920, 1080);
+        InitRasterizer(1280, 720);
+
+        _shadowFb = std::make_shared<swr::Framebuffer>(1024, 1024);
+        _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
+        _glTex2 = std::make_unique<ogl::Texture2D>(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
+
+        _lightDir = glm::vec3(0.0f, -1.0f, 0.0f);
+        _lightPos = glm::vec3(0.0f, 10.0f, 0.0f);
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
@@ -117,13 +170,43 @@ public:
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _glTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
-        _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
+        _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height * 2);
+    }
+
+    void RenderShadow() {
+        _shadowProjMat = glm::ortho(-16.0f, +16.0f, -16.0f, +16.0f, 0.1f, 50.0f) * glm::lookAt(_lightPos, glm::vec3(0), glm::vec3(0, 1, 0));
+
+        DepthOnlyShader shader = { .ProjMat = _shadowProjMat };
+
+        _shadowFb->ClearDepth(1.0f);
+
+        for (Mesh& mesh : _shadowModel->Meshes) {
+            swr::VertexReader data(
+                (uint8_t*)&_shadowModel->VertexBuffer[mesh.VertexOffset],
+                (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset],
+                mesh.IndexCount, swr::VertexReader::U16);
+
+            _shadowRast->DrawIndexed(data, shader);
+        }
+
+        uint32_t n = _shadowFb->Width * _shadowFb->Height;
+        for (uint32_t i = 0; i < n; i++) {
+            uint8_t c = (uint8_t)(glm::clamp(_shadowFb->DepthBuffer[i]*0.5f+0.5f, 0.0f,1.0f) * 255.0f);
+            _shadowFb->ColorBuffer[i] = c * 0x01'01'01 | 0xFF'000000;
+        }
+
+        _shadowFb->GetPixels(_tempPixels.get(), _shadowFb->Width);
+        _glTex2->SetPixels(_tempPixels.get(), _shadowFb->Width);
+        ImGui::Begin("Shadow Debug");
+        ImGui::Image((ImTextureID)(uintptr_t)_glTex2->Handle, ImVec2(300, 300), ImVec2(0,1), ImVec2(1,0));
+        ImGui::End();
     }
 
     void Render() {
         auto renderStart = std::chrono::high_resolution_clock::now();
 
         static bool s_NormalMapping = true;
+        static bool s_EnableShadows = false;
 
         ImGui::Begin("Settings");
 
@@ -137,18 +220,22 @@ public:
         }
 
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
+        ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
         ImGui::Checkbox("Wireframe", &_rast->EnableWireframe);
-
-        static int s_MaxDrawProgress = _model->Meshes.size();
-        ImGui::SliderInt("Draw Progress", &s_MaxDrawProgress, 1, _model->Meshes.size());
-        ImGui::SliderFloat("CamSpeed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
         _cam.Update();
 
+        if (s_EnableShadows) {
+            RenderShadow();
+        }
+
         PhongShader shader = {
             .ProjMat = _cam.GetViewProjMatrix(),
-            .LightPos = _lightPos
+            .LightPos = _lightPos,
+            .ShadowProjMat = _shadowProjMat,
+            .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
         };
 
         _fb->Clear(0xD0EEFF, 1.0f);
