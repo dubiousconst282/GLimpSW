@@ -103,7 +103,7 @@ struct Framebuffer {
         VInt indices = tileId * kTileNumPixels + pixelOffset;
         uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
 
-        return _mm512_mask_i32gather_ps(_mm512_setzero_ps(), boundMask, indices, DepthBuffer, 4);
+        return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer, 4);
     }
 
     void GetPixels(uint32_t* dest, uint32_t stride) const;
