@@ -78,13 +78,63 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
     }
 }
 
-void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs)
-{
+void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs) {
+    TrianglePacket& tri = batch.PeekLast();
+    Clipper::ClipCodes cc = _clipper.ComputeClipCodes(tri);
+    uint32_t addedTriangles = 0;
+    uint32_t numAttribs = numCustomAttribs + 4;
+
+    // Clip non-trivial triangles
+    for (uint32_t i : BitIter(cc.NonTrivialMask)) {
+        _clipper.LoadTriangle(tri, i, numAttribs);
+
+        for (uint32_t j : BitIter(cc.OutCodes[i])) {
+            _clipper.ClipAgainstPlane((Clipper::Plane)j, numAttribs);
+        }
+
+        if (_clipper.Count < 2) continue;
+
+        // Triangulate result polygon
+        for (uint32_t j = 0; j < _clipper.Count - 2; j++) {
+            uint32_t usedMask = cc.AcceptMask | (cc.NonTrivialMask & (~1u << i));
+            uint32_t freeIdx = (uint32_t)std::countr_one(usedMask);
+
+            if (freeIdx < VFloat::Length) {
+                _clipper.StoreTriangle(tri, freeIdx, j, numAttribs);
+                cc.AcceptMask |= 1u << freeIdx;
+            } else {
+                if (addedTriangles % VFloat::Length == 0) {
+                    TrianglePacket& newTri = batch.Alloc();
+                    assert(&newTri == (&tri + i / VFloat::Length + 1));
+                }
+                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % VFloat::Length, j, numAttribs);
+                addedTriangles++;
+            }
+        }
+        STAT_INCREMENT(TrianglesClipped, 1);
+    }
+
+    if (cc.AcceptMask == 0 && addedTriangles == 0) {
+        batch.Count--;  // free unused triangle
+        return;
+    }
+
+    if (cc.AcceptMask != 0) {
+        BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
+    }
+
+    for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
+        uint16_t mask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
+        BinTriangles(batch, *(&tri + i / VFloat::Length + 1), mask, numCustomAttribs);
+    }
+}
+
+void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs) {
     int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
     tris.Setup(width, height, numAttribs);
 
-    //TODO: backface culling (need to flip vertices or smt)
-    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ); //skip zero area triangles
+    // TODO: backface culling (need to flip vertices or smt)
+    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip zero area triangles
 
     for (uint32_t i : BitIter(mask)) {
         uint32_t minX = (uint32_t)((tris.MinX[i] + width / 2) >> kBinSizeLog2);
@@ -92,7 +142,7 @@ void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t nu
         uint32_t maxX = (uint32_t)((tris.MaxX[i] + width / 2) >> kBinSizeLog2);
         uint32_t maxY = (uint32_t)((tris.MaxY[i] + height / 2) >> kBinSizeLog2);
 
-        uint16_t triangleId = (uint16_t)((&tris - _triangles.get()) * VFloat::Length + i);
+        uint16_t triangleId = batch.GetId(tris, i);
         uint32_t binStride = (uint32_t)width >> kBinSizeLog2;
 
         for (uint32_t y = minY; y <= maxY; y++) {
@@ -106,8 +156,6 @@ void Rasterizer::SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t nu
 }
 
 Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
-    _triangles = std::make_unique<TrianglePacket[]>(kTriangleBatchSize);
-
     _binsW = (fb->Width + kBinSize - 1) >> kBinSizeLog2;
     _binsH = (fb->Height + kBinSize - 1) >> kBinSizeLog2;
     _numBins = _binsW * _binsH;
@@ -156,7 +204,7 @@ static void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t
     }
 }
 
-void Rasterizer::RenderBins(std::function<void(const BinnedTriangle&)> drawFn) {
+void Rasterizer::RenderBins(TriangleBatch& batch, std::function<void(const BinnedTriangle&)> drawFn) {
     STAT_TIME_BEGIN(Rasterize);
 
     auto binRange = std::ranges::iota_view(0u, _binsW * _binsH);
@@ -181,7 +229,8 @@ void Rasterizer::RenderBins(std::function<void(const BinnedTriangle&)> drawFn) {
             .Y = (bid / _binsW) * kBinSize,
         };
         for (uint16_t triangleId : bin) {
-            bt.TriangleId = triangleId;
+            bt.Triangle = &batch.Storage[triangleId / VFloat::Length];
+            bt.TriangleIndex = triangleId % VFloat::Length;
             drawFn(bt);
         }
         bin.clear();
@@ -194,7 +243,7 @@ void Rasterizer::RenderBins(std::function<void(const BinnedTriangle&)> drawFn) {
 
         for (uint32_t j : BitIter(wireframeTids[i])) {
             uint32_t tid = i * 32 + j;
-            RenderWireframe(*_fb, _triangles[tid / VFloat::Length], tid % VFloat::Length);
+            RenderWireframe(*_fb, batch.Storage[tid / VFloat::Length], tid % VFloat::Length);
         }
     }
 

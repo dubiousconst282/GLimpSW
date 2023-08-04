@@ -265,52 +265,79 @@ struct Clipper {
     struct Vertex {
         float Attribs[(ShadedVertexPacket::MaxAttribs + 4 + VFloat::Length - 1) & ~(VFloat::Length - 1)];
     };
+    struct ClipCodes {
+        uint16_t AcceptMask;        // Triangles that don't need to be clipped.
+        uint16_t NonTrivialMask;    // Triangles that need to be clipped.
+        uint8_t OutCodes[16];       // Planes that need to be clipped against (per-triangle).
+    };
 
     uint32_t Count, FreeVtx;
     float GuardBandPlaneDistXY[2]{ 1.0f, 1.0f };
     uint8_t Indices[24];
     Vertex Vertices[24];
 
-    void ClipAroundPlane(Plane plane, uint32_t numAttribs);
+    // Compute Cohen-Sutherland clip codes
+    ClipCodes ComputeClipCodes(const TrianglePacket& tri);
 
-    void ClipTriangles(TrianglePacket* tris, uint32_t numAttribs, uint32_t& renderMask, uint32_t& addedTriangles);
+    void ClipAgainstPlane(Plane plane, uint32_t numAttribs);
 
-private:
     void LoadTriangle(TrianglePacket& srcTri, uint32_t srcTriIdx, uint32_t numAttribs);
     void StoreTriangle(TrianglePacket& destTri, uint32_t destTriIdx, uint32_t srcTriFanIdx, uint32_t numAttribs);
 };
 
 template<typename T>
-concept ShaderDef =
+concept ShaderProgram =
     requires(T s, const VertexReader& vertexData, ShadedVertexPacket& vertexPacket, const Framebuffer& fb, VaryingBuffer& vars) {
         { T::NumCustomAttribs } -> std::convertible_to<uint32_t>;
         { s.ShadeVertices(vertexData, vertexPacket) } -> std::same_as<void>;
         { s.ShadePixels(fb, vars) } -> std::same_as<void>;
     };
 
+struct TriangleBatch {
+    static const uint32_t MaxSize = 2048 / VFloat::Length;
+
+    uint32_t Count = 0;
+    TrianglePacket Storage[MaxSize];
+
+    TrianglePacket& Alloc() {
+        assert(Count < MaxSize);
+        return Storage[Count++];
+    }
+    TrianglePacket& PeekLast(uint32_t offset = 0) {
+        assert(Count - 1 + offset < MaxSize);
+        return Storage[Count - 1 + offset];
+    }
+    uint16_t GetId(const TrianglePacket& packet, uint32_t index) {
+        assert((intptr_t)(&packet - &Storage[0]) < MaxSize);
+        return (uint16_t)((&packet - &Storage[0]) * VFloat::Length + index);
+    }
+    bool IsFull() { return Count >= MaxSize - 24; } //Reserve 24*vec triangles for clipping
+};
+
 class Rasterizer {
-    static const int kTriangleBatchSize = 8192 / VFloat::Length, kBinSizeLog2 = 7, kBinSize = 1 << kBinSizeLog2;
+    static const uint32_t kBinSizeLog2 = 7, kBinSize = 1 << kBinSizeLog2;
 
     std::shared_ptr<Framebuffer> _fb;
-    std::unique_ptr<TrianglePacket[]> _triangles;    // Working triangle batch
-    std::unique_ptr<std::vector<uint16_t>[]> _bins;  // Bins containing triangle indices
+    std::unique_ptr<std::vector<uint16_t>[]> _bins;    // Bins containing triangle indices
     uint32_t _binsW, _binsH, _numBins;
     Clipper _clipper;
 
     struct BinnedTriangle {
         uint32_t X, Y;
-        uint16_t TriangleId;
+        uint16_t TriangleIndex;
+        const TrianglePacket* Triangle;
     };
-    // Setup edges and distribute to bins
-    void SetupTriangles(TrianglePacket& tris, uint32_t mask, uint32_t numAttribs);
 
-    void RenderBins(std::function<void(const BinnedTriangle&)> drawFn);
+    void SetupTriangles(TriangleBatch& batch, uint32_t numAttribs);
+    void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs);
 
-    template<ShaderDef TShader>
+    void RenderBins(TriangleBatch& batch, std::function<void(const BinnedTriangle&)> drawFn);
+
+    template<ShaderProgram TShader>
     void DrawBinnedTriangle(const TShader& shader, const BinnedTriangle& bin) {
-        TrianglePacket& tri = _triangles[bin.TriangleId / VFloat::Length];
         Framebuffer& fb = *_fb.get();
-        uint32_t i = bin.TriangleId % VFloat::Length;
+        const TrianglePacket& tri = *bin.Triangle;
+        uint32_t i = bin.TriangleIndex;
 
         int32_t centerX = (int32_t)(fb.Width / 2), centerY = (int32_t)(fb.Height / 2);
 
@@ -381,46 +408,37 @@ public:
 
     Rasterizer(std::shared_ptr<Framebuffer> fb);
 
-    template<ShaderDef TShader>
+    template<ShaderProgram TShader>
     void DrawIndexed(VertexReader& vertexData, const TShader& shader) {
         uint32_t pos = 0;
         uint32_t count = vertexData.Count / 3;
+        auto batch = std::make_unique<TriangleBatch>();
 
         while (pos < count) {
             STAT_TIME_BEGIN(VertexSetup);
 
             // Setup bins
-            auto tri = _triangles.get();
-            auto endTri = _triangles.get() + kTriangleBatchSize - 24;  // reserve 24*vec tris for clipping
+            batch->Count = 0;
 
-            for (; pos < count && tri < endTri; pos += VFloat::Length) {
+            for (; pos < count && !batch->IsFull(); pos += VFloat::Length) {
+                TrianglePacket& tri = batch->Alloc();
+
+                // Read vertices and assemble triangles
                 VInt indices[3];
                 vertexData.ReadTriangleIndices(pos * 3, indices);
 
-                // Shade vertices
                 for (uint32_t vi = 0; vi < 3; vi++) {
                     vertexData._Indices = indices[vi];
-                    shader.ShadeVertices(vertexData, tri->Vertices[vi]);
+                    shader.ShadeVertices(vertexData, tri.Vertices[vi]);
                 }
-                
-                // Clip and setup
-                uint32_t renderMask, addedTriangles;
-                _clipper.ClipTriangles(tri, shader.NumCustomAttribs + 4, renderMask, addedTriangles);
 
-                if (renderMask != 0) {
-                    SetupTriangles(*tri, renderMask, shader.NumCustomAttribs);
-                }
-                if (renderMask != 0 || addedTriangles > 0) tri++;
-
-                for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
-                    renderMask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
-                    SetupTriangles(*tri++, renderMask, shader.NumCustomAttribs);
-                }
+                // Clip, setup, and bin
+                SetupTriangles(*batch, shader.NumCustomAttribs);
             }
             STAT_TIME_END(VertexSetup);
 
             // clang-format off
-            RenderBins([&](auto& bt) { DrawBinnedTriangle(shader, bt); });
+            RenderBins(*batch, [&](auto& bt) { DrawBinnedTriangle(shader, bt); });
         }
     }
 };

@@ -16,7 +16,7 @@ struct VInt {
     VInt() { reg = _mm512_setzero_epi32(); }
     VInt(__m512i x) { reg = x; }
     VInt(int32_t x) { reg = _mm512_set1_epi32(x); }
-    inline operator __m512i() { return reg; }
+    inline operator __m512i() const { return reg; }
 
     inline int32_t& operator[](size_t idx) const {
         assert(idx >= 0 && idx < Length);
@@ -39,7 +39,7 @@ struct VFloat {
     VFloat() { reg = _mm512_setzero_ps(); }
     VFloat(__m512 x) { reg = x; }
     VFloat(float x) { reg = _mm512_set1_ps(x); }
-    inline operator __m512() { return reg; }
+    inline operator __m512() const { return reg; }
 
     inline float& operator[](size_t idx) const {
         assert(idx >= 0 && idx < Length);
