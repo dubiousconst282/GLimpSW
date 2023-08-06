@@ -104,7 +104,7 @@ struct PhongShader {
             // closestDepth > pos.z ? 1.0 : 0.0
             shadowLight = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(closestDepth, currentDepth, _CMP_GE_OQ), shadowLight);
         }
-        VFloat combinedLight = diffuseLight * shadowLight + 0.3;
+        VFloat combinedLight = diffuseLight * shadowLight + 0.3f;
 
         VFloat4 color = {
             diffuseColor.x * combinedLight,
@@ -142,7 +142,7 @@ class SwRenderer {
     std::unique_ptr<ogl::Texture2D> _frontTex;
     std::unique_ptr<ogl::Texture2D> _shadowDebugTex;
     std::unique_ptr<uint32_t[]> _tempPixels;
-    glm::vec3 _lightPos, _lightDir;
+    glm::vec3 _lightPos, _lightRot;
     glm::mat4 _shadowProjMat;
 
     std::shared_ptr<swr::Framebuffer> _shadowFb;
@@ -154,7 +154,8 @@ public:
         _shadowModel = std::make_unique<Model>("Models/Sponza/Sponza_LowPoly.gltf");
 
         //_model = std::make_unique<Model>("Models/sea_keep_lonely_watcher/scene.gltf");
-        //_model = std::make_unique<Model>("Models/San_Miguel/san-miguel-low-poly.obj");
+        //_model = std::make_unique<Model>("Models/SunTemple_v4/SunTemple.fbx");
+
         _cam = Camera{ .Position = glm::vec3(0, 4, 0), .MoveSpeed = 10.0f };
 
         InitRasterizer(1280, 720);
@@ -162,7 +163,7 @@ public:
         _shadowFb = std::make_shared<swr::Framebuffer>(1024, 1024);
         _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
 
-        _lightDir = glm::vec3(0.0f, -1.0f, 0.0f);
+        _lightRot = glm::vec3(0.0f, -90.0f, 0.0f);
         _lightPos = glm::vec3(-0.5f, 12.0f, 0.5f);
     }
 
@@ -188,10 +189,8 @@ public:
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
             ImGui::EndCombo();
         }
-
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
-        ImGui::Checkbox("Wireframe", &_rast->EnableWireframe);
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
@@ -223,7 +222,7 @@ public:
                 (uint8_t*)&_model->IndexBuffer[mesh.IndexOffset],
                 mesh.IndexCount, swr::VertexReader::U16);
 
-            _rast->DrawIndexed(data, shader);
+            _rast->Draw(data, shader);
         }
 
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
@@ -243,18 +242,18 @@ public:
 
         ImGui::Begin("Rasterizer Stats");
         ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed);
-        ImGui::Text("Vertex setup: %.1fms", stats.VertexSetup[0] / 1000000.0);
-        ImGui::Text("Rasterize: %.1fms", stats.Rasterize[0] / 1000000.0);
-        ImGui::Text("Triangles: %.1fK (%.1fK clipped)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0);
-        ImGui::Text("Bins filled: %.1fK", stats.BinsFilled / 1000.0);
+        ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms)", stats.SetupTime[0] / 1000000.0, stats.ClippingTime[0] / 1000000.0, stats.BinningTime[0] / 1000000.0);
+        ImGui::Text("Rasterize: %.1fms (actual CPU: %.1fms)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / 1000000.0);
+        ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0);
         stats.Reset();
         ImGui::End();
 
-        DrawTranslationGizmo(_lightPos, _lightDir);
+        DrawTranslationGizmo(_lightPos, _lightRot);
     }
 
     void RenderShadow() {
-        _shadowProjMat = glm::ortho(-12.0f, +12.0f, -12.0f, +12.0f, 0.1f, 40.0f) * glm::lookAt(_lightPos, _lightDir, glm::vec3(0, 1, 0));
+        //TODO: fix shadow matrix
+        _shadowProjMat = glm::ortho(-12.0f, +12.0f, -12.0f, +12.0f, 0.05f, 40.0f) * glm::lookAt(_lightPos, glm::vec3(0, -1, 0), glm::vec3(0, 1, 0));
 
         DepthOnlyShader shader = { .ProjMat = _shadowProjMat };
 
@@ -264,7 +263,7 @@ public:
             swr::VertexReader data((uint8_t*)&_shadowModel->VertexBuffer[mesh.VertexOffset],
                                    (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset], mesh.IndexCount, swr::VertexReader::U16);
 
-            _shadowRast->DrawIndexed(data, shader);
+            _shadowRast->Draw(data, shader);
         }
 
         if (ImGui::Begin("Shadow Debug")) {
@@ -285,8 +284,8 @@ public:
             _shadowDebugTex->SetPixels(buf.get(), _shadowFb->Width);
 
             ImGui::Image((ImTextureID)(uintptr_t)_shadowDebugTex->Handle, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
-            ImGui::End();
         }
+        ImGui::End();
     }
 
     void DrawTranslationGizmo(glm::vec3& pos, glm::vec3& rot) {
@@ -301,7 +300,7 @@ public:
         float scale[3]{ 1.0f, 1.0f, 1.0f };
         ImGuizmo::RecomposeMatrixFromComponents(&pos.x, &rot.x, scale, matrix);
 
-        if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE | ImGuizmo::ROTATE, ImGuizmo::WORLD, matrix)) {
+        if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
             ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, &rot.x, scale);
         }
     }

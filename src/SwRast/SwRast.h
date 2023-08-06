@@ -1,15 +1,15 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string_view>
 #include <vector>
-#include <functional>
 
 #include "SIMD.h"
 
 #define STAT_INCREMENT(key, amount) (swr::g_Stats.key += (amount))
-#define STAT_TIME_BEGIN(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key, 1)
-#define STAT_TIME_END(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key, 0)
+#define STAT_TIME_BEGIN(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key##Time, 1)
+#define STAT_TIME_END(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key##Time, 0)
 
 namespace swr {
 
@@ -17,8 +17,11 @@ struct ProfilerStats {
     uint32_t TrianglesDrawn;
     uint32_t TrianglesClipped;
     uint32_t BinsFilled;
-    int64_t VertexSetup[2];
-    int64_t Rasterize[2];
+    int64_t SetupTime[2];
+    int64_t ClippingTime[2];
+    int64_t BinningTime[2];
+    int64_t RasterizeTime[2];
+    int64_t RasterizeCpuTime;
 
     void Reset() { *this = {}; }
     static void MeasureTime(int64_t key[2], bool begin);
@@ -58,16 +61,16 @@ private:
 
 struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
-    static const uint32_t kTileSize = 4, kTileShift = 2, kTileMask = kTileSize - 1, kTileNumPixels = kTileSize * kTileSize;
+    static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
 
     uint32_t Width, Height, TileStride;
     uint32_t* ColorBuffer;
     float* DepthBuffer;
 
     Framebuffer(uint32_t width, uint32_t height) {
-        Width = (width + kTileMask) & ~kTileMask;
-        Height = (height + kTileMask) & ~kTileMask;
-        TileStride = Width / kTileSize;
+        Width = (width + TileMask) & ~TileMask;
+        Height = (height + TileMask) & ~TileMask;
+        TileStride = Width / TileSize;
 
         ColorBuffer = (uint32_t*)_mm_malloc(Width * Height * 4, 64);
         DepthBuffer = (float*)_mm_malloc(Width * Height * 4, 64);
@@ -84,9 +87,9 @@ struct Framebuffer {
     void ClearDepth(float depth) { std::fill(&DepthBuffer[0], &DepthBuffer[Width * Height], depth); }
 
     size_t GetPixelOffset(uint32_t x, uint32_t y) const {
-        size_t tileId = (x >> kTileShift) + (y >> kTileShift) * TileStride;
-        size_t pixelOffset = (x & kTileMask) + (y & kTileMask) * kTileSize;
-        return tileId * kTileNumPixels + pixelOffset;
+        size_t tileId = (x >> TileShift) + (y >> TileShift) * TileStride;
+        size_t pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
+        return tileId * TileNumPixels + pixelOffset;
     }
 
     void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) const {
@@ -98,9 +101,9 @@ struct Framebuffer {
         VInt ix = simd::round2i(x * (int32_t)Width);
         VInt iy = simd::round2i(y * (int32_t)Height);
 
-        VInt tileId = (ix >> kTileShift) + (iy >> kTileShift) * (int32_t)TileStride;
-        VInt pixelOffset = (ix & kTileMask) + (iy & kTileMask) * kTileSize;
-        VInt indices = tileId * kTileNumPixels + pixelOffset;
+        VInt tileId = (ix >> TileShift) + (iy >> TileShift) * (int32_t)TileStride;
+        VInt pixelOffset = (ix & TileMask) + (iy & TileMask) * TileSize;
+        VInt indices = tileId * TileNumPixels + pixelOffset;
         uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
 
         return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer, 4);
@@ -295,31 +298,40 @@ concept ShaderProgram =
 
 struct TriangleBatch {
     static const uint32_t MaxSize = 2048 / VFloat::Length;
+    static const uint32_t BinSizeLog2 = 7, BinSize = 1 << BinSizeLog2;
+
+    std::unique_ptr<std::vector<uint16_t>[]> Bins;
+    uint32_t BinsPerRow, NumBins;
 
     uint32_t Count = 0;
-    TrianglePacket Storage[MaxSize];
+    TrianglePacket Triangles[MaxSize];
+
+    TriangleBatch(uint32_t fbWidth, uint32_t fbHeight) {
+        BinsPerRow = (fbWidth + BinSize - 1) >> BinSizeLog2;
+        NumBins = ((fbHeight + BinSize - 1) >> BinSizeLog2) * BinsPerRow;
+        Bins = std::make_unique<std::vector<uint16_t>[]>(NumBins);
+    }
 
     TrianglePacket& Alloc() {
         assert(Count < MaxSize);
-        return Storage[Count++];
+        return Triangles[Count++];
     }
     TrianglePacket& PeekLast(uint32_t offset = 0) {
         assert(Count - 1 + offset < MaxSize);
-        return Storage[Count - 1 + offset];
+        return Triangles[Count - 1 + offset];
     }
-    uint16_t GetId(const TrianglePacket& packet, uint32_t index) {
-        assert((intptr_t)(&packet - &Storage[0]) < MaxSize);
-        return (uint16_t)((&packet - &Storage[0]) * VFloat::Length + index);
+    void AddBin(uint32_t x, uint32_t y, TrianglePacket& tri, uint32_t index) {
+        assert((&tri - Triangles) < MaxSize);
+
+        uint32_t id = (&tri - Triangles) * VFloat::Length + index;
+        Bins[x + y * BinsPerRow].push_back(id);
     }
     bool IsFull() { return Count >= MaxSize - 24; } //Reserve 24*vec triangles for clipping
 };
 
 class Rasterizer {
-    static const uint32_t kBinSizeLog2 = 7, kBinSize = 1 << kBinSizeLog2;
-
     std::shared_ptr<Framebuffer> _fb;
-    std::unique_ptr<std::vector<uint16_t>[]> _bins;    // Bins containing triangle indices
-    uint32_t _binsW, _binsH, _numBins;
+    std::unique_ptr<TriangleBatch> _batch;
     Clipper _clipper;
 
     struct BinnedTriangle {
@@ -327,11 +339,16 @@ class Rasterizer {
         uint16_t TriangleIndex;
         const TrianglePacket* Triangle;
     };
+    struct ShaderInterface {
+        std::function<void(size_t, ShadedVertexPacket[3])> ReadVtxFn;
+        std::function<void(const BinnedTriangle&)> DrawFn;
+        uint32_t NumCustomAttribs;
+    };
+
+    void Draw(VertexReader& vertexData, const ShaderInterface& shader);
 
     void SetupTriangles(TriangleBatch& batch, uint32_t numAttribs);
     void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs);
-
-    void RenderBins(TriangleBatch& batch, std::function<void(const BinnedTriangle&)> drawFn);
 
     template<ShaderProgram TShader>
     void DrawBinnedTriangle(const TShader& shader, const BinnedTriangle& bin) {
@@ -343,8 +360,8 @@ class Rasterizer {
 
         uint32_t minX = (uint32_t)(tri.MinX[i] + centerX);
         uint32_t minY = (uint32_t)(tri.MinY[i] + centerY);
-        uint32_t maxX = std::min((uint32_t)(tri.MaxX[i] + centerX), bin.X + kBinSize - 4);
-        uint32_t maxY = std::min((uint32_t)(tri.MaxY[i] + centerY), bin.Y + kBinSize - 4);
+        uint32_t maxX = std::min((uint32_t)(tri.MaxX[i] + centerX), bin.X + TriangleBatch::BinSize - 4);
+        uint32_t maxY = std::min((uint32_t)(tri.MaxY[i] + centerY), bin.Y + TriangleBatch::BinSize - 4);
 
         VInt tileOffsX = VInt::ramp() & 3;
         VInt tileOffsY = VInt::ramp() >> 2;
@@ -404,42 +421,25 @@ class Rasterizer {
     }
 
 public:
-    bool EnableWireframe = false;
-
     Rasterizer(std::shared_ptr<Framebuffer> fb);
 
     template<ShaderProgram TShader>
-    void DrawIndexed(VertexReader& vertexData, const TShader& shader) {
-        uint32_t pos = 0;
-        uint32_t count = vertexData.Count / 3;
-        auto batch = std::make_unique<TriangleBatch>();
+    void Draw(VertexReader& vertexData, const TShader& shader) {
+        ShaderInterface shifc = {
+            .ReadVtxFn =
+                [&](size_t offset, ShadedVertexPacket vertices[3]) {
+                    VInt indices[3];
+                    vertexData.ReadTriangleIndices(offset, indices);
 
-        while (pos < count) {
-            STAT_TIME_BEGIN(VertexSetup);
-
-            // Setup bins
-            batch->Count = 0;
-
-            for (; pos < count && !batch->IsFull(); pos += VFloat::Length) {
-                TrianglePacket& tri = batch->Alloc();
-
-                // Read vertices and assemble triangles
-                VInt indices[3];
-                vertexData.ReadTriangleIndices(pos * 3, indices);
-
-                for (uint32_t vi = 0; vi < 3; vi++) {
-                    vertexData._Indices = indices[vi];
-                    shader.ShadeVertices(vertexData, tri.Vertices[vi]);
-                }
-
-                // Clip, setup, and bin
-                SetupTriangles(*batch, shader.NumCustomAttribs);
-            }
-            STAT_TIME_END(VertexSetup);
-
-            // clang-format off
-            RenderBins(*batch, [&](auto& bt) { DrawBinnedTriangle(shader, bt); });
-        }
+                    for (uint32_t vi = 0; vi < 3; vi++) {
+                        vertexData._Indices = indices[vi];
+                        shader.ShadeVertices(vertexData, vertices[vi]);
+                    }
+                },
+            .DrawFn = [&](const BinnedTriangle& bt) { DrawBinnedTriangle(shader, bt); },
+            .NumCustomAttribs = shader.NumCustomAttribs,
+        };
+        Draw(vertexData, shifc);
     }
 };
 

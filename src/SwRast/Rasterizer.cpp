@@ -1,13 +1,172 @@
-#include <algorithm>
+
 #include <array>
+#include <chrono>
 #include <execution>
 #include <ranges>
-#include <chrono>
 
 #include "Misc.h"
 #include "SwRast.h"
 
 namespace swr {
+
+Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
+    const float maxViewSize = 2048.0f;
+    _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb->Width;
+    _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb->Height;
+
+    _batch = std::make_unique<TriangleBatch>(fb->Width, fb->Height);
+
+    _fb = std::move(fb);
+}
+
+void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs) {
+    STAT_TIME_BEGIN(Clipping);
+
+    TrianglePacket& tri = batch.PeekLast();
+    Clipper::ClipCodes cc = _clipper.ComputeClipCodes(tri);
+    uint32_t addedTriangles = 0;
+    uint32_t numAttribs = numCustomAttribs + 4;
+
+    // Clip non-trivial triangles
+    for (uint32_t i : BitIter(cc.NonTrivialMask)) {
+        _clipper.LoadTriangle(tri, i, numAttribs);
+
+        for (uint32_t j : BitIter(cc.OutCodes[i])) {
+            _clipper.ClipAgainstPlane((Clipper::Plane)j, numAttribs);
+        }
+
+        if (_clipper.Count < 2) continue;
+
+        // Triangulate result polygon
+        for (uint32_t j = 0; j < _clipper.Count - 2; j++) {
+            uint32_t usedMask = cc.AcceptMask | (cc.NonTrivialMask & (~1u << i));
+            uint32_t freeIdx = (uint32_t)std::countr_one(usedMask);
+
+            if (freeIdx < VFloat::Length) {
+                _clipper.StoreTriangle(tri, freeIdx, j, numAttribs);
+                cc.AcceptMask |= 1u << freeIdx;
+            } else {
+                if (addedTriangles % VFloat::Length == 0) {
+                    TrianglePacket& newTri = batch.Alloc();
+                    assert(&newTri == (&tri + i / VFloat::Length + 1));
+                }
+                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % VFloat::Length, j, numAttribs);
+                addedTriangles++;
+            }
+        }
+        STAT_INCREMENT(TrianglesClipped, 1);
+    }
+    STAT_TIME_END(Clipping);
+
+    if (cc.AcceptMask == 0 && addedTriangles == 0) {
+        batch.Count--;  // free unused triangle
+        return;
+    }
+
+    STAT_TIME_BEGIN(Binning);
+
+    if (cc.AcceptMask != 0) {
+        BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
+    }
+
+    for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
+        uint16_t mask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
+        BinTriangles(batch, *(&tri + i / VFloat::Length + 1), mask, numCustomAttribs);
+    }
+
+    STAT_TIME_END(Binning);
+}
+
+void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs) {
+    int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
+    tris.Setup(width, height, numAttribs);
+
+    // TODO: backface culling (need to flip vertices or smt)
+    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip zero area triangles
+
+    for (uint32_t i : BitIter(mask)) {
+        const uint32_t binShift = TriangleBatch::BinSizeLog2;
+
+        uint32_t minX = (uint32_t)((tris.MinX[i] + width / 2) >> binShift);
+        uint32_t minY = (uint32_t)((tris.MinY[i] + height / 2) >> binShift);
+        uint32_t maxX = (uint32_t)((tris.MaxX[i] + width / 2) >> binShift);
+        uint32_t maxY = (uint32_t)((tris.MaxY[i] + height / 2) >> binShift);
+
+        for (uint32_t y = minY; y <= maxY; y++) {
+            for (uint32_t x = minX; x <= maxX; x++) {
+                batch.AddBin(x, y, tris, i);
+                STAT_INCREMENT(BinsFilled, 1);
+            }
+        }
+    }
+    STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
+}
+
+void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
+    uint32_t pos = 0;
+    uint32_t count = vertexData.Count / 3;
+
+    while (pos < count) {
+        TriangleBatch& batch = *_batch;
+        batch.Count = 0;
+
+        STAT_TIME_BEGIN(Setup);
+
+        for (; pos < count && !batch.IsFull(); pos += VFloat::Length) {
+            TrianglePacket& tri = batch.Alloc();
+
+            // Read vertices and assemble triangles
+            shader.ReadVtxFn(pos * 3, tri.Vertices);
+
+            // Clip, setup, and bin
+            SetupTriangles(batch, shader.NumCustomAttribs);
+        }
+
+        STAT_TIME_END(Setup);
+
+        STAT_TIME_BEGIN(Rasterize);
+
+        auto binRange = std::ranges::iota_view(0u, batch.NumBins);
+        std::atomic_int64_t elapsed = 0;
+
+        std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
+            auto startTime = std::chrono::high_resolution_clock::now();
+
+            std::vector<uint16_t>& bin = batch.Bins[bid];
+
+            BinnedTriangle bt = {
+                .X = (bid % batch.BinsPerRow) * TriangleBatch::BinSize,
+                .Y = (bid / batch.BinsPerRow) * TriangleBatch::BinSize,
+            };
+            for (uint16_t triangleId : bin) {
+                bt.Triangle = &batch.Triangles[triangleId / VFloat::Length];
+                bt.TriangleIndex = triangleId % VFloat::Length;
+                shader.DrawFn(bt);
+            }
+            bin.clear();
+
+            elapsed += (std::chrono::high_resolution_clock::now() - startTime).count();
+        });
+        g_Stats.RasterizeCpuTime += elapsed.load() / std::thread::hardware_concurrency();
+
+        STAT_TIME_END(Rasterize);
+    }
+}
+
+ProfilerStats g_Stats = {};
+
+void ProfilerStats::MeasureTime(int64_t key[2], bool begin) {
+    int64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+
+    if (begin) {
+        assert(key[1] == 0 && "STAT_TIME_X() must be called in pairs");
+        key[1] = now;
+    } else {
+        key[0] += now - key[1];
+        assert(key[1] != 0 && !(key[1] = 0) && "STAT_TIME_X() must be called in pairs");
+    }
+}
+
 
 static VInt EdgeWeight(VInt a, VInt x, VInt b, VInt y) {
     VInt w = a * x + b * y;
@@ -21,10 +180,11 @@ static VInt EdgeWeight(VInt a, VInt x, VInt b, VInt y) {
     return w >> 4;
 }
 
+//return min(r, bb...)
 static VInt ComputeMinBB(VInt a, VInt b, VInt c, int32_t vpSize) {
     VInt r = simd::min(simd::max(simd::min(simd::min(a, b), c), (vpSize << 4) / -2), (vpSize << 4) / +2);
     r = (r + 15) >> 4;                // round up to int
-    r = r & ~(int32_t)Framebuffer::kTileMask;  // align min bb coords to tile boundary
+    r = r & ~(int32_t)Framebuffer::TileMask;  // align min bb coords to tile boundary
     return r;
 }
 static VInt ComputeMaxBB(VInt a, VInt b, VInt c, int32_t vpSize) {
@@ -75,192 +235,6 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
         VFloat v0 = Vertices[0].Attribs[j];
         Vertices[1].Attribs[j] -= v0;
         Vertices[2].Attribs[j] -= v0;
-    }
-}
-
-void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs) {
-    TrianglePacket& tri = batch.PeekLast();
-    Clipper::ClipCodes cc = _clipper.ComputeClipCodes(tri);
-    uint32_t addedTriangles = 0;
-    uint32_t numAttribs = numCustomAttribs + 4;
-
-    // Clip non-trivial triangles
-    for (uint32_t i : BitIter(cc.NonTrivialMask)) {
-        _clipper.LoadTriangle(tri, i, numAttribs);
-
-        for (uint32_t j : BitIter(cc.OutCodes[i])) {
-            _clipper.ClipAgainstPlane((Clipper::Plane)j, numAttribs);
-        }
-
-        if (_clipper.Count < 2) continue;
-
-        // Triangulate result polygon
-        for (uint32_t j = 0; j < _clipper.Count - 2; j++) {
-            uint32_t usedMask = cc.AcceptMask | (cc.NonTrivialMask & (~1u << i));
-            uint32_t freeIdx = (uint32_t)std::countr_one(usedMask);
-
-            if (freeIdx < VFloat::Length) {
-                _clipper.StoreTriangle(tri, freeIdx, j, numAttribs);
-                cc.AcceptMask |= 1u << freeIdx;
-            } else {
-                if (addedTriangles % VFloat::Length == 0) {
-                    TrianglePacket& newTri = batch.Alloc();
-                    assert(&newTri == (&tri + i / VFloat::Length + 1));
-                }
-                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % VFloat::Length, j, numAttribs);
-                addedTriangles++;
-            }
-        }
-        STAT_INCREMENT(TrianglesClipped, 1);
-    }
-
-    if (cc.AcceptMask == 0 && addedTriangles == 0) {
-        batch.Count--;  // free unused triangle
-        return;
-    }
-
-    if (cc.AcceptMask != 0) {
-        BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
-    }
-
-    for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
-        uint16_t mask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
-        BinTriangles(batch, *(&tri + i / VFloat::Length + 1), mask, numCustomAttribs);
-    }
-}
-
-void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs) {
-    int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
-    tris.Setup(width, height, numAttribs);
-
-    // TODO: backface culling (need to flip vertices or smt)
-    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip zero area triangles
-
-    for (uint32_t i : BitIter(mask)) {
-        uint32_t minX = (uint32_t)((tris.MinX[i] + width / 2) >> kBinSizeLog2);
-        uint32_t minY = (uint32_t)((tris.MinY[i] + height / 2) >> kBinSizeLog2);
-        uint32_t maxX = (uint32_t)((tris.MaxX[i] + width / 2) >> kBinSizeLog2);
-        uint32_t maxY = (uint32_t)((tris.MaxY[i] + height / 2) >> kBinSizeLog2);
-
-        uint16_t triangleId = batch.GetId(tris, i);
-        uint32_t binStride = (uint32_t)width >> kBinSizeLog2;
-
-        for (uint32_t y = minY; y <= maxY; y++) {
-            for (uint32_t x = minX; x <= maxX; x++) {
-                _bins[x + y * _binsW].push_back(triangleId);
-                STAT_INCREMENT(BinsFilled, 1);
-            }
-        }
-    }
-    STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
-}
-
-Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
-    _binsW = (fb->Width + kBinSize - 1) >> kBinSizeLog2;
-    _binsH = (fb->Height + kBinSize - 1) >> kBinSizeLog2;
-    _numBins = _binsW * _binsH;
-    _bins = std::make_unique<std::vector<uint16_t>[]>(_numBins);
-
-    const float maxViewSize = 2048.0f;
-    _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb->Width;
-    _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb->Height;
-
-    _fb = std::move(fb);
-}
-
-// This impl performs no clipping and is intended for debugging only.
-static void RenderWireframe(Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint32_t color = 0xFF'0000FF) {
-    float sx = fb.Width * 0.5f, sy = fb.Height * 0.5f;
-
-    for (uint32_t vi = 0; vi < 3; vi++) {
-        const VFloat4& p1 = tri.Vertices[vi].Position;
-        const VFloat4& p2 = tri.Vertices[(vi + 1) % 3].Position;
-
-        // Draw line using fixed-point DDA algorithm
-        int32_t x1 = (int32_t)((p1.x[i] * sx + sx) * 16384.0f);
-        int32_t y1 = (int32_t)((p1.y[i] * sy + sy) * 16384.0f);
-        int32_t x2 = (int32_t)((p2.x[i] * sx + sx) * 16384.0f);
-        int32_t y2 = (int32_t)((p2.y[i] * sy + sy) * 16384.0f);
-
-        int32_t dx = x2 - x1, dy = y2 - y1;
-        int32_t length = std::max(std::abs(dx), std::abs(dy));
-
-        if (length == 0 || length == INT_MIN) continue;
-
-        dx = (int32_t)(((int64_t)dx << 14) / length);
-        dy = (int32_t)(((int64_t)dy << 14) / length);
-
-        int32_t steps = length >> 14;
-
-        while (steps-- >= 0) {
-            uint32_t x = (uint32_t)(x1 >> 14), y = (uint32_t)(y1 >> 14);
-
-            if (x < fb.Width && y < fb.Height) {
-                fb.ColorBuffer[fb.GetPixelOffset(x, y)] = color;
-            }
-            x1 += dx;
-            y1 += dy;
-        }
-    }
-}
-
-void Rasterizer::RenderBins(TriangleBatch& batch, std::function<void(const BinnedTriangle&)> drawFn) {
-    STAT_TIME_BEGIN(Rasterize);
-
-    auto binRange = std::ranges::iota_view(0u, _binsW * _binsH);
-
-    std::vector<uint32_t> wireframeTids;
-
-    if (EnableWireframe) {
-        wireframeTids.resize(65536 / 32);
-
-        for (uint32_t bid : binRange) {
-            for (uint16_t tid : _bins[bid]) {
-                wireframeTids[tid / 32] |= 1u << (tid % 32);
-            }
-        }
-    }
-
-    std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
-        std::vector<uint16_t>& bin = _bins[bid];
-
-        BinnedTriangle bt = {
-            .X = (bid % _binsW) * kBinSize,
-            .Y = (bid / _binsW) * kBinSize,
-        };
-        for (uint16_t triangleId : bin) {
-            bt.Triangle = &batch.Storage[triangleId / VFloat::Length];
-            bt.TriangleIndex = triangleId % VFloat::Length;
-            drawFn(bt);
-        }
-        bin.clear();
-    });
-
-    // TODO: This is slow and shitty, maybe use some math magic to draw wireframe in the rasterizer?
-    //       https://math.stackexchange.com/questions/3748903/closest-point-to-triangle-edge-with-barycentric-coordinates
-    for (uint32_t i = 0; i < wireframeTids.size(); i++) {
-        if (wireframeTids[i] == 0) continue;
-
-        for (uint32_t j : BitIter(wireframeTids[i])) {
-            uint32_t tid = i * 32 + j;
-            RenderWireframe(*_fb, batch.Storage[tid / VFloat::Length], tid % VFloat::Length);
-        }
-    }
-
-    STAT_TIME_END(Rasterize);
-}
-
-ProfilerStats g_Stats = {};
-
-void ProfilerStats::MeasureTime(int64_t key[2], bool begin) {
-    int64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-
-    if (begin) {
-        assert(key[1] == 0 && "STAT_TIME_X() must be called in pairs");
-        key[1] = now;
-    } else {
-        key[0] += now - key[1];
-        assert(key[1] != 0 && !(key[1] = 0) && "STAT_TIME_X() must be called in pairs");
     }
 }
 

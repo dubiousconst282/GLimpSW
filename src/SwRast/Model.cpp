@@ -97,11 +97,14 @@ Model::Model(std::string_view path) {
             v.y = mesh->mVertices[j].y;
             v.z = mesh->mVertices[j].z;
 
-            v.u = mesh->mTextureCoords[0][j].x;
-            v.v = mesh->mTextureCoords[0][j].y;
-
-            PackNorm(&v.nx, &mesh->mNormals[j].x);
-            PackNorm(&v.tx, &mesh->mTangents[j].x);
+            if (mesh->HasTextureCoords(0)) {
+                v.u = mesh->mTextureCoords[0][j].x;
+                v.v = mesh->mTextureCoords[0][j].y;
+            }
+            if (mesh->HasNormals() && mesh->HasTangentsAndBitangents()) {
+                PackNorm(&v.nx, &mesh->mNormals[j].x);
+                PackNorm(&v.tx, &mesh->mTangents[j].x);
+            }
         }
 
         for (uint32_t j = 0; j < mesh->mNumFaces; j++) {

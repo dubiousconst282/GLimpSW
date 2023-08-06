@@ -30,25 +30,25 @@ static void Transpose16x3(__m512i v[3]) {
     //   8  9 10 11 12 13 14 15 32 33 34 35 36 37 38 39
     //  16 17 18 19 20 21 22 23 40 41 42 43 44 45 46 47
 
-    r0 = _mm512_mask_blend_ps(0xf0f0, a0, a1);
-    r1 = _mm512_permutex2var_ps(a0, _mm512_setr_epi32(4, 5, 6, 7, 16, 17, 18, 19, 12, 13, 14, 15, 24, 25, 26, 27), a2);
-    r2 = _mm512_mask_blend_ps(0xf0f0, a1, a2);
+    r0 = _mm512_mask_blend_epi32(0xf0f0, a0, a1);
+    r1 = _mm512_permutex2var_epi32(a0, _mm512_setr_epi32(4, 5, 6, 7, 16, 17, 18, 19, 12, 13, 14, 15, 24, 25, 26, 27), a2);
+    r2 = _mm512_mask_blend_epi32(0xf0f0, a1, a2);
 
     //   0  1  2  3 12 13 14 15 24 25 26 27 36 37 38 39
     //   4  5  6  7 16 17 18 19 28 29 30 31 40 41 42 43
     //   8  9 10 11 20 21 22 23 32 33 34 35 44 45 46 47
 
-    a0 = _mm512_mask_blend_ps(0xcccc, r0, r1);
-    a1 = _mm512_shuffle_ps(r0, r2, 78);
-    a2 = _mm512_mask_blend_ps(0xcccc, r1, r2);
+    a0 = _mm512_mask_blend_epi32(0xcccc, r0, r1);
+    a1 = _mm512_castps_si512(_mm512_shuffle_ps(_mm512_castsi512_ps(r0), _mm512_castsi512_ps(r2), 78));
+    a2 = _mm512_mask_blend_epi32(0xcccc, r1, r2);
 
     //   0  1  6  7 12 13 18 19 24 25 30 31 36 37 42 43
     //   2  3  8  9 14 15 20 21 26 27 32 33 38 39 44 45
     //   4  5 10 11 16 17 22 23 28 29 34 35 40 41 46 47
 
-    v[0] = _mm512_mask_blend_ps(0xaaaa, a0, a1);
-    v[1] = _mm512_permutex2var_ps(a0, _mm512_setr_epi32(1, 16, 3, 18, 5, 20, 7, 22, 9, 24, 11, 26, 13, 28, 15, 30), a2);
-    v[2] = _mm512_mask_blend_ps(0xaaaa, a1, a2);
+    v[0] = _mm512_mask_blend_epi32(0xaaaa, a0, a1);
+    v[1] = _mm512_permutex2var_epi32(a0, _mm512_setr_epi32(1, 16, 3, 18, 5, 20, 7, 22, 9, 24, 11, 26, 13, 28, 15, 30), a2);
+    v[2] = _mm512_mask_blend_epi32(0xaaaa, a1, a2);
 
     //   0  3  6  9 12 15 18 21 24 27 30 33 36 39 42 45
     //   1  4  7 10 13 16 19 22 25 28 31 34 37 40 43 46
