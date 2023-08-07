@@ -13,7 +13,7 @@
 
 #include "Camera.h"
 
-#include "Model.h"
+#include "Scene.h"
 #include "QuickGL.h"
 
 using swr::VFloat, swr::VFloat3, swr::VFloat4;
@@ -21,7 +21,7 @@ using swr::VFloat, swr::VFloat3, swr::VFloat4;
 struct PhongShader {
     static const uint32_t NumCustomAttribs = 12;
 
-    glm::mat4 ProjMat;
+    glm::mat4 ProjMat, ModelMat;
     glm::vec3 LightPos;
     glm::mat4 ShadowProjMat;
     const swr::Framebuffer* ShadowBuffer;
@@ -30,13 +30,14 @@ struct PhongShader {
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
         VFloat4 pos = { .w = 1.0f };
-        data.ReadAttribs(&Vertex::x, &pos.x, 3);
+        data.ReadAttribs(&scene::Vertex::x, &pos.x, 3);
         vars.Position = swr::simd::TransformVector(ProjMat, pos);
 
-        data.ReadAttribs(&Vertex::u, &vars.Attribs[0], 2);
-        data.ReadAttribs(&Vertex::nx, &vars.Attribs[2], 3);
-        data.ReadAttribs(&Vertex::tx, &vars.Attribs[5], 3);
+        data.ReadAttribs(&scene::Vertex::u, &vars.Attribs[0], 2);
+        data.ReadAttribs(&scene::Vertex::nx, &vars.Attribs[2], 3);
+        data.ReadAttribs(&scene::Vertex::tx, &vars.Attribs[5], 3);
 
+        pos = swr::simd::TransformVector(ModelMat, pos);
         vars.Attribs[6] = pos.x;
         vars.Attribs[7] = pos.y;
         vars.Attribs[8] = pos.z;
@@ -127,7 +128,7 @@ struct DepthOnlyShader {
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
         VFloat4 pos = { .w = 1.0f };
-        data.ReadAttribs(&Vertex::x, &pos.x, 3);
+        data.ReadAttribs(&scene::Vertex::x, &pos.x, 3);
         vars.Position = swr::simd::TransformVector(ProjMat, pos);
     }
 
@@ -139,7 +140,7 @@ struct DepthOnlyShader {
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
-    std::unique_ptr<Model> _model, _shadowModel;
+    std::unique_ptr<scene::Model> _model, _shadowModel;
     Camera _cam;
     std::unique_ptr<ogl::Texture2D> _frontTex;
     std::unique_ptr<ogl::Texture2D> _shadowDebugTex;
@@ -152,11 +153,11 @@ class SwRenderer {
 
 public:
     SwRenderer() {
-        _model = std::make_unique<Model>("Models/Sponza/Sponza.gltf");
-        _shadowModel = std::make_unique<Model>("Models/Sponza/Sponza_LowPoly.gltf");
+        _model = std::make_unique<scene::Model>("Models/Sponza/Sponza.gltf");
+        _shadowModel = std::make_unique<scene::Model>("Models/Sponza/Sponza_LowPoly.gltf");
 
-        //_model = std::make_unique<Model>("Models/sea_keep_lonely_watcher/scene.gltf");
-        //_model = std::make_unique<Model>("Models/SunTemple_v4/SunTemple.fbx");
+        //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
+        //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");
 
         _cam = Camera{ .Position = glm::vec3(0, 4, 0), .MoveSpeed = 10.0f };
 
@@ -206,8 +207,9 @@ public:
 
         double shadowElapsed = (std::chrono::high_resolution_clock::now() - renderStart).count() / 1000000.0;
 
+        glm::mat4 projMat = _cam.GetViewProjMatrix();
+
         PhongShader shader = {
-            .ProjMat = _cam.GetViewProjMatrix(),
             .LightPos = _lightPos,
             .ShadowProjMat = _shadowProjMat,
             .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
@@ -215,17 +217,25 @@ public:
 
         _fb->Clear(0xD0EEFF, 1.0f);
 
-        for (Mesh& mesh : _model->Meshes) {
-            shader.DiffuseTex = mesh.Material->DiffuseTex;
-            shader.NormalTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
+        _model->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
+            for (uint32_t meshId : node.Meshes) {
+                scene::Mesh& mesh = _model->Meshes[meshId];
 
-            swr::VertexReader data(
-                (uint8_t*)&_model->VertexBuffer[mesh.VertexOffset], 
-                (uint8_t*)&_model->IndexBuffer[mesh.IndexOffset],
-                mesh.IndexCount, swr::VertexReader::U16);
+                shader.ProjMat = projMat * modelMat;
+                shader.ModelMat = modelMat;
 
-            _rast->Draw(data, shader);
-        }
+                shader.DiffuseTex = mesh.Material->DiffuseTex;
+                shader.NormalTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
+
+                swr::VertexReader data(
+                    (uint8_t*)&_model->VertexBuffer[mesh.VertexOffset], 
+                    (uint8_t*)&_model->IndexBuffer[mesh.IndexOffset],
+                    mesh.IndexCount, swr::VertexReader::U16);
+
+                _rast->Draw(data, shader);
+            }
+            return true;
+        });
 
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             _lightPos = _cam.Position;
@@ -245,7 +255,7 @@ public:
         ImGui::Begin("Rasterizer Stats");
         ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed);
         ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms)", stats.SetupTime[0] / 1000000.0, stats.ClippingTime[0] / 1000000.0, stats.BinningTime[0] / 1000000.0);
-        ImGui::Text("Rasterize: %.1fms (actual CPU: %.1fms)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / 1000000.0);
+        ImGui::Text("Rasterize: %.1fms (CPU: %.0f%%)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / (double)(stats.RasterizeTime[0] * std::thread::hardware_concurrency()) * 100);
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0);
         stats.Reset();
         ImGui::End();
@@ -257,16 +267,21 @@ public:
         //TODO: fix shadow matrix
         _shadowProjMat = glm::ortho(-12.0f, +12.0f, -12.0f, +12.0f, 0.05f, 40.0f) * glm::lookAt(_lightPos, glm::vec3(0, -1, 0), glm::vec3(0, 1, 0));
 
-        DepthOnlyShader shader = { .ProjMat = _shadowProjMat };
-
         _shadowFb->ClearDepth(1.0f);
 
-        for (Mesh& mesh : _shadowModel->Meshes) {
-            swr::VertexReader data((uint8_t*)&_shadowModel->VertexBuffer[mesh.VertexOffset],
-                                   (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset], mesh.IndexCount, swr::VertexReader::U16);
+        _shadowModel->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
+            for (uint32_t meshId : node.Meshes) {
+                scene::Mesh& mesh = _shadowModel->Meshes[meshId];
 
-            _shadowRast->Draw(data, shader);
-        }
+                swr::VertexReader data(
+                    (uint8_t*)&_shadowModel->VertexBuffer[mesh.VertexOffset],
+                    (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset],
+                    mesh.IndexCount, swr::VertexReader::U16);
+
+                _shadowRast->Draw(data, DepthOnlyShader { .ProjMat = _shadowProjMat * modelMat });
+            }
+            return true;
+        });
 
         if (ImGui::Begin("Shadow Debug")) {
             uint32_t n = _shadowFb->Width * _shadowFb->Height;

@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_executable(SwRast 
     Main.cpp
-    Model.cpp
+    Scene.cpp
     
     Texture2D.cpp
     Rasterizer.cpp
