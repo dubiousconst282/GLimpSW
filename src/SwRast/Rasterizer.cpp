@@ -81,8 +81,8 @@ void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16
     int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
     tris.Setup(width, height, numAttribs);
 
-    // TODO: backface culling (need to flip vertices or smt)
-    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip zero area triangles
+    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(0.0f), _CMP_GT_OQ);  // backface culling (skip triangles with negative area)
+    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip triangles with zero area
 
     for (uint32_t i : BitIter(mask)) {
         const uint32_t binShift = TriangleBatch::BinSizeLog2;
@@ -108,7 +108,6 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
     while (pos < count) {
         TriangleBatch& batch = *_batch;
-        batch.Count = 0;
 
         STAT_TIME_BEGIN(Setup);
 
@@ -124,6 +123,8 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         STAT_TIME_END(Setup);
 
+        if (batch.Count == 0) continue;
+        
         STAT_TIME_BEGIN(Rasterize);
 
         auto binRange = std::ranges::iota_view(0u, batch.NumBins);
@@ -133,6 +134,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
             auto startTime = std::chrono::high_resolution_clock::now();
 
             std::vector<uint16_t>& bin = batch.Bins[bid];
+            if (bin.size() == 0) return;
 
             BinnedTriangle bt = {
                 .X = (bid % batch.BinsPerRow) * TriangleBatch::BinSize,
@@ -147,7 +149,8 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
             elapsed += (std::chrono::high_resolution_clock::now() - startTime).count();
         });
-        g_Stats.RasterizeCpuTime += elapsed.load() / std::thread::hardware_concurrency();
+        g_Stats.RasterizeCpuTime += elapsed.load();
+        batch.Count = 0;
 
         STAT_TIME_END(Rasterize);
     }

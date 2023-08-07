@@ -65,7 +65,7 @@ struct PhongShader {
             // mat3 TBN = mat3(T, cross(N, T), N);
             // vec3 n = texture(u_NormalTex, UV).rgb * 2.0 - 1.0;
             // norm = normalize(TBN * n);
-            VFloat3 T = swr::simd::normalize({ vars.GetSmooth(5), vars.GetSmooth(6), vars.GetSmooth(7) });
+            VFloat3 T = { vars.GetSmooth(5), vars.GetSmooth(6), vars.GetSmooth(7) };
             
             // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
             // Re-orthogonalize T with respect to N
@@ -75,10 +75,12 @@ struct PhongShader {
 
             VFloat4 SN = NormalTex->SampleHybrid(u, v);
 
-            // https://aras-p.info/texts/CompactNormalStorage.html#q-comparison
             VFloat Sx = SN.x * 2.0f - 1.0f;
             VFloat Sy = SN.y * 2.0f - 1.0f;
-            VFloat Sz = swr::simd::sqrt14(1.0f - Sx * Sx + Sy * Sy);  // sqrt(1.0f - dot(n.xy, n.xy));
+            VFloat Sz = SN.z * 2.0f - 1.0f;
+            // TODO: use GA channels for PBR roughness/metalness
+            // https://aras-p.info/texts/CompactNormalStorage.html#q-comparison
+            // VFloat Sz = swr::simd::sqrt14(1.0f - Sx * Sx + Sy * Sy);  // sqrt(1.0f - dot(n.xy, n.xy));
 
             N.x = T.x * Sx + B.x * Sy + N.x * Sz;
             N.y = T.y * Sx + B.y * Sy + N.y * Sz;

@@ -297,7 +297,7 @@ concept ShaderProgram =
     };
 
 struct TriangleBatch {
-    static const uint32_t MaxSize = 2048 / VFloat::Length;
+    static const uint32_t MaxSize = 4096 / VFloat::Length;
     static const uint32_t BinSizeLog2 = 7, BinSize = 1 << BinSizeLog2;
 
     std::unique_ptr<std::vector<uint16_t>[]> Bins;
