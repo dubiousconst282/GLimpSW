@@ -141,10 +141,14 @@ class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
     std::unique_ptr<scene::Model> _model, _shadowModel;
+
     Camera _cam;
+    scene::DepthPyramid _depthPyramid;
+
     std::unique_ptr<ogl::Texture2D> _frontTex;
     std::unique_ptr<ogl::Texture2D> _shadowDebugTex;
     std::unique_ptr<uint32_t[]> _tempPixels;
+
     glm::vec3 _lightPos, _lightRot;
     glm::mat4 _shadowProjMat;
 
@@ -180,7 +184,8 @@ public:
 
     void Render() {
         static bool s_NormalMapping = true;
-        static bool s_EnableShadows = true;
+        static bool s_EnableShadows = false;
+        static bool s_HzbOcclusion = true;
 
         ImGui::Begin("Settings");
 
@@ -194,6 +199,7 @@ public:
         }
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
+        ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
@@ -215,7 +221,9 @@ public:
             .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
         };
 
-        _fb->Clear(0xD0EEFF, 1.0f);
+        _fb->Clear(0xFF'FFEED0, 1.0f);
+
+        uint32_t drawCalls = 0;
 
         _model->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
             for (uint32_t meshId : node.Meshes) {
@@ -223,6 +231,8 @@ public:
 
                 shader.ProjMat = projMat * modelMat;
                 shader.ModelMat = modelMat;
+
+                if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
 
                 shader.DiffuseTex = mesh.Material->DiffuseTex;
                 shader.NormalTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
@@ -233,12 +243,18 @@ public:
                     mesh.IndexCount, swr::VertexReader::U16);
 
                 _rast->Draw(data, shader);
+                drawCalls++;
             }
             return true;
         });
 
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             _lightPos = _cam.Position;
+        }
+
+        if (s_HzbOcclusion) {
+            _depthPyramid.Update(*_fb, shader.ProjMat);
+            RenderDebugHzb();
         }
 
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
@@ -256,7 +272,7 @@ public:
         ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed);
         ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms)", stats.SetupTime[0] / 1000000.0, stats.ClippingTime[0] / 1000000.0, stats.BinningTime[0] / 1000000.0);
         ImGui::Text("Rasterize: %.1fms (CPU: %.0f%%)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / (double)(stats.RasterizeTime[0] * std::thread::hardware_concurrency()) * 100);
-        ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0);
+        ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0, drawCalls);
         stats.Reset();
         ImGui::End();
 
@@ -299,6 +315,31 @@ public:
                 }
             }
             _shadowDebugTex->SetPixels(buf.get(), _shadowFb->Width);
+
+            ImGui::Image((ImTextureID)(uintptr_t)_shadowDebugTex->Handle, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
+        }
+        ImGui::End();
+    }
+
+    void RenderDebugHzb() {
+        if (ImGui::Begin("Depth Pyramid")) {
+            static int level = 0;
+            ImGui::SliderInt("Level", &level, 0, 12);
+
+            uint32_t w = _fb->Width >> level;
+            uint32_t h = _fb->Height >> level;
+            _shadowDebugTex = std::make_unique<ogl::Texture2D>(w, h, 1, GL_RGBA8);
+            auto buf = std::make_unique<uint32_t[]>(w * h);
+
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    float d = _depthPyramid.GetDepth(x / (float)(w - 1), y / (float)(h - 1), level);
+
+                    uint8_t c = (uint8_t)(glm::sqrt(1.0f - d * d) * 255.0f);
+                    buf[x + y * w] = c * 0x01'01'01 | 0xFF'000000;
+                }
+            }
+            _shadowDebugTex->SetPixels(buf.get(), w);
 
             ImGui::Image((ImTextureID)(uintptr_t)_shadowDebugTex->Handle, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
         }
