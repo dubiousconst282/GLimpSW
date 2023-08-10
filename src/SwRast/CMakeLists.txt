@@ -44,5 +44,5 @@ target_include_directories(SwRast PRIVATE ${Stb_INCLUDE_DIR})
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     target_compile_options(SwRast PRIVATE "-march=native" "-ffast-math" "-Wno-unused" "-Wsign-conversion")
 else()
-    target_compile_options(SwRast PRIVATE "/arch:AVX2") # MSVC seems to be pretty bad at inlining and SIMD
+    target_compile_options(SwRast PRIVATE "/arch:AVX512" "/fp:fast")
 endif()
