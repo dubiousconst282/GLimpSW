@@ -15,132 +15,13 @@
 
 #include "Scene.h"
 #include "QuickGL.h"
-
-using swr::VFloat, swr::VFloat3, swr::VFloat4;
-
-struct PhongShader {
-    static const uint32_t NumCustomAttribs = 12;
-
-    glm::mat4 ProjMat, ModelMat;
-    glm::vec3 LightPos;
-    glm::mat4 ShadowProjMat;
-    const swr::Framebuffer* ShadowBuffer;
-    const swr::Texture2D* DiffuseTex;
-    const swr::Texture2D* NormalTex;
-
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        VFloat4 pos = { .w = 1.0f };
-        data.ReadAttribs(&scene::Vertex::x, &pos.x, 3);
-        vars.Position = swr::simd::TransformVector(ProjMat, pos);
-
-        data.ReadAttribs(&scene::Vertex::u, &vars.Attribs[0], 2);
-        data.ReadAttribs(&scene::Vertex::nx, &vars.Attribs[2], 3);
-        data.ReadAttribs(&scene::Vertex::tx, &vars.Attribs[5], 3);
-
-        pos = swr::simd::TransformVector(ModelMat, pos);
-        vars.Attribs[6] = pos.x;
-        vars.Attribs[7] = pos.y;
-        vars.Attribs[8] = pos.z;
-
-        if (ShadowBuffer != nullptr) {
-            VFloat4 shadowPos = swr::simd::TransformVector(ShadowProjMat, pos);
-            VFloat shadowRcpW = _mm512_rcp14_ps(shadowPos.w);
-
-            vars.Attribs[9] = shadowPos.x * shadowRcpW * 0.5f + 0.5f;
-            vars.Attribs[10] = shadowPos.y * shadowRcpW * 0.5f + 0.5f;
-            vars.Attribs[11] = shadowPos.z * shadowRcpW ;
-        }
-    }
-
-    void ShadePixels(const swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
-        vars.ApplyPerspectiveCorrection();
-
-        VFloat u = vars.GetSmooth(0);
-        VFloat v = vars.GetSmooth(1);
-        VFloat4 diffuseColor = DiffuseTex->SampleHybrid(u, v);
-
-        VFloat3 N = swr::simd::normalize({ vars.GetSmooth(2), vars.GetSmooth(3), vars.GetSmooth(4) });
-
-        if (NormalTex != nullptr) {
-            // T = normalize(T - dot(T, N) * N);
-            // mat3 TBN = mat3(T, cross(N, T), N);
-            // vec3 n = texture(u_NormalTex, UV).rgb * 2.0 - 1.0;
-            // norm = normalize(TBN * n);
-            VFloat3 T = { vars.GetSmooth(5), vars.GetSmooth(6), vars.GetSmooth(7) };
-            
-            // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
-            // Re-orthogonalize T with respect to N
-            VFloat TN = swr::simd::dot(T, N);
-            T = swr::simd::normalize({ T.x - TN * N.x, T.y - TN * N.y, T.z - TN * N.z });
-            VFloat3 B = swr::simd::cross(N, T);
-
-            VFloat4 SN = NormalTex->SampleHybrid(u, v);
-
-            VFloat Sx = SN.x * 2.0f - 1.0f;
-            VFloat Sy = SN.y * 2.0f - 1.0f;
-            VFloat Sz = SN.z * 2.0f - 1.0f;
-            // TODO: use GA channels for PBR roughness/metalness
-            // https://aras-p.info/texts/CompactNormalStorage.html#q-comparison
-            // VFloat Sz = swr::simd::sqrt14(1.0f - Sx * Sx + Sy * Sy);  // sqrt(1.0f - dot(n.xy, n.xy));
-
-            N.x = T.x * Sx + B.x * Sy + N.x * Sz;
-            N.y = T.y * Sx + B.y * Sy + N.y * Sz;
-            N.z = T.z * Sx + B.z * Sy + N.z * Sz;
-        }
-
-        VFloat3 lightDir = swr::simd::normalize({
-            LightPos.x - vars.GetSmooth(6),
-            LightPos.y - vars.GetSmooth(7),
-            LightPos.z - vars.GetSmooth(8),
-        });
-        VFloat NdotL = swr::simd::dot(N, lightDir);
-        VFloat diffuseLight = swr::simd::max(NdotL, 0.0f);
-        VFloat shadowLight = 1.0f;
-
-        if (ShadowBuffer != nullptr) [[unlikely]] {
-            VFloat sx = vars.GetSmooth(9);
-            VFloat sy = vars.GetSmooth(10);
-            VFloat bias = swr::simd::max(0.08f * (1.0f - NdotL), 0.001f);
-            VFloat currentDepth = vars.GetSmooth(11) - bias;
-            VFloat closestDepth = ShadowBuffer->SampleDepth(sx, sy);
-
-            // closestDepth > pos.z ? 1.0 : 0.0
-            shadowLight = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(closestDepth, currentDepth, _CMP_GE_OQ), shadowLight);
-        }
-        VFloat combinedLight = diffuseLight * shadowLight + 0.3f;
-
-        VFloat4 color = {
-            diffuseColor.x * combinedLight,
-            diffuseColor.y * combinedLight,
-            diffuseColor.z * combinedLight,
-            diffuseColor.w,
-        };
-
-        auto rgba = swr::simd::PackRGBA(color);
-        uint16_t alphaMask = _mm512_cmpgt_epu32_mask(rgba, _mm512_set1_epi32(200 << 24));
-        fb.WriteTile(vars.TileOffset, vars.TileMask & alphaMask, rgba, vars.Depth);
-    }
-};
-struct DepthOnlyShader {
-    static const uint32_t NumCustomAttribs = 0;
-
-    glm::mat4 ProjMat;
-
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        VFloat4 pos = { .w = 1.0f };
-        data.ReadAttribs(&scene::Vertex::x, &pos.x, 3);
-        vars.Position = swr::simd::TransformVector(ProjMat, pos);
-    }
-
-    void ShadePixels(const swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
-        _mm512_mask_storeu_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
-    }
-};
+#include "RendererShaders.h"
 
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
     std::unique_ptr<scene::Model> _model, _shadowModel;
+    std::unique_ptr<swr::HdrTexture2D> _skyboxTex;
 
     Camera _cam;
     scene::DepthPyramid _depthPyramid;
@@ -159,6 +40,8 @@ public:
     SwRenderer() {
         _model = std::make_unique<scene::Model>("Models/Sponza/Sponza.gltf");
         _shadowModel = std::make_unique<scene::Model>("Models/Sponza/Sponza_LowPoly.gltf");
+
+        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadImage("Skyboxes/sunflowers_puresky_4k.hdr"));
 
         //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");
@@ -215,7 +98,7 @@ public:
 
         glm::mat4 projMat = _cam.GetViewProjMatrix();
 
-        PhongShader shader = {
+        renderer::PhongShader shader = {
             .LightPos = _lightPos,
             .ShadowProjMat = _shadowProjMat,
             .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
@@ -247,6 +130,8 @@ public:
             }
             return true;
         });
+
+        renderer::DrawSkybox(*_fb, *_skyboxTex, _cam.GetProjectionMatrix(), _cam.GetViewMatrix());
 
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             _lightPos = _cam.Position;
@@ -294,7 +179,7 @@ public:
                     (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset],
                     mesh.IndexCount, swr::VertexReader::U16);
 
-                _shadowRast->Draw(data, DepthOnlyShader { .ProjMat = _shadowProjMat * modelMat });
+                _shadowRast->Draw(data, renderer::DepthOnlyShader{ .ProjMat = _shadowProjMat * modelMat });
             }
             return true;
         });

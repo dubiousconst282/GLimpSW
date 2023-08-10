@@ -35,7 +35,7 @@ struct Texture2D {
 
     Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels);
 
-    static Texture2D LoadImage(std::string_view filename, uint32_t mipLevels = 16);
+    static Texture2D LoadImage(std::string_view filename, std::string_view metalRoughMapFilename = "", uint32_t mipLevels = 16);
 
     void SetPixels(const uint32_t* pixels, uint32_t stride);
 
@@ -57,6 +57,29 @@ private:
         return VInt::gather<4>((int32_t*)Data.get(), indices);
     }
     void GenerateMips();
+};
+// HDR float multi-layer texture
+struct HdrTexture2D {
+    uint32_t Width, Height, NumLayers;
+    uint32_t StrideLog2;               // Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
+    std::unique_ptr<uint32_t[]> Data;  // R11F_G11F_B10F float pixel data.
+
+    HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers);
+
+    // Initializes the texture with RGB float pixels.
+    void SetPixels(const float* pixels, uint32_t stride, uint32_t layer);
+
+    // __vectorcall is so badly broken, you know.
+    VFloat3 SampleNearest(VFloat u, VFloat v, VInt layer) const;
+
+    // Project normalized direction to cubemap UV and face.
+    static inline void ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx);
+
+    static HdrTexture2D LoadImage(std::string_view filename);
+
+private:
+    float _scaleU, _scaleV;
+    int32_t _maskU, _maskV;
 };
 
 struct Framebuffer {

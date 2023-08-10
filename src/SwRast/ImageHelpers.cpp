@@ -8,12 +8,40 @@
 
 namespace swr {
 
-Texture2D Texture2D::LoadImage(std::string_view filename, uint32_t mipLevels) {
+Texture2D Texture2D::LoadImage(std::string_view filename, std::string_view metalRoughMapFilename, uint32_t mipLevels) {
     int width, height, channels;
     auto pixels = stbi_load(filename.data(), &width, &height, &channels, 4);
 
+    if (!metalRoughMapFilename.empty()) {
+        int mrWidth, mrHeight, mrChannels;
+        auto mrPixels = stbi_load(metalRoughMapFilename.data(), &mrWidth, &mrHeight, &mrChannels, 4);
+
+        if (mrPixels == nullptr || mrWidth != width || mrHeight != height) {
+            throw std::exception("Bad Metallic-Roughness map");
+        }
+        // Overwrite BA channels from normal map with Metallic and Roughness.
+        // The normal Z can be reconstructed with `sqrt(1.0f - dot(n.xy, n.xy))`
+        for (uint32_t i = 0; i < width * height; i++) {
+            pixels[i * 4 + 2] = mrPixels[i * 4 + 0];
+            pixels[i * 4 + 3] = mrPixels[i * 4 + 1];
+        }
+        stbi_image_free(mrPixels);
+    }
+
     auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
     tex.SetPixels((uint32_t*)pixels, tex.Width);
+
+    stbi_image_free(pixels);
+
+    return tex;
+}
+
+HdrTexture2D HdrTexture2D::LoadImage(std::string_view filename) {
+    int width, height, channels;
+    auto pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
+
+    auto tex = HdrTexture2D((uint32_t)width, (uint32_t)height, 1);
+    tex.SetPixels(pixels, tex.Width, 0);
 
     stbi_image_free(pixels);
 

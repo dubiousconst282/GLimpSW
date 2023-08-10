@@ -179,4 +179,107 @@ VFloat4 Texture2D::SampleHybrid(VFloat u, VFloat v) const {
     return SampleLinear(u, v);
 }
 
+HdrTexture2D::HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers) {
+    assert(std::has_single_bit(width) && std::has_single_bit(height));
+
+    Width = width;
+    Height = height;
+    StrideLog2 = (uint32_t)std::countr_zero(width);
+    NumLayers = numLayers;
+
+    Data = std::make_unique<uint32_t[]>(numLayers * (width << StrideLog2));
+
+    _scaleU = (float)width;
+    _scaleV = (float)height;
+    _maskU = (int32_t)width - 1;
+    _maskV = (int32_t)height - 1;
+}
+
+void HdrTexture2D::SetPixels(const float* pixels, uint32_t stride, uint32_t layer) {
+    uint32_t offset = layer * (Height << StrideLog2);
+
+    const auto PackFloat = [](float x, uint32_t fracBits) -> uint32_t {
+        uint32_t bits = *(uint32_t*)&x;
+        int32_t exp = (bits >> 23 & 255) - 127;
+        uint32_t frc = bits & ((1u << 23) - 1);
+
+        exp += 15;
+        frc >>= (23 - fracBits);
+
+        if (exp < 0) return 0;
+
+        if (exp > 31) {
+            exp = 31;
+            frc = 0;
+        }
+        return (uint32_t)exp << fracBits | frc;
+    };
+
+    for (uint32_t y = 0; y < Height; y++) {
+        for (uint32_t x = 0; x < Width; x++) {
+            uint32_t v = PackFloat(pixels[(x + y * stride) * 3 + 0], 6) << 21 | 
+                         PackFloat(pixels[(x + y * stride) * 3 + 1], 6) << 10 | 
+                         PackFloat(pixels[(x + y * stride) * 3 + 2], 5) << 0;
+
+            Data[offset + x + (y << StrideLog2)] = v;
+        }
+    }
+}
+
+// 5-bit exp, 6-bit mantissa
+inline VFloat UnpackF11(VInt x) {
+    // int exp = (x >> 6) & 0x1F;
+    // int frc = x & 0x3F;
+    // return (exp - 15 + 127) << 23 | frc << (23 - 6);
+
+    x = x << 17;
+    return simd::re2f((x & 0x0FFE0000) + 0x38000000);
+}
+// 5-bit exp, 5-bit mantissa
+inline VFloat UnpackF10(VInt x) {
+    // int exp = (x >> 5) & 0x1F;
+    // int frc = x & 0x1F;
+    // return (exp - 15 + 127) << 23 | frc << (23 - 5);
+
+    x = x << 18;
+    return simd::re2f((x & 0x0FFC0000) + 0x38000000);
+}
+
+VFloat3 HdrTexture2D::SampleNearest(VFloat u, VFloat v, VInt layer) const {
+    VFloat su = u * _scaleU, sv = v * _scaleV;
+    VInt ix = simd::round2i(su) & _maskU;
+    VInt iy = simd::round2i(sv) & _maskV;
+
+    VInt colors = VInt::gather<4>((int32_t*)Data.get(), ix + (iy << StrideLog2));
+
+    return {
+        UnpackF11((colors >> 21) & 0x7FF),
+        UnpackF11((colors >> 10) & 0x7FF),
+        UnpackF10((colors >> 0) & 0x3FF),
+    };
+}
+
+// https://gamedev.stackexchange.com/questions/183452/how-does-cube-mapping-work
+void HdrTexture2D::ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx) {
+    // Find axis with max magnitude
+    auto w = dir.x.reg;
+
+    uint16_t wy = _mm512_cmp_ps_mask(_mm512_abs_ps(dir.y), _mm512_abs_ps(w), _CMP_GT_OQ);
+    w = _mm512_mask_mov_ps(w, wy, dir.y);
+
+    uint16_t wz = _mm512_cmp_ps_mask(_mm512_abs_ps(dir.z), _mm512_abs_ps(w), _CMP_GT_OQ);
+    w = _mm512_mask_mov_ps(w, wz, dir.z);
+
+    // uv = { x: yz,  y: xz,  z: xy }[w]
+    u = _mm512_mask_mov_ps(dir.y, wy, dir.x);  // dir.y == w ? dir.x : dir.y;
+    v = _mm512_mask_mov_ps(dir.z, wz, dir.y);  // dir.z == w ? dir.y : dir.z;
+
+    // faceIdx = wz ? 2+2 : (wy ? 2 : 0)
+    faceIdx = _mm512_set1_epi32(2);
+    faceIdx = _mm512_mask_add_epi32(_mm512_maskz_mov_epi32(wy, faceIdx), wz, faceIdx, faceIdx);
+
+    // faceIdx += w < 0 ? 1 : 0
+    faceIdx += _mm512_srli_epi32(_mm512_castps_si512(w), 31);
+}
+
 }; // namespace swr
