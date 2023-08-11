@@ -153,7 +153,8 @@ struct DepthOnlyShader {
     }
 };
 
-inline void DrawSkybox(swr::Framebuffer& fb, const swr::HdrTexture2D& texture, const glm::mat4& projMat, const glm::mat4& viewMat) {
+
+inline void DrawSkybox(swr::Framebuffer& fb, const swr::HdrTexture2D& cubeMapTex, const glm::mat4& projMat, const glm::mat4& viewMat) {
     // Screen-space cubemap rendering, see https://gamedev.stackexchange.com/a/60377
     glm::mat4 invProj = glm::inverse(projMat * glm::mat4(viewMat[0], viewMat[1], viewMat[2], glm::vec4(0, 0, 0, 1)));
 
@@ -174,18 +175,12 @@ inline void DrawSkybox(swr::Framebuffer& fb, const swr::HdrTexture2D& texture, c
             VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2)) * dv - 1.0f;
 
             VFloat4 eyeDir = TransformVector(invProj, { u, v, 0.0f, 1.0f });
-            VFloat rcpW = _mm512_rcp14_ps(eyeDir.w);
 
-            VFloat3 eyeDirN = normalize({ eyeDir.x * rcpW, eyeDir.y * rcpW, eyeDir.z * rcpW });
+            VFloat faceU, faceV;
+            VInt faceIdx;
+            swr::HdrTexture2D::ProjectCubemap({ eyeDir.x, eyeDir.y, eyeDir.z }, faceU, faceV, faceIdx);
+            VFloat3 color = cubeMapTex.SampleNearest(faceU, faceV, faceIdx);
 
-            VFloat kU, kV;
-
-            for (size_t i = 0; i < 16; i++) {
-                kU[i] = atan2f(eyeDirN.z[i], eyeDirN.x[i]) / (pi * 2) + 0.5f;
-                kV[i] = asinf(-eyeDirN.y[i]) / pi + 0.5f;
-            }
-
-            VFloat3 color = texture.SampleNearest(kU, kV, 0);
             _mm512_mask_store_epi32(&fb.ColorBuffer[tileOffset], tileMask, PackRGBA({ color.x, color.y, color.z, 1.0f }));
         }
     }

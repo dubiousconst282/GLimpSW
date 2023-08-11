@@ -41,7 +41,7 @@ public:
         _model = std::make_unique<scene::Model>("Models/Sponza/Sponza.gltf");
         _shadowModel = std::make_unique<scene::Model>("Models/Sponza/Sponza_LowPoly.gltf");
 
-        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadImage("Skyboxes/sunflowers_puresky_4k.hdr"));
+        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadCubemapFromPanorama("Skyboxes/sunflowers_puresky_4k.hdr"));
 
         //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");

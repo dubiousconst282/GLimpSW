@@ -12,7 +12,7 @@ Texture2D::Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels) {
 
     Width = width;
     Height = height;
-    StrideLog2 = (uint32_t)std::countr_zero(width);
+    RowShift = (uint32_t)std::countr_zero(width);
 
     uint32_t nominalMips = (uint32_t)std::bit_width(std::min(width, height));
     MipLevels = std::max(std::min(std::min(mipLevels, nominalMips), VInt::Length), 1u);
@@ -96,7 +96,7 @@ VFloat4 Texture2D::SampleNearest(VFloat u, VFloat v) const {
     VInt iy = simd::round2i(sv) & _maskV;
 
     VInt level = simd::trunc2i(CalcMipLevel(su, sv));
-    VInt stride = (int32_t)StrideLog2;
+    VInt stride = (int32_t)RowShift;
 
     if (_mm512_cmpgt_epi32_mask(level, VInt(0))) {
         level = simd::min(simd::max(level, 0), (int32_t)MipLevels - 1);
@@ -132,7 +132,7 @@ VFloat4 Texture2D::SampleLinear(VFloat u, VFloat v) const {
 
     // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
     // Row 1
-    VInt indices00 = ix + (iy << StrideLog2);
+    VInt indices00 = ix + (iy << RowShift);
     // indices10 = indices00 + (ix < Width - 1)
     //           = indices00 - (ix < Width - 1 ? -1 : 0)
     VInt indices10 = _mm512_sub_epi32(indices00, _mm512_movm_epi32(_mm512_cmplt_epi32_mask(ix, _mm512_set1_epi32((int32_t)Width - 1))));
@@ -184,10 +184,11 @@ HdrTexture2D::HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers) 
 
     Width = width;
     Height = height;
-    StrideLog2 = (uint32_t)std::countr_zero(width);
+    RowShift = (uint32_t)std::countr_zero(width);
+    LayerShift = (uint32_t)std::countr_zero(height) + RowShift;
     NumLayers = numLayers;
 
-    Data = std::make_unique<uint32_t[]>(numLayers * (width << StrideLog2));
+    Data = std::make_unique<uint32_t[]>(numLayers * (width << RowShift));
 
     _scaleU = (float)width;
     _scaleV = (float)height;
@@ -195,39 +196,25 @@ HdrTexture2D::HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers) 
     _maskV = (int32_t)height - 1;
 }
 
-void HdrTexture2D::SetPixels(const float* pixels, uint32_t stride, uint32_t layer) {
-    uint32_t offset = layer * (Height << StrideLog2);
+static uint32_t PackFloat(float x, uint32_t fracBits) {
+    uint32_t bits = *(uint32_t*)&x;
+    int32_t exp = (bits >> 23 & 255) - 127;
+    uint32_t frc = bits & ((1u << 23) - 1);
 
-    const auto PackFloat = [](float x, uint32_t fracBits) -> uint32_t {
-        uint32_t bits = *(uint32_t*)&x;
-        int32_t exp = (bits >> 23 & 255) - 127;
-        uint32_t frc = bits & ((1u << 23) - 1);
+    exp += 15;
+    frc >>= (23 - fracBits);
 
-        exp += 15;
-        frc >>= (23 - fracBits);
+    if (exp < 0) return 0;
 
-        if (exp < 0) return 0;
-
-        if (exp > 31) {
-            exp = 31;
-            frc = 0;
-        }
-        return (uint32_t)exp << fracBits | frc;
-    };
-
-    for (uint32_t y = 0; y < Height; y++) {
-        for (uint32_t x = 0; x < Width; x++) {
-            uint32_t v = PackFloat(pixels[(x + y * stride) * 3 + 0], 6) << 21 | 
-                         PackFloat(pixels[(x + y * stride) * 3 + 1], 6) << 10 | 
-                         PackFloat(pixels[(x + y * stride) * 3 + 2], 5) << 0;
-
-            Data[offset + x + (y << StrideLog2)] = v;
-        }
+    if (exp > 31) {
+        exp = 31;
+        frc = 0;
     }
+    return (uint32_t)exp << fracBits | frc;
 }
 
 // 5-bit exp, 6-bit mantissa
-inline VFloat UnpackF11(VInt x) {
+static VFloat UnpackF11(VInt x) {
     // int exp = (x >> 6) & 0x1F;
     // int frc = x & 0x3F;
     // return (exp - 15 + 127) << 23 | frc << (23 - 6);
@@ -236,7 +223,7 @@ inline VFloat UnpackF11(VInt x) {
     return simd::re2f((x & 0x0FFE0000) + 0x38000000);
 }
 // 5-bit exp, 5-bit mantissa
-inline VFloat UnpackF10(VInt x) {
+static VFloat UnpackF10(VInt x) {
     // int exp = (x >> 5) & 0x1F;
     // int frc = x & 0x1F;
     // return (exp - 15 + 127) << 23 | frc << (23 - 5);
@@ -245,12 +232,26 @@ inline VFloat UnpackF10(VInt x) {
     return simd::re2f((x & 0x0FFC0000) + 0x38000000);
 }
 
-VFloat3 HdrTexture2D::SampleNearest(VFloat u, VFloat v, VInt layer) const {
-    VFloat su = u * _scaleU, sv = v * _scaleV;
-    VInt ix = simd::round2i(su) & _maskU;
-    VInt iy = simd::round2i(sv) & _maskV;
+void HdrTexture2D::SetPixels(const float* pixels, uint32_t stride, uint32_t layer) {
+    assert(layer < NumLayers);
 
-    VInt colors = VInt::gather<4>((int32_t*)Data.get(), ix + (iy << StrideLog2));
+    for (uint32_t y = 0; y < Height; y++) {
+        for (uint32_t x = 0; x < Width; x++) {
+            uint32_t v = PackFloat(pixels[(x + y * stride) * 3 + 0], 6) << 21 | 
+                         PackFloat(pixels[(x + y * stride) * 3 + 1], 6) << 10 | 
+                         PackFloat(pixels[(x + y * stride) * 3 + 2], 5) << 0;
+
+            Data[(layer << LayerShift) + x + (y << RowShift)] = v;
+        }
+    }
+}
+
+VFloat3 HdrTexture2D::SampleNearest(VFloat u, VFloat v, VInt layer) const {
+    // Artifacts from repeat wrap are very noticeable for cubemapping.
+    VInt ix = simd::min(simd::round2i(u * _scaleU), _maskU);
+    VInt iy = simd::min(simd::round2i(v * _scaleV), _maskV);
+
+    VInt colors = VInt::gather<4>((int32_t*)Data.get(), (layer << LayerShift) + ix + (iy << RowShift));
 
     return {
         UnpackF11((colors >> 21) & 0x7FF),
@@ -259,7 +260,8 @@ VFloat3 HdrTexture2D::SampleNearest(VFloat u, VFloat v, VInt layer) const {
     };
 }
 
-// https://gamedev.stackexchange.com/questions/183452/how-does-cube-mapping-work
+// https://en.wikipedia.org/wiki/Cube_mapping#Memory_addressing
+// This doesn't flip UVs depending on faces because that's stupid and every cycle matters. :)
 void HdrTexture2D::ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx) {
     // Find axis with max magnitude
     auto w = dir.x.reg;
@@ -270,9 +272,8 @@ void HdrTexture2D::ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceI
     uint16_t wz = _mm512_cmp_ps_mask(_mm512_abs_ps(dir.z), _mm512_abs_ps(w), _CMP_GT_OQ);
     w = _mm512_mask_mov_ps(w, wz, dir.z);
 
-    // uv = { x: yz,  y: xz,  z: xy }[w]
-    u = _mm512_mask_mov_ps(dir.y, wy, dir.x);  // dir.y == w ? dir.x : dir.y;
-    v = _mm512_mask_mov_ps(dir.z, wz, dir.y);  // dir.z == w ? dir.y : dir.z;
+    uint16_t wx = wy | wz; // negated
+    wy &= ~wz;
 
     // faceIdx = wz ? 2+2 : (wy ? 2 : 0)
     faceIdx = _mm512_set1_epi32(2);
@@ -280,6 +281,11 @@ void HdrTexture2D::ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceI
 
     // faceIdx += w < 0 ? 1 : 0
     faceIdx += _mm512_srli_epi32(_mm512_castps_si512(w), 31);
+
+    // uv = { x: zy,  y: xz,  z: xy }[w]
+    w = _mm512_rcp14_ps(_mm512_abs_ps(w)) * 0.5f;
+    u = _mm512_mask_mov_ps(dir.z, wx, dir.x) * w + 0.5f;  // dir.x == w ? dir.z : dir.x;
+    v = _mm512_mask_mov_ps(dir.y, wy, dir.z) * w + 0.5f;  // dir.y == w ? dir.z : dir.y;
 }
 
 }; // namespace swr

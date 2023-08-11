@@ -30,7 +30,7 @@ extern ProfilerStats g_Stats;
 
 struct Texture2D {
     uint32_t Width, Height, MipLevels;
-    uint32_t StrideLog2; //Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
+    uint32_t RowShift; //Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
     std::unique_ptr<uint32_t[]> Data;  // RGBA8 pixel data.
 
     Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels);
@@ -61,7 +61,7 @@ private:
 // HDR float multi-layer texture
 struct HdrTexture2D {
     uint32_t Width, Height, NumLayers;
-    uint32_t StrideLog2;               // Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
+    uint32_t RowShift, LayerShift;
     std::unique_ptr<uint32_t[]> Data;  // R11F_G11F_B10F float pixel data.
 
     HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers);
@@ -69,13 +69,13 @@ struct HdrTexture2D {
     // Initializes the texture with RGB float pixels.
     void SetPixels(const float* pixels, uint32_t stride, uint32_t layer);
 
-    // __vectorcall is so badly broken, you know.
-    VFloat3 SampleNearest(VFloat u, VFloat v, VInt layer) const;
+    VFloat3 __vectorcall SampleNearest(VFloat u, VFloat v, VInt layer) const;
 
     // Project normalized direction to cubemap UV and face.
-    static inline void ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx);
+    static void __vectorcall ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx);
 
     static HdrTexture2D LoadImage(std::string_view filename);
+    static HdrTexture2D LoadCubemapFromPanorama(std::string_view filename);
 
 private:
     float _scaleU, _scaleV;

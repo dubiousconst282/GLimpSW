@@ -47,6 +47,51 @@ HdrTexture2D HdrTexture2D::LoadImage(std::string_view filename) {
 
     return tex;
 }
+HdrTexture2D HdrTexture2D::LoadCubemapFromPanorama(std::string_view filename) {
+    int width, height, channels;
+    auto pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
+
+    uint32_t faceSize = (uint32_t)width / 4;
+
+    auto tex = HdrTexture2D(faceSize, faceSize, 6);
+    auto temp = std::make_unique<float[]>(faceSize * faceSize * 3);
+
+    for (uint32_t layer = 0; layer < 6; layer++) {
+        for (uint32_t y = 0; y < faceSize; y++) {
+            for (uint32_t x = 0; x < faceSize; x++) {
+                float u = x / (float)(faceSize - 1) * 2.0f - 1.0f;
+                float v = y / (float)(faceSize - 1) * 2.0f - 1.0f;
+
+                // clang-format off
+                glm::vec3 dirs[6]{
+                    {  1,  v,  u }, 
+                    { -1,  v,  u }, 
+                    {  u,  1,  v }, 
+                    {  u, -1,  v }, 
+                    {  u,  v,  1 }, 
+                    {  u,  v, -1 },
+                };
+                glm::vec3 dir = glm::normalize(dirs[layer]);
+
+                float tu = std::atan2f(dir.z, dir.x) / (simd::pi * 2.0f) + 0.5f;
+                float tv = std::asinf(-dir.y) / simd::pi + 0.5f;
+
+                // TODO: re-use linear sampling from HdrTextures if/when they support it
+                uint32_t px = std::min((uint32_t)(tu * width), (uint32_t)width - 1);
+                uint32_t py = std::min((uint32_t)(tv * height), (uint32_t)height - 1);
+
+                for (uint32_t ch = 0; ch < 3; ch++) {
+                    temp[(x + y * faceSize) * 3 + ch] = pixels[(px + py * (uint32_t)width) * 3 + ch];
+                }
+            }
+        }
+        tex.SetPixels(temp.get(), faceSize, layer);
+    }
+
+    stbi_image_free(pixels);
+
+    return tex;
+}
 
 void Framebuffer::GetPixels(uint32_t* __restrict dest, uint32_t stride) const {
     for (uint32_t y = 0; y < Height; y += 4) {
