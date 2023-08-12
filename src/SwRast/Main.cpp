@@ -38,10 +38,10 @@ class SwRenderer {
 
 public:
     SwRenderer() {
-        _model = std::make_unique<scene::Model>("Models/Sponza/Sponza.gltf");
-        _shadowModel = std::make_unique<scene::Model>("Models/Sponza/Sponza_LowPoly.gltf");
+        _model = std::make_unique<scene::Model>("assets/models/Sponza/Sponza.gltf");
+        _shadowModel = std::make_unique<scene::Model>("assets/models/Sponza/Sponza_LowPoly.gltf");
 
-        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadCubemapFromPanorama("Skyboxes/sunflowers_puresky_4k.hdr"));
+        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadCubemapFromPanorama("assets/skyboxes/sunflowers_puresky_4k.hdr"));
 
         //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");
@@ -249,15 +249,13 @@ public:
     }
 };
 
-
-
 int main(int argc, char** args) {
     if (!glfwInit()) return -1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
 
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "SwRast", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Glimpsw", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -270,9 +268,10 @@ int main(int argc, char** args) {
 
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = "logs/imgui.ini";
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    io.Fonts->AddFontFromFileTTF("Roboto-Medium.ttf", 18.0f);
+    io.Fonts->AddFontFromFileTTF("assets/Roboto-Medium.ttf", 18.0f);
 
     ImGui::StyleColorsDark();
 

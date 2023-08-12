@@ -8,7 +8,7 @@
             "program": "${command:cmake.launchTargetPath}",
             "args": [],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}/logs",
+            "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"
         }
     ]
