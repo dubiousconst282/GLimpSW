@@ -46,7 +46,7 @@ public:
         //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");
 
-        _cam = Camera{ .Position = glm::vec3(0, 4, 0), .MoveSpeed = 10.0f };
+        _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 10.0f };
 
         InitRasterizer(1280, 720);
 
@@ -54,7 +54,7 @@ public:
         _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
 
         _lightRot = glm::vec3(0.0f, -90.0f, 0.0f);
-        _lightPos = glm::vec3(-0.5f, 12.0f, 0.5f);
+        _lightPos = glm::vec3(3.5f, 12.0f, 2.9f);
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {

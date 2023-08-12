@@ -120,10 +120,13 @@ struct Framebuffer {
         _mm512_mask_storeu_ps(&DepthBuffer[offset], mask, depth);
     }
 
-    VFloat SampleDepth(VFloat x, VFloat y) const {
+    VFloat __vectorcall SampleDepth(VFloat x, VFloat y) const {
         VInt ix = simd::round2i(x * (int32_t)Width);
         VInt iy = simd::round2i(y * (int32_t)Height);
 
+        return SampleDepth(ix, iy);
+    }
+    VFloat __vectorcall SampleDepth(VInt ix, VInt iy) const {
         VInt tileId = (ix >> TileShift) + (iy >> TileShift) * (int32_t)TileStride;
         VInt pixelOffset = (ix & TileMask) + (iy & TileMask) * TileSize;
         VInt indices = tileId * TileNumPixels + pixelOffset;

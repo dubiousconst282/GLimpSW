@@ -84,24 +84,41 @@ struct PhongShader {
         });
         VFloat NdotL = dot(N, lightDir);
         VFloat diffuseLight = max(NdotL, 0.0f);
-        VFloat shadowLight = 1.0f;
 
-        if (ShadowBuffer != nullptr) [[unlikely]] {
+        if (ShadowBuffer != nullptr && _mm512_cmp_ps_mask(NdotL, _mm512_set1_ps(0.0f), _CMP_GT_OQ)) [[unlikely]] {
             VFloat sx = vars.GetSmooth(9);
             VFloat sy = vars.GetSmooth(10);
             VFloat bias = max((1.0f - NdotL) * 0.015f, 0.003f);
             VFloat currentDepth = vars.GetSmooth(11) - bias;
-            VFloat closestDepth = ShadowBuffer->SampleDepth(sx, sy);
 
-            // closestDepth > pos.z ? 1.0 : 0.0
-            shadowLight = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(closestDepth, currentDepth, _CMP_GE_OQ), shadowLight);
+            static const int8_t PoissonDisk[2][16] = {
+                { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
+                { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
+            };
+            auto samples = _mm_set1_epi8(0);
+
+            VInt x = round2i(sx * (float)(ShadowBuffer->Width << 6) + 31);
+            VInt y = round2i(sy * (float)(ShadowBuffer->Height << 6) + 31);
+
+            for (uint32_t i = 0; i < 16; i++) {
+                // If at the 4th iter samples are all 0 or 4, assume this area is not in a shadow edge
+                if (i == 4 && (!_mm_cmpgt_epu8_mask(samples, _mm_set1_epi8(0)) || !_mm_cmplt_epu8_mask(samples, _mm_set1_epi8(4)))) {
+                    diffuseLight *= conv2f(_mm512_cvtepi8_epi32(samples)) * (1.0 / 4);
+                    goto EarlyOutExit;
+                }
+                VFloat occlusionDepth = ShadowBuffer->SampleDepth((x + PoissonDisk[0][i]) >> 6, (y + PoissonDisk[1][i]) >> 6);
+                samples = _mm_mask_add_epi8(samples, _mm512_cmp_ps_mask(occlusionDepth, currentDepth, _CMP_GE_OQ), samples, _mm_set1_epi8(1));
+            }
+            diffuseLight *= conv2f(_mm512_cvtepi8_epi32(samples)) * (1.0 / 16);
+
+        EarlyOutExit:;
         }
-        VFloat combinedLight = diffuseLight * shadowLight + 0.3f;
+        diffuseLight += 0.3f;
 
         VFloat4 color = {
-            diffuseColor.x * combinedLight,
-            diffuseColor.y * combinedLight,
-            diffuseColor.z * combinedLight,
+            diffuseColor.x * diffuseLight,
+            diffuseColor.y * diffuseLight,
+            diffuseColor.z * diffuseLight,
             diffuseColor.w,
         };
 
