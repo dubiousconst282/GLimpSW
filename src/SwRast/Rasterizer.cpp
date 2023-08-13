@@ -200,8 +200,7 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
     // Perspective division
     for (uint32_t i = 0; i < 3; i++) {
         VFloat4& pos = Vertices[i].Position;
-        VFloat rw = 1.0f / pos.w;
-        pos = { pos.x * rw, pos.y * rw, pos.z * rw, rw };
+        pos = simd::PerspectiveDiv(pos);
     }
 
     const auto LoadFixedPos = [&](uint32_t axis, float scale) -> std::array<VInt, 3> {

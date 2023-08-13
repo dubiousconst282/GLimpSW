@@ -65,24 +65,9 @@ void Texture2D::GenerateMips() {
     }
 }
 
-// Calculate coarse partial derivatives for a 4x4 tile.
-// https://gamedev.stackexchange.com/a/130933
-static VFloat dFdx(VFloat p) {
-    auto a = _mm512_shuffle_ps(p, p, 0b10'10'00'00);  //[0 0 2 2]
-    auto b = _mm512_shuffle_ps(p, p, 0b11'11'01'01);  //[1 1 3 3]
-    return b - a;
-}
-static VFloat dFdy(VFloat p) {
-    // auto a = _mm256_permute2x128_si256(p, p, 0b00'00'00'00);  // dupe lower 128 lanes
-    // auto b = _mm256_permute2x128_si256(p, p, 0b01'01'01'01);  // dupe upper 128 lanes
-    auto a = _mm512_shuffle_f32x4(p, p, 0b10'10'00'00);
-    auto b = _mm512_shuffle_f32x4(p, p, 0b11'11'01'01);
-    return b - a;
-}
-
 static VFloat CalcMipLevel(VFloat scaledU, VFloat scaledV) {
-    VFloat dxu = dFdx(scaledU), dyu = dFdy(scaledU);
-    VFloat dxv = dFdx(scaledV), dyv = dFdy(scaledV);
+    VFloat dxu = simd::dFdx(scaledU), dyu = simd::dFdy(scaledU);
+    VFloat dxv = simd::dFdx(scaledV), dyv = simd::dFdy(scaledV);
 
     VFloat maxDeltaSq = simd::max(simd::fma(dxu, dxu, dxv * dxv), simd::fma(dyu, dyu, dyv * dyv));
     return simd::approx_log2(maxDeltaSq) * 0.5f;

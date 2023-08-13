@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SwRast.h"
+#include <random>
 
 namespace renderer {
 
@@ -127,6 +128,7 @@ struct PhongShader {
         fb.WriteTile(vars.TileOffset, vars.TileMask & alphaMask, rgba, vars.Depth);
     }
 
+    // TODO: Move this to PBR shader if/when
     static VFloat DistributionGGX(VFloat3 N, VFloat3 H, VFloat roughness) {
         VFloat a = roughness * roughness;
         VFloat a2 = a * a;
@@ -170,15 +172,125 @@ struct DepthOnlyShader {
     }
 };
 
+struct EffectSSAO {
+    static const uint32_t KernelSize = 32;
+    float Radius = 0.5f;
+
+    float Kernel[3][KernelSize];
+    float Noise[2][16];
+
+    EffectSSAO() {
+        std::mt19937 prng(123456);
+        std::uniform_real_distribution<float> unid;
+
+        for (uint32_t i = 0; i < KernelSize; i++) {
+            glm::vec3 s = {
+                unid(prng) * 2.0f - 1.0f,
+                unid(prng) * 2.0f - 1.0f,
+                unid(prng),
+            };
+            s = glm::normalize(s) * unid(prng);  // Re-distrubute to hemisphere
+
+            // Cluster samples closer to origin
+            float scale = (float)i / KernelSize;
+            s *= glm::lerp(0.1f, 1.0f, scale * scale);
+
+            for (int32_t j = 0; j < 3; j++) {
+                Kernel[j][i] = s[j];
+            }
+        }
+        for (uint32_t i = 0; i < 16; i++) {
+            glm::vec2 s = {
+                unid(prng) * 2.0f - 1.0f,
+                unid(prng) * 2.0f - 1.0f,
+            };
+            s = glm::normalize(s);
+
+            Noise[0][i] = s.x;
+            Noise[1][i] = s.y;
+        }
+    }
+
+    void Generate(swr::Framebuffer& fb, const glm::mat4& projViewMat) {
+        glm::mat4 invProj = glm::inverse(projViewMat);
+        // Bias matrix so that input UVs can be in range [0..1] rather than [-1..1]
+        invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
+        invProj = glm::scale(invProj, glm::vec3(2.0f / fb.Width, 2.0f / fb.Height, 1.0f));
+
+        bool altView = std::chrono::high_resolution_clock::now().time_since_epoch().count() / 1000000000 % 2;
+
+        for (uint32_t y = 0; y < fb.Height; y += 4) {
+            for (uint32_t x = 0; x < fb.Width; x += 4) {
+                uint32_t tileOffset = fb.GetPixelOffset(x, y);
+
+                VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
+                VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
+                VFloat z = VFloat::load(&fb.DepthBuffer[tileOffset]);
+
+                VFloat4 pos = PerspectiveDiv(TransformVector(invProj, { u, v, z, 1.0f }));
+
+                VFloat3 posDx = { dFdx(pos.x), dFdx(pos.y), dFdx(pos.z) };
+                VFloat3 posDy = { dFdy(pos.x), dFdy(pos.y), dFdy(pos.z) };
+                VFloat3 N = normalize(cross(posDx, posDy));
+
+                VFloat3 rotation = { VFloat::load(Noise[0]), VFloat::load(Noise[1]), 0.0f };
+                VFloat NdotR = dot(rotation, N);
+                VFloat3 T = normalize({
+                    rotation.x - N.x * NdotR,
+                    rotation.y - N.y * NdotR,
+                    rotation.z - N.z * NdotR,
+                });
+                VFloat3 B = cross(N, T);
+
+                auto occlusion = _mm_set1_epi8(0);
+
+                for (uint32_t i = 0; i < KernelSize; i++) {
+                    VFloat sx = Kernel[0][i], sy = Kernel[1][i], sz = Kernel[2][i];
+                    sx = T.x * sx + B.x * sy + N.x * sz;
+                    sy = T.y * sx + B.y * sy + N.y * sz;
+                    sz = T.z * sx + B.z * sy + N.z * sz;
+
+                    sx = pos.x + sx * Radius;
+                    sy = pos.y + sy * Radius;
+                    sz = pos.z + sz * Radius;
+
+                    VFloat4 samplePos = PerspectiveDiv(TransformVector(projViewMat, { sx, sy, sz, 1.0f }));
+                    VFloat sampleDepth = fb.SampleDepth(samplePos.x * 0.5f + 0.5f, samplePos.y * 0.5f + 0.5f);
+                    VFloat sampleDist = _mm512_abs_ps(LinearizeDepth(z) - LinearizeDepth(sampleDepth));
+
+                    uint16_t rangeMask = _mm512_cmp_ps_mask(sampleDist, _mm512_set1_ps(Radius), _CMP_LT_OQ);
+                    uint16_t occluMask = _mm512_cmp_ps_mask(sampleDepth, samplePos.z - 0.00005f, _CMP_LE_OQ);
+                    occlusion = _mm_sub_epi8(occlusion, _mm_movm_epi8(occluMask & rangeMask));
+
+                    //float rangeCheck = abs(origin.z - sampleDepth) < uRadius ? 1.0 : 0.0;
+                    //occlusion += (sampleDepth <= sample.z ? 1.0 : 0.0) * rangeCheck;
+                }
+                VFloat occlusionFac = 1.0f - conv2f(_mm512_cvtepi8_epi32(occlusion)) * (1.0f / KernelSize);
+
+                VFloat4 color = { occlusionFac, occlusionFac, occlusionFac, 1.0f };
+
+                _mm512_store_epi32(&fb.ColorBuffer[tileOffset], PackRGBA(color));
+            }
+        }
+    }
+    __m128i ComputeOcclusion(VFloat u, VFloat v, VFloat z) {
+        
+    }
+    static VFloat LinearizeDepth(VFloat d) {
+        const float zNear = 0.05f, zFar = 1000.0f;
+        VFloat z_n = d * 2.0f - 1.0f;
+        return (2.0f * zNear * zFar) / ((zFar + zNear) - z_n * (zFar - zNear));
+    }
+};
 
 inline void DrawSkybox(swr::Framebuffer& fb, const swr::HdrTexture2D& cubeMapTex, const glm::mat4& projMat, const glm::mat4& viewMat) {
     // Screen-space cubemap rendering, see https://gamedev.stackexchange.com/a/60377
     glm::mat4 invProj = glm::inverse(projMat * glm::mat4(viewMat[0], viewMat[1], viewMat[2], glm::vec4(0, 0, 0, 1)));
+    // Bias matrix so that input UVs can be in range [0..1] rather than [-1..1]
+    invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
+    invProj = glm::scale(invProj, glm::vec3(2.0f / fb.Width, 2.0f / fb.Height, 1.0f));
 
     float minDepth = 1.0f;
-
-    VFloat du = 2.0f / fb.Width;
-    VFloat dv = 2.0f / fb.Height;
 
     for (uint32_t y = 0; y < fb.Height; y += 4) {
         for (uint32_t x = 0; x < fb.Width; x += 4) {
@@ -188,8 +300,8 @@ inline void DrawSkybox(swr::Framebuffer& fb, const swr::HdrTexture2D& cubeMapTex
 
             if (!tileMask) continue;
 
-            VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3)) * du - 1.0f;
-            VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2)) * dv - 1.0f;
+            VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
+            VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
 
             VFloat4 eyeDir = TransformVector(invProj, { u, v, 0.0f, 1.0f });
 

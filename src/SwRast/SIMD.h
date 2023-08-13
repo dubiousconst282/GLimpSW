@@ -150,7 +150,7 @@ inline VFloat sin(VFloat a) {
 }
 
 // Sleef xfastcosf_u3500()
-static VFloat cos(VFloat a) {
+inline VFloat cos(VFloat a) {
     VInt q = round2i(fma(a, inv_pi, -0.5f));
     VFloat d = fma(conv2f(q), -pi, a - (pi * 0.5f));
 
@@ -164,9 +164,24 @@ static VFloat cos(VFloat a) {
 }
 
 // https://github.com/romeric/fastapprox/blob/master/fastapprox/src/fastlog.h
-static VFloat approx_log2(VFloat x) {
+inline VFloat approx_log2(VFloat x) {
     VFloat y = conv2f(re2i(x));
     return fma(y, 1.1920928955078125e-7f, -126.94269504f);
+}
+
+// Calculate coarse partial derivatives for a 4x4 tile.
+// https://gamedev.stackexchange.com/a/130933
+inline VFloat dFdx(VFloat p) {
+    auto a = _mm512_shuffle_ps(p, p, 0b10'10'00'00);  //[0 0 2 2]
+    auto b = _mm512_shuffle_ps(p, p, 0b11'11'01'01);  //[1 1 3 3]
+    return b - a;
+}
+inline VFloat dFdy(VFloat p) {
+    // auto a = _mm256_permute2x128_si256(p, p, 0b00'00'00'00);  // dupe lower 128 lanes
+    // auto b = _mm256_permute2x128_si256(p, p, 0b01'01'01'01);  // dupe upper 128 lanes
+    auto a = _mm512_shuffle_f32x4(p, p, 0b10'10'00'00);
+    auto b = _mm512_shuffle_f32x4(p, p, 0b11'11'01'01);
+    return b - a;
 }
 
 inline VInt PackRGBA(const VFloat4& color) {
@@ -190,6 +205,10 @@ inline VFloat4 TransformVector(const glm::mat4& m, const VFloat4& v) {
         m[0][2] * v.x + m[1][2] * v.y + m[2][2] * v.z + m[3][2] * v.w,
         m[0][3] * v.x + m[1][3] * v.y + m[2][3] * v.z + m[3][3] * v.w,
     };
+}
+inline VFloat4 PerspectiveDiv(const VFloat4& v) {
+    VFloat rw = 1.0f / v.w;
+    return { v.x * rw, v.y * rw, v.z * rw, rw };
 }
 
 };  // namespace simd

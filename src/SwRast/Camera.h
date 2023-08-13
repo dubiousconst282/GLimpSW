@@ -13,8 +13,7 @@ struct Camera {
     float MoveSpeed = 30.0f;
 
     glm::mat4 GetViewMatrix() { return glm::translate(glm::mat4_cast(Rotation), -_ViewPosition); }
-    glm::mat4 GetProjectionMatrix() { return glm::perspective(FieldOfView, AspectRatio, 0.05f, 1000.0f); }
-    glm::mat4 GetViewProjMatrix() { return GetProjectionMatrix() * GetViewMatrix(); }
+    glm::mat4 GetProjMatrix() { return glm::perspective(FieldOfView, AspectRatio, 0.05f, 1000.0f); }
 
     void Update() {
         ImGuiIO& io = ImGui::GetIO();

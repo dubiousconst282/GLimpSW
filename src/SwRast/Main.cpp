@@ -36,6 +36,8 @@ class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _shadowFb;
     std::unique_ptr<swr::Rasterizer> _shadowRast;
 
+    renderer::EffectSSAO _ssao;
+
 public:
     SwRenderer() {
         _model = std::make_unique<scene::Model>("assets/models/Sponza/Sponza.gltf");
@@ -80,6 +82,7 @@ public:
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
             ImGui::EndCombo();
         }
+        ImGui::InputFloat("SSAO Radius", &_ssao.Radius, 0.1f);
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
@@ -96,7 +99,9 @@ public:
 
         double shadowElapsed = (std::chrono::high_resolution_clock::now() - renderStart).count() / 1000000.0;
 
-        glm::mat4 projMat = _cam.GetViewProjMatrix();
+        glm::mat4 projMat = _cam.GetProjMatrix();
+        glm::mat4 viewMat = _cam.GetViewMatrix();
+        glm::mat4 projViewMat = projMat * viewMat;
 
         renderer::PhongShader shader = {
             .LightPos = _lightPos,
@@ -104,7 +109,7 @@ public:
             .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
         };
 
-        _fb->Clear(0xFF'FFEED0, 1.0f);
+        _fb->ClearDepth(1.0f);
 
         uint32_t drawCalls = 0;
 
@@ -112,7 +117,7 @@ public:
             for (uint32_t meshId : node.Meshes) {
                 scene::Mesh& mesh = _model->Meshes[meshId];
 
-                shader.ProjMat = projMat * modelMat;
+                shader.ProjMat = projViewMat * modelMat;
                 shader.ModelMat = modelMat;
 
                 if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
@@ -131,15 +136,20 @@ public:
             return true;
         });
 
-        renderer::DrawSkybox(*_fb, *_skyboxTex, _cam.GetProjectionMatrix(), _cam.GetViewMatrix());
+        auto postProcessStart = std::chrono::high_resolution_clock::now();
+        _ssao.Generate(*_fb, projViewMat);
 
-        if (ImGui::IsKeyPressed(ImGuiKey_M)) {
-            _lightPos = _cam.Position;
-        }
+        renderer::DrawSkybox(*_fb, *_skyboxTex, projMat, viewMat);
 
         if (s_HzbOcclusion) {
             _depthPyramid.Update(*_fb, shader.ProjMat);
             RenderDebugHzb();
+        }
+
+        double postProcessElapsed = (std::chrono::high_resolution_clock::now() - postProcessStart).count() / 1000000.0;
+
+        if (ImGui::IsKeyPressed(ImGuiKey_M)) {
+            _lightPos = _cam.Position;
         }
 
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
@@ -154,7 +164,7 @@ public:
         drawList->AddImage(texId, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 1), ImVec2(1, 0));
 
         ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed);
+        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, postProcessElapsed);
         ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms)", stats.SetupTime[0] / 1000000.0, stats.ClippingTime[0] / 1000000.0, stats.BinningTime[0] / 1000000.0);
         ImGui::Text("Rasterize: %.1fms (CPU: %.0f%%)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / (double)(stats.RasterizeTime[0] * std::thread::hardware_concurrency()) * 100);
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0, drawCalls);
@@ -238,7 +248,7 @@ public:
         ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
 
         glm::mat4 viewMat = _cam.GetViewMatrix();
-        glm::mat4 projMat = _cam.GetProjectionMatrix();
+        glm::mat4 projMat = _cam.GetProjMatrix();
         float matrix[16];
         float scale[3]{ 1.0f, 1.0f, 1.0f };
         ImGuizmo::RecomposeMatrixFromComponents(&pos.x, &rot.x, scale, matrix);
