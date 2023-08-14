@@ -86,21 +86,25 @@ struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
     static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
 
-    uint32_t Width, Height, TileStride;
+    uint32_t Width, Height, TileStride, NumAttachments;
     uint32_t* ColorBuffer;
     float* DepthBuffer;
+    uint8_t* AttachmentBuffer;
 
-    Framebuffer(uint32_t width, uint32_t height) {
+    Framebuffer(uint32_t width, uint32_t height, uint32_t numAttachments = 0) {
         Width = (width + TileMask) & ~TileMask;
         Height = (height + TileMask) & ~TileMask;
         TileStride = Width / TileSize;
+        NumAttachments = numAttachments;
 
         ColorBuffer = (uint32_t*)_mm_malloc(Width * Height * 4, 64);
         DepthBuffer = (float*)_mm_malloc(Width * Height * 4, 64);
+        AttachmentBuffer = (uint8_t*)_mm_malloc(Width * Height * numAttachments, 64);
     }
     ~Framebuffer() {
         _mm_free(ColorBuffer);
         _mm_free(DepthBuffer);
+        _mm_free(AttachmentBuffer);
     }
 
     void Clear(uint32_t color, float depth) {
@@ -118,6 +122,10 @@ struct Framebuffer {
     void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) const {
         _mm512_mask_storeu_epi32(&ColorBuffer[offset], mask, color);
         _mm512_mask_storeu_ps(&DepthBuffer[offset], mask, depth);
+    }
+    uint8_t* GetAttachmentBuffer(uint32_t attachmentId, uint32_t count) {
+        assert(attachmentId + count <= NumAttachments && "Missing attachment storage");
+        return &AttachmentBuffer[attachmentId * (Width * Height)];
     }
 
     VFloat __vectorcall SampleDepth(VFloat x, VFloat y) const {
@@ -401,6 +409,11 @@ class Rasterizer {
             minY = bin.Y;
         }
 
+        __builtin_assume(minX >= maxX);
+        __builtin_assume(minY >= maxY);
+        __builtin_assume(minX % 4 == 0);
+        __builtin_assume(minY % 4 == 0);
+
         // Barycentric coordinates at start of row
         VInt stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
         VInt stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
@@ -420,7 +433,7 @@ class Rasterizer {
             for (uint32_t x = minX; x <= maxX; x += 4) {
                 uint16_t tileMask = _mm512_cmpge_epi32_mask(w0 | w1 | w2, _mm512_set1_epi32(0));
 
-                if (tileMask != 0) {
+                if (tileMask != 0) [[unlikely]] {
                     VaryingBuffer vars = {
                         .Attribs = (float*)&tri.Vertices->Attribs + i,
                         .W1 = simd::conv2f(w1) * area,

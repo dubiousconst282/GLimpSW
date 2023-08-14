@@ -36,7 +36,7 @@ class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _shadowFb;
     std::unique_ptr<swr::Rasterizer> _shadowRast;
 
-    renderer::EffectSSAO _ssao;
+    renderer::SSAO _ssao;
 
 public:
     SwRenderer() {
@@ -60,7 +60,7 @@ public:
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
-        _fb = std::make_shared<swr::Framebuffer>(width, height);
+        _fb = std::make_shared<swr::Framebuffer>(width, height, 5);
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
@@ -70,22 +70,32 @@ public:
     void Render() {
         static bool s_NormalMapping = true;
         static bool s_EnableShadows = false;
+        static bool s_EnableSSAO = false;
         static bool s_HzbOcclusion = true;
 
         ImGui::Begin("Settings");
 
         std::string currRes = std::format("{}x{}", _fb->Width, _fb->Height);
         if (ImGui::BeginCombo("Res", currRes.c_str())) {
-            if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1080);
+            if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1088);
             if (ImGui::Selectable("1280x720")) InitRasterizer(1280, 720);
             if (ImGui::Selectable("854x480")) InitRasterizer(854, 480);
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
             ImGui::EndCombo();
         }
-        ImGui::InputFloat("SSAO Radius", &_ssao.Radius, 0.1f);
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
+        ImGui::Checkbox("SSAO", &s_EnableSSAO);
+
+        if (s_EnableSSAO) {
+            ImGui::SeparatorText("SSAO");
+            ImGui::InputFloat("Radius", &_ssao.Radius, 0.1f);
+            ImGui::InputFloat("Range", &_ssao.MaxRange, 0.1f);
+        }
+
+        ImGui::Separator();
+
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
@@ -137,14 +147,15 @@ public:
         });
 
         auto postProcessStart = std::chrono::high_resolution_clock::now();
-        _ssao.Generate(*_fb, projViewMat);
-
-        renderer::DrawSkybox(*_fb, *_skyboxTex, projMat, viewMat);
 
         if (s_HzbOcclusion) {
             _depthPyramid.Update(*_fb, shader.ProjMat);
             RenderDebugHzb();
         }
+        if (s_EnableSSAO) {
+            _ssao.Generate(*_fb, _depthPyramid, projViewMat);
+        }
+        renderer::ComposeDeferred(*_fb, *_skyboxTex, projMat, viewMat, s_EnableSSAO);
 
         double postProcessElapsed = (std::chrono::high_resolution_clock::now() - postProcessStart).count() / 1000000.0;
 
@@ -164,7 +175,7 @@ public:
         drawList->AddImage(texId, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 1), ImVec2(1, 0));
 
         ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, postProcessElapsed);
+        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, postProcessElapsed);
         ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms)", stats.SetupTime[0] / 1000000.0, stats.ClippingTime[0] / 1000000.0, stats.BinningTime[0] / 1000000.0);
         ImGui::Text("Rasterize: %.1fms (CPU: %.0f%%)", stats.RasterizeTime[0] / 1000000.0, stats.RasterizeCpuTime / (double)(stats.RasterizeTime[0] * std::thread::hardware_concurrency()) * 100);
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", stats.TrianglesDrawn / 1000.0, stats.TrianglesClipped / 1000.0, stats.BinsFilled / 1000.0, drawCalls);

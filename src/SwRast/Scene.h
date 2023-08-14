@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "SwRast.h"
+#include "SIMD.h"
 
 namespace scene {
 
@@ -94,6 +95,20 @@ public:
         width = _width >> level;
         height = _height >> level;
         return &_storage[_offsets[level]];
+    }
+
+    swr::VFloat __vectorcall SampleDepth(swr::VFloat x, swr::VFloat y, uint32_t level) const {
+        swr::VInt ix = swr::simd::round2i(x * (int32_t)_width);
+        swr::VInt iy = swr::simd::round2i(y * (int32_t)_height);
+
+        return SampleDepth(ix << 1, iy << 1, level);
+    }
+    swr::VFloat __vectorcall SampleDepth(swr::VInt ix, swr::VInt iy, uint32_t level) const {
+        ix = ix >> 1, iy = iy >> 1;
+        uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, swr::VInt((int32_t)_width)) & _mm512_cmplt_epu32_mask(iy, swr::VInt((int32_t)_height));
+        swr::VInt indices = (ix >> level) + (iy >> level) * (int32_t)(_width >> level);
+
+        return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, &_storage[_offsets[level]], 4);
     }
 };
 
