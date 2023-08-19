@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <Type Name="swr::VInt">
+    <DisplayString>{{[ {(int)reg[0]}, {(int)(reg[0] >> 32)}, {(int)reg[1]}, {(int)(reg[1] >> 32)}, ... ]}}</DisplayString>
+    <Expand>
+      <ArrayItems>
+        <Size>16</Size>
+        <ValuePointer>(int*)&amp;reg</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
+  <Type Name="swr::VFloat">
+    <DisplayString>{{[ {reg[0]}, {reg[1]}, {reg[2]}, {reg[3]}, ... ]}}</DisplayString>
+    <Expand>
+      <ArrayItems>
+        <Size>16</Size>
+        <ValuePointer>(float*)&amp;reg</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+  
+</AutoVisualizer>

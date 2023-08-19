@@ -6,27 +6,9 @@
 #include <vector>
 
 #include "SIMD.h"
-
-#define STAT_INCREMENT(key, amount) (swr::g_Stats.key += (amount))
-#define STAT_TIME_BEGIN(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key##Time, 1)
-#define STAT_TIME_END(key) swr::ProfilerStats::MeasureTime(swr::g_Stats.key##Time, 0)
+#include "ProfilerStats.h"
 
 namespace swr {
-
-struct ProfilerStats {
-    uint32_t TrianglesDrawn;
-    uint32_t TrianglesClipped;
-    uint32_t BinsFilled;
-    int64_t SetupTime[2];
-    int64_t ClippingTime[2];
-    int64_t BinningTime[2];
-    int64_t RasterizeTime[2];
-    int64_t RasterizeCpuTime;
-
-    void Reset() { *this = {}; }
-    static void MeasureTime(int64_t key[2], bool begin);
-};
-extern ProfilerStats g_Stats;
 
 struct Texture2D {
     uint32_t Width, Height, MipLevels;
@@ -474,6 +456,7 @@ public:
                         vertexData._Indices = indices[vi];
                         shader.ShadeVertices(vertexData, vertices[vi]);
                     }
+                    STAT_INCREMENT(VerticesShaded, VInt::Length * 3);
                 },
             .DrawFn = [&](const BinnedTriangle& bt) { DrawBinnedTriangle(shader, bt); },
             .NumCustomAttribs = shader.NumCustomAttribs,

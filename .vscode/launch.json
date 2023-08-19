@@ -9,7 +9,8 @@
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal"
+            "console": "internalConsole",
+            "visualizerFile": "${workspaceFolder}/src/DebugDisplay.natvis"
         }
     ]
 }

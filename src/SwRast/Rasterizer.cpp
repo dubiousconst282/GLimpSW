@@ -128,11 +128,8 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
         STAT_TIME_BEGIN(Rasterize);
 
         auto binRange = std::ranges::iota_view(0u, batch.NumBins);
-        std::atomic_int64_t elapsed = 0;
 
         std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
-            auto startTime = std::chrono::high_resolution_clock::now();
-
             std::vector<uint16_t>& bin = batch.Bins[bid];
             if (bin.size() == 0) return;
 
@@ -146,10 +143,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
                 shader.DrawFn(bt);
             }
             bin.clear();
-
-            elapsed += (std::chrono::high_resolution_clock::now() - startTime).count();
         });
-        g_Stats.RasterizeCpuTime += elapsed.load();
         batch.Count = 0;
 
         STAT_TIME_END(Rasterize);
@@ -158,18 +152,10 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
 ProfilerStats g_Stats = {};
 
-void ProfilerStats::MeasureTime(int64_t key[2], bool begin) {
-    int64_t now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-
-    if (begin) {
-        assert(key[1] == 0 && "STAT_TIME_X() must be called in pairs");
-        key[1] = now;
-    } else {
-        key[0] += now - key[1];
-        assert(key[1] != 0 && !(key[1] = 0) && "STAT_TIME_X() must be called in pairs");
-    }
+uint64_t ProfilerStats::CurrentTime() {
+    auto time = std::chrono::high_resolution_clock::now();
+    return (uint64_t)time.time_since_epoch().count();
 }
-
 
 static VInt EdgeWeight(VInt a, VInt x, VInt b, VInt y) {
     VInt w = a * x + b * y;
