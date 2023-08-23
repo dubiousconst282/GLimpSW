@@ -77,12 +77,12 @@ void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs)
     STAT_TIME_END(Binning);
 }
 
-void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs) {
+void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask mask, uint32_t numAttribs) {
     int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
     tris.Setup(width, height, numAttribs);
 
-    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(0.0f), _CMP_GT_OQ);  // backface culling (skip triangles with negative area)
-    mask &= _mm512_cmp_ps_mask(tris.RcpArea, _mm512_set1_ps(1.0f), _CMP_LT_OQ);  // skip triangles with zero area
+    mask &= tris.RcpArea > 0.0f;  // backface culling (skip triangles with negative area)
+    mask &= tris.RcpArea < 1.0f;  // skip triangles with zero area
 
     for (uint32_t i : BitIter(mask)) {
         const uint32_t binShift = TriangleBatch::BinSizeLog2;

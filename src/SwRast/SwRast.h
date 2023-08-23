@@ -102,8 +102,8 @@ struct Framebuffer {
     }
 
     void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) const {
-        _mm512_mask_storeu_epi32(&ColorBuffer[offset], mask, color);
-        _mm512_mask_storeu_ps(&DepthBuffer[offset], mask, depth);
+        _mm512_mask_store_epi32(&ColorBuffer[offset], mask, color);
+        _mm512_mask_store_ps(&DepthBuffer[offset], mask, depth);
     }
     uint8_t* GetAttachmentBuffer(uint32_t attachmentId, uint32_t count) {
         assert(attachmentId + count <= NumAttachments && "Missing attachment storage");
@@ -364,7 +364,7 @@ class Rasterizer {
     void Draw(VertexReader& vertexData, const ShaderInterface& shader);
 
     void SetupTriangles(TriangleBatch& batch, uint32_t numAttribs);
-    void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, uint16_t mask, uint32_t numAttribs);
+    void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask mask, uint32_t numAttribs);
 
     template<ShaderProgram TShader>
     void DrawBinnedTriangle(const TShader& shader, const BinnedTriangle& bin) {
@@ -413,7 +413,7 @@ class Rasterizer {
             VInt w0 = rowW0, w1 = rowW1, w2 = rowW2;
 
             for (uint32_t x = minX; x <= maxX; x += 4) {
-                uint16_t tileMask = _mm512_cmpge_epi32_mask(w0 | w1 | w2, _mm512_set1_epi32(0));
+                VMask tileMask = _mm512_cmpge_epi32_mask(w0 | w1 | w2, _mm512_set1_epi32(0));
 
                 if (tileMask != 0) [[unlikely]] {
                     VaryingBuffer vars = {
@@ -425,7 +425,7 @@ class Rasterizer {
                     VFloat oldDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
                     VFloat newDepth = vars.GetSmooth(VaryingBuffer::AttribZ);
 
-                    tileMask &= _mm512_cmp_ps_mask(newDepth, oldDepth, _CMP_LT_OQ);
+                    tileMask &= newDepth < oldDepth;
 
                     if (tileMask != 0) {
                         vars.Depth = newDepth;

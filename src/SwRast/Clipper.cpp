@@ -10,6 +10,7 @@ static float GetIntersectDist(const Clipper::Vertex& vtx, Clipper::Plane plane, 
     return a + vtx.Attribs[3] * dist;
 }
 
+// https://www.cubic.org/docs/3dclip.htm
 void Clipper::ClipAgainstPlane(Plane plane, uint32_t numAttribs) {
     if (Count < 3) return;  // triangle has been fully clipped away
 
@@ -35,10 +36,12 @@ void Clipper::ClipAgainstPlane(Plane plane, uint32_t numAttribs) {
 
             float t = da / (da - db);
 
+            assert(numAttribs <= sizeof(va.Attribs) / 4);
+
             for (uint32_t ai = 0; ai < numAttribs; ai += VFloat::Length) {
                 VFloat a = VFloat::load(&va.Attribs[ai]);
                 VFloat b = VFloat::load(&vb.Attribs[ai]);
-                VFloat r = simd::fma(b - a, t, a);  // a + (b - a) * t
+                VFloat r = simd::lerp(a, b, t);
                 r.store(&dest.Attribs[ai]);
             }
         }
@@ -57,12 +60,12 @@ Clipper::ClipCodes Clipper::ComputeClipCodes(const TrianglePacket& tri) {
         auto outcode = _mm_set1_epi8(0);
 
         const auto MaskN = [&](VFloat x, Clipper::Plane p) {
-            auto m = _mm512_cmp_ps_mask(x, -pos.w, _CMP_LT_OQ);
+            VMask m = x < -pos.w;
             auto c = _mm_maskz_mov_epi8(m, _mm_set1_epi8(1 << (int)p));
             outcode = _mm_or_si128(outcode, c);
         };
         const auto MaskP = [&](VFloat x, Clipper::Plane p) {
-            auto m = _mm512_cmp_ps_mask(x, pos.w, _CMP_GT_OQ);
+            VMask m = x > pos.w;
             auto c = _mm_maskz_mov_epi8(m, _mm_set1_epi8(1 << (int)p));
             outcode = _mm_or_si128(outcode, c);
         };
@@ -77,12 +80,12 @@ Clipper::ClipCodes Clipper::ComputeClipCodes(const TrianglePacket& tri) {
         combinedOut = _mm_and_si128(combinedOut, outcode);
     }
 
-    uint16_t acceptMask = _mm_cmpeq_epi8_mask(partialOut, _mm_set1_epi8(0));
-    uint16_t rejectMask = _mm_cmpneq_epi8_mask(combinedOut, _mm_set1_epi8(0));
+    VMask acceptMask = _mm_cmpeq_epi8_mask(partialOut, _mm_set1_epi8(0));
+    VMask rejectMask = _mm_cmpneq_epi8_mask(combinedOut, _mm_set1_epi8(0));
 
     ClipCodes codes = {
-        .AcceptMask = (uint16_t)(acceptMask & ~rejectMask),
-        .NonTrivialMask = (uint16_t)(~acceptMask & ~rejectMask),
+        .AcceptMask = (VMask)(acceptMask & ~rejectMask),
+        .NonTrivialMask = (VMask)(~acceptMask & ~rejectMask),
     };
     _mm_storeu_si128((__m128i*)codes.OutCodes, partialOut);
     return codes;
