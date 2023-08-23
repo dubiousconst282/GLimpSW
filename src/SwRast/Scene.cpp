@@ -14,24 +14,7 @@ static void PackNorm(int8_t* dst, float* src) {
         dst[i] = (int8_t)std::round(src[i] * 127.0f);
     }
 }
-
-const swr::Texture2D* Model::LoadTexture(const std::string& name) {
-    auto entry = Textures.find(name);
-
-    if (entry != Textures.end()) {
-        return &entry->second;
-    }
-
-    auto fullPath = std::filesystem::path(BasePath) / name;
-
-    if (name.empty() || !std::filesystem::exists(fullPath)) {
-        return nullptr;
-    }
-
-    auto tex = Textures.insert({name, swr::Texture2D::LoadImage(fullPath.string())});
-    return &tex.first->second;
-}
-std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
+static std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
     if (mat->GetTextureCount(type) <= 0) {
         return "";
     }
@@ -40,8 +23,45 @@ std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
     return std::string(path.data, path.length);
 }
 
+static swr::Texture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextureType type) {
+    std::string name = GetTexturePath(mat, type);
+
+    auto basePath = std::filesystem::path(m.BasePath);
+
+    auto fullPath = basePath / name;
+
+    if (name.empty() || !std::filesystem::exists(fullPath)) {
+        return nullptr;
+    }
+
+    auto cached = m.Textures.find(name);
+
+    if (cached != m.Textures.end()) {
+        return &cached->second;
+    }
+
+    if (type == aiTextureType_NORMALS) {
+        // Merge Metallic-Roughness map into normals texture
+        // RG: Normals, BA: MR
+        std::string mrName = GetTexturePath(mat, aiTextureType_DIFFUSE_ROUGHNESS);
+        auto mrPath = basePath / mrName;
+
+        if (mrName.empty() || !std::filesystem::exists(mrPath)) {
+            mrPath = "";
+        }
+        auto tex = swr::Texture2D::LoadNormalMap(fullPath.string(), mrPath.string());
+        auto slot = m.Textures.insert({ name, std::move(tex) });
+        return &slot.first->second;
+    } else {
+        auto tex = swr::Texture2D::LoadImage(fullPath.string());
+        auto slot = m.Textures.insert({ name, std::move(tex) });
+        return &slot.first->second;
+    }
+}
+
 Node ConvertNode(const Model& model, aiNode* node) {
     //TODO: figure out wtf is going on with empty nodes
+    //FIXME: apply transform on node AABBs
     Node impNode = {
         .Transform = glm::transpose(*(glm::mat4*)&node->mTransformation),
         .BoundMin = glm::vec3(INFINITY),
@@ -89,9 +109,9 @@ Model::Model(std::string_view path) {
     for (int i = 0; i < scene->mNumMaterials; i++) {
         aiMaterial* mat = scene->mMaterials[i];
 
-        Materials.push_back(Material { 
-            .DiffuseTex = LoadTexture(GetTexturePath(mat, aiTextureType_DIFFUSE)),
-            .NormalTex = LoadTexture(GetTexturePath(mat, aiTextureType_NORMALS)),
+        Materials.push_back(Material{
+            .DiffuseTex = LoadTexture(*this, mat, aiTextureType_BASE_COLOR),
+            .NormalTex = LoadTexture(*this, mat, aiTextureType_NORMALS),
         });
     }
 

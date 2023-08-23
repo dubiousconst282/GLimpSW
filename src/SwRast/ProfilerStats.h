@@ -15,6 +15,7 @@ struct ProfilerStats {
         ClippingTime,
         BinningTime,
         RasterizeTime,
+        ComposeTime,
 
         _Count,
         _TimeFirst = SetupTime,
@@ -29,7 +30,7 @@ struct ProfilerStats {
         for (uint32_t i = 0; i < _Count; i++) {
             Entry& e = Keys[i];
 
-            const uint64_t a = 80;
+            const uint64_t a = 95;
             e.Avg = (e.Avg * a + e.Value * (100 - a)) / 100;
             e.Value = 0;
         }

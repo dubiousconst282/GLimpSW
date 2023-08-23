@@ -67,8 +67,6 @@ public:
             Traverse(visitor, localMat, &child);
         }
     }
-
-    const swr::Texture2D* LoadTexture(const std::string& name);
 };
 
 // Hierarchical depth buffer for occlusion culling

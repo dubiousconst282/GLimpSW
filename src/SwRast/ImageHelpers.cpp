@@ -8,25 +8,9 @@
 
 namespace swr {
 
-Texture2D Texture2D::LoadImage(std::string_view filename, std::string_view metalRoughMapFilename, uint32_t mipLevels) {
+Texture2D Texture2D::LoadImage(std::string_view path, uint32_t mipLevels) {
     int width, height, channels;
-    auto pixels = stbi_load(filename.data(), &width, &height, &channels, 4);
-
-    if (!metalRoughMapFilename.empty()) {
-        int mrWidth, mrHeight, mrChannels;
-        auto mrPixels = stbi_load(metalRoughMapFilename.data(), &mrWidth, &mrHeight, &mrChannels, 4);
-
-        if (mrPixels == nullptr || mrWidth != width || mrHeight != height) {
-            throw std::exception("Bad Metallic-Roughness map");
-        }
-        // Overwrite BA channels from normal map with Metallic and Roughness.
-        // The normal Z can be reconstructed with `sqrt(1.0f - dot(n.xy, n.xy))`
-        for (uint32_t i = 0; i < width * height; i++) {
-            pixels[i * 4 + 2] = mrPixels[i * 4 + 0];
-            pixels[i * 4 + 3] = mrPixels[i * 4 + 1];
-        }
-        stbi_image_free(mrPixels);
-    }
+    stbi_uc* pixels = stbi_load(path.data(), &width, &height, &channels, 4);
 
     auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
     tex.SetPixels((uint32_t*)pixels, tex.Width);
@@ -36,9 +20,48 @@ Texture2D Texture2D::LoadImage(std::string_view filename, std::string_view metal
     return tex;
 }
 
+Texture2D Texture2D::LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath, uint32_t mipLevels) {
+    int width, height, channels;
+    stbi_uc* pixels = stbi_load(normalPath.data(), &width, &height, &channels, 4);
+    stbi_uc* mrPixels = nullptr;
+
+    if (!metallicRoughnessPath.empty()) {
+        int mrWidth, mrHeight, mrChannels;
+        mrPixels = stbi_load(metallicRoughnessPath.data(), &mrWidth, &mrHeight, &mrChannels, 4);
+
+        if (mrWidth != width || mrHeight != height) {
+            throw std::exception("Bad Metallic-Roughness map");
+        }
+    }
+
+    for (uint32_t i = 0; i < width * height; i++) {
+        // Re-normalize to get rid of JPEG artifacts
+        glm::vec3 N = glm::vec3(pixels[i * 4 + 0], pixels[i * 4 + 1], pixels[i * 4 + 2]);
+        N = glm::normalize(N / 127.0f - 1.0f) * 127.0f + 127.0f;
+
+        pixels[i * 4 + 0] = (uint8_t)roundf(N.x);
+        pixels[i * 4 + 1] = (uint8_t)roundf(N.y);
+
+        // Overwrite BA channels from normal map with Metallic and Roughness.
+        // The normal Z can be reconstructed with `sqrt(1.0f - dot(n.xy, n.xy))`
+        if (mrPixels != nullptr) {
+            pixels[i * 4 + 2] = mrPixels[i * 4 + 2];  // Metallic
+            pixels[i * 4 + 3] = mrPixels[i * 4 + 1];  // Roughness
+        }
+    }
+    
+    auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
+    tex.SetPixels((uint32_t*)pixels, tex.Width);
+
+    stbi_image_free(pixels);
+    stbi_image_free(mrPixels);
+
+    return tex;
+}
+
 HdrTexture2D HdrTexture2D::LoadImage(std::string_view filename) {
     int width, height, channels;
-    auto pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
+    float* pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
 
     auto tex = HdrTexture2D((uint32_t)width, (uint32_t)height, 1);
     tex.SetPixels(pixels, tex.Width, 0);
@@ -49,7 +72,7 @@ HdrTexture2D HdrTexture2D::LoadImage(std::string_view filename) {
 }
 HdrTexture2D HdrTexture2D::LoadCubemapFromPanorama(std::string_view filename) {
     int width, height, channels;
-    auto pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
+    float* pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
 
     uint32_t faceSize = (uint32_t)width / 4;
 

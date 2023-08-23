@@ -113,10 +113,13 @@ public:
         glm::mat4 viewMat = _cam.GetViewMatrix();
         glm::mat4 projViewMat = projMat * viewMat;
 
-        renderer::PhongShader shader = {
-            .LightPos = _lightPos,
-            .ShadowProjMat = _shadowProjMat,
+        renderer::DefaultShader shader = {
             .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
+            .SkyboxTex = _skyboxTex.get(),
+            .ShadowProjMat = _shadowProjMat,
+            .ViewMat = viewMat,
+            .LightPos = _lightPos,
+            .ViewPos = _cam._ViewPosition,
         };
 
         _fb->ClearDepth(1.0f);
@@ -132,8 +135,8 @@ public:
 
                 if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
 
-                shader.DiffuseTex = mesh.Material->DiffuseTex;
-                shader.NormalTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
+                shader.BaseColorTex = mesh.Material->DiffuseTex;
+                shader.NormalMetallicRoughnessTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
 
                 swr::VertexReader data(
                     (uint8_t*)&_model->VertexBuffer[mesh.VertexOffset], 
@@ -146,7 +149,7 @@ public:
             return true;
         });
 
-        auto postProcessStart = std::chrono::high_resolution_clock::now();
+        STAT_TIME_BEGIN(Compose);
 
         if (s_HzbOcclusion) {
             _depthPyramid.Update(*_fb, shader.ProjMat);
@@ -155,9 +158,11 @@ public:
         if (s_EnableSSAO) {
             _ssao.Generate(*_fb, _depthPyramid, projViewMat);
         }
-        renderer::ComposeDeferred(*_fb, *_skyboxTex, projMat, viewMat, s_EnableSSAO);
 
-        double postProcessElapsed = (std::chrono::high_resolution_clock::now() - postProcessStart).count() / 1000000.0;
+        shader.ProjMat = projViewMat;
+        shader.Compose(*_fb, s_EnableSSAO);
+
+        STAT_TIME_END(Compose);
 
         if (ImGui::IsKeyPressed(ImGuiKey_M)) {
             _lightPos = _cam.Position;
@@ -176,7 +181,7 @@ public:
 
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, postProcessElapsed);
+        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, STAT_GET_TIME(Compose));
         ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms), %.1fK vertices", STAT_GET_TIME(Setup), STAT_GET_TIME(Clipping), STAT_GET_TIME(Binning), STAT_GET_COUNT(VerticesShaded));
         ImGui::Text("Rasterize: %.1fms", STAT_GET_TIME(Rasterize));
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", STAT_GET_COUNT(TrianglesDrawn), STAT_GET_COUNT(TrianglesClipped), STAT_GET_COUNT(BinsFilled), drawCalls);
@@ -184,7 +189,6 @@ public:
         // clang-format on
 
         stats.Reset();
-
         DrawTranslationGizmo(_lightPos, _lightRot);
     }
 

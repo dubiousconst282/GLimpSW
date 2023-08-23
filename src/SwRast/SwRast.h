@@ -17,7 +17,8 @@ struct Texture2D {
 
     Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels);
 
-    static Texture2D LoadImage(std::string_view filename, std::string_view metalRoughMapFilename = "", uint32_t mipLevels = 16);
+    static Texture2D LoadImage(std::string_view path, uint32_t mipLevels = 16);
+    static Texture2D LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath = "", uint32_t mipLevels = 16);
 
     void SetPixels(const uint32_t* pixels, uint32_t stride);
 
@@ -53,7 +54,8 @@ struct HdrTexture2D {
 
     VFloat3 __vectorcall SampleNearest(VFloat u, VFloat v, VInt layer) const;
 
-    // Project normalized direction to cubemap UV and face.
+    // Projects the given direction vector (may be unnormalized) to cubemap face UV and layer.
+    // This is incompatible with other graphics APIs, UVs are not flipped depending on faces.
     static void __vectorcall ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx);
 
     static HdrTexture2D LoadImage(std::string_view filename);
@@ -68,7 +70,8 @@ struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
     static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
 
-    uint32_t Width, Height, TileStride, NumAttachments;
+    uint32_t Width, Height, TileStride;
+    uint32_t AttachmentStride, NumAttachments;
     uint32_t* ColorBuffer;
     float* DepthBuffer;
     uint8_t* AttachmentBuffer;
@@ -77,11 +80,12 @@ struct Framebuffer {
         Width = (width + TileMask) & ~TileMask;
         Height = (height + TileMask) & ~TileMask;
         TileStride = Width / TileSize;
+        AttachmentStride = (Width * Height + 63) & ~63u;
         NumAttachments = numAttachments;
 
         ColorBuffer = (uint32_t*)_mm_malloc(Width * Height * 4, 64);
         DepthBuffer = (float*)_mm_malloc(Width * Height * 4, 64);
-        AttachmentBuffer = (uint8_t*)_mm_malloc(Width * Height * numAttachments, 64);
+        AttachmentBuffer = (uint8_t*)_mm_malloc(AttachmentStride * numAttachments, 64);
     }
     ~Framebuffer() {
         _mm_free(ColorBuffer);
@@ -101,13 +105,15 @@ struct Framebuffer {
         return tileId * TileNumPixels + pixelOffset;
     }
 
-    void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) const {
+    void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) {
         _mm512_mask_store_epi32(&ColorBuffer[offset], mask, color);
         _mm512_mask_store_ps(&DepthBuffer[offset], mask, depth);
     }
-    uint8_t* GetAttachmentBuffer(uint32_t attachmentId, uint32_t count) {
-        assert(attachmentId + count <= NumAttachments && "Missing attachment storage");
-        return &AttachmentBuffer[attachmentId * (Width * Height)];
+
+    template<typename T>
+    T* GetAttachmentBuffer(uint32_t attachmentId, size_t offset = 0) {
+        assert(attachmentId + sizeof(T) <= NumAttachments && "Missing attachment storage");
+        return (T*)&AttachmentBuffer[attachmentId * AttachmentStride] + offset;
     }
 
     VFloat __vectorcall SampleDepth(VFloat x, VFloat y) const {
@@ -170,9 +176,14 @@ struct VertexReader {
         return VInt::gather((int32_t*)&VertexBuffer[offset], _Indices * stride);
     }
 
-    /// Reads float or normalized integer attributes
-    template<typename V, typename A>
-    void ReadAttribs(A V::* vertexMember, VFloat* dest, uint32_t count) const {
+    // Reads a vector of float or normalized integer attributes. `T` should be a struct containing only `VFloat` fields.
+    template<typename T, typename V, typename A>
+    T ReadAttribs(A V::*vertexMember) const {
+        static_assert(sizeof(T) % sizeof(VFloat) == 0);
+
+        uint32_t count = sizeof(T) / sizeof(VFloat);
+        VFloat dest[count];
+
         size_t offset = (size_t)&(((V*)0)->*vertexMember);
 
         for (uint32_t i = 0; i < count;) {
@@ -193,6 +204,7 @@ struct VertexReader {
                 }
             }
         }
+        return *(T*)&dest;
     }
 
     static VFloat UnpackUNorm(VInt data, uint32_t bitPos, uint32_t bitCount) {
@@ -216,6 +228,14 @@ struct ShadedVertexPacket {
 
     VFloat4 Position;
     VFloat Attribs[MaxAttribs];
+
+    template<typename T>
+    void SetAttribs(int32_t attrId, const T& values) {
+        static_assert(sizeof(T) % sizeof(VFloat) == 0);
+        assert(attrId + sizeof(T) / sizeof(VFloat) <= MaxAttribs);
+
+        *(T*)&Attribs[attrId] = values;
+    }
 };
 
 struct TrianglePacket {
@@ -236,7 +256,7 @@ struct VaryingBuffer {
 
     const float* Attribs;
     uint32_t TileOffset;
-    uint16_t TileMask;
+    VMask TileMask;
 
     VFloat W1, W2;
     VFloat Depth;
@@ -258,6 +278,20 @@ struct VaryingBuffer {
 
         int32_t idx = attrId * (int32_t)VFloat::Length + (int32_t)(vertexId * (sizeof(ShadedVertexPacket) / 4));
         return Attribs[idx];
+    }
+
+    // Interpolates a vector of vertex attributes. `T` should be a struct containing only `VFloat` fields.
+    template<typename T>
+    T GetSmooth(int32_t attrId) const {
+        static_assert(sizeof(T) % sizeof(VFloat) == 0);
+
+        uint32_t count = sizeof(T) / sizeof(VFloat);
+        VFloat dest[count];
+
+        for (uint32_t i = 0; i < count; i++) {
+            dest[i] = GetSmooth(attrId + (int32_t)i);
+        }
+        return *(T*)&dest;
     }
 
     void ApplyPerspectiveCorrection() {
@@ -285,9 +319,9 @@ struct Clipper {
         float Attribs[(ShadedVertexPacket::MaxAttribs + 4 + VFloat::Length - 1) & ~(VFloat::Length - 1)];
     };
     struct ClipCodes {
-        uint16_t AcceptMask;        // Triangles that don't need to be clipped.
-        uint16_t NonTrivialMask;    // Triangles that need to be clipped.
-        uint8_t OutCodes[16];       // Planes that need to be clipped against (per-triangle).
+        VMask AcceptMask;       // Triangles that are in-bounds and can be immediately rasterized.
+        VMask NonTrivialMask;   // Triangles that need to be clipped.
+        uint8_t OutCodes[16];   // Planes that need to be clipped against (per-triangle).
     };
 
     uint32_t Count, FreeVtx;
@@ -306,7 +340,7 @@ struct Clipper {
 
 template<typename T>
 concept ShaderProgram =
-    requires(T s, const VertexReader& vertexData, ShadedVertexPacket& vertexPacket, const Framebuffer& fb, VaryingBuffer& vars) {
+    requires(T s, const VertexReader& vertexData, ShadedVertexPacket& vertexPacket, Framebuffer& fb, VaryingBuffer& vars) {
         { T::NumCustomAttribs } -> std::convertible_to<uint32_t>;
         { s.ShadeVertices(vertexData, vertexPacket) } -> std::same_as<void>;
         { s.ShadePixels(fb, vars) } -> std::same_as<void>;
