@@ -6,13 +6,13 @@
 #include <memory>
 
 #include "SwRast.h"
-#include "SIMD.h"
+#include "Texture.h"
 
 namespace scene {
 
 struct Material {
-    const swr::Texture2D* DiffuseTex;
-    const swr::Texture2D* NormalTex;
+    const swr::RgbaTexture2D* DiffuseTex;
+    const swr::RgbaTexture2D* NormalTex;
 };
 
 struct Mesh {
@@ -44,7 +44,7 @@ public:
 
     std::vector<Mesh> Meshes;
     std::vector<Material> Materials;
-    std::unordered_map<std::string, swr::Texture2D> Textures;
+    std::unordered_map<std::string, swr::RgbaTexture2D> Textures;
 
     std::unique_ptr<Vertex[]> VertexBuffer;
     std::unique_ptr<Index[]> IndexBuffer;

@@ -27,7 +27,7 @@ struct VInt {
     inline void store(void* ptr) const { _mm512_storeu_si512((__m512i*)ptr, reg); }
 
     template<int IndexScale = 1>
-    static inline VInt gather(const int32_t* basePtr, VInt indices) { return _mm512_i32gather_epi32(indices, basePtr, IndexScale); }
+    static inline VInt gather(const void* basePtr, VInt indices) { return _mm512_i32gather_epi32(indices, basePtr, IndexScale); }
 
     static inline VInt ramp() { return _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 };
@@ -50,7 +50,7 @@ struct VFloat {
     inline void store(void* ptr) const { _mm512_storeu_ps(ptr, reg); }
 
     template<int IndexScale = 1>
-    static inline VFloat gather(const float* basePtr, VInt indices) { return _mm512_i32gather_ps(indices.reg, basePtr, IndexScale); }
+    static inline VFloat gather(const void* basePtr, VInt indices) { return _mm512_i32gather_ps(indices.reg, basePtr, IndexScale); }
 
     static inline VFloat ramp() { return _mm512_setr_ps(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 };
@@ -84,28 +84,28 @@ struct VFloat4 {
 
 inline VFloat3::VFloat3(const VFloat4& v) { x = v.x, y = v.y, z = v.z; }
 
-#define _SIMD_DEF_OPERATORS(TVec, OpSuffix, MulOp, BitSuffix)                      \
-    inline TVec operator+(TVec a, TVec b) { return _mm512_add_##OpSuffix(a, b); }  \
-    inline TVec operator-(TVec a, TVec b) { return _mm512_sub_##OpSuffix(a, b); }  \
-    inline TVec operator*(TVec a, TVec b) { return _mm512_##MulOp(a, b); }         \
-    inline TVec operator&(TVec a, TVec b) { return _mm512_and_##BitSuffix(a, b); } \
-    inline TVec operator|(TVec a, TVec b) { return _mm512_or_##BitSuffix(a, b); }  \
-    inline TVec operator^(TVec a, TVec b) { return _mm512_xor_##BitSuffix(a, b); } \
-                                                                                   \
-    inline TVec operator+=(TVec& a, TVec b) { return a = (a + b); }                \
-    inline TVec operator-=(TVec& a, TVec b) { return a = (a - b); }                \
-    inline TVec operator*=(TVec& a, TVec b) { return a = (a * b); }
+#define _SIMD_DEF_OPERATORS(V, OpSuffix, MulOp, BitSuffix)                                          \
+    inline V operator+(V a, V b) { return _mm512_add_##OpSuffix(a, b); }                            \
+    inline V operator-(V a, V b) { return _mm512_sub_##OpSuffix(a, b); }                            \
+    inline V operator*(V a, V b) { return _mm512_##MulOp(a, b); }                                   \
+    inline V operator&(V a, V b) { return _mm512_and_##BitSuffix(a, b); }                           \
+    inline V operator|(V a, V b) { return _mm512_or_##BitSuffix(a, b); }                            \
+    inline V operator^(V a, V b) { return _mm512_xor_##BitSuffix(a, b); }                           \
+                                                                                                    \
+    inline V operator+=(V& a, V b) { return a = (a + b); }                                          \
+    inline V operator-=(V& a, V b) { return a = (a - b); }                                          \
+    inline V operator*=(V& a, V b) { return a = (a * b); }                                          \
+                                                                                                    \
+    inline VMask operator<(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_LT); }  \
+    inline VMask operator>(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_GT); }  \
+    inline VMask operator<=(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_LE); } \
+    inline VMask operator>=(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_GE); } \
+    inline VMask operator==(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_EQ); } \
+    inline VMask operator!=(V a, V b) { return _mm512_cmp_##OpSuffix##_mask(a, b, _MM_CMPINT_NE); }
 
 _SIMD_DEF_OPERATORS(VFloat, ps, mul_ps, ps);
 inline VFloat operator/(VFloat a, VFloat b) { return _mm512_div_ps(a, b); }
 inline VFloat operator-(VFloat a) { return a ^ -0.0f; }
-
-inline VMask operator<(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_LT_OQ); }
-inline VMask operator>(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_GT_OQ); }
-inline VMask operator<=(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_LE_OQ); }
-inline VMask operator>=(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_GE_OQ); }
-inline VMask operator==(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_EQ_OQ); }
-inline VMask operator!=(VFloat a, VFloat b) { return _mm512_cmp_ps_mask(a, b, _CMP_NEQ_UQ); }
 
 _SIMD_DEF_OPERATORS(VInt, epi32, mullo_epi32, si512);
 inline VInt operator>>(VInt a, uint32_t b) { return _mm512_srai_epi32(a, b); }
@@ -114,10 +114,21 @@ inline VInt operator<<(VInt a, uint32_t b) { return _mm512_slli_epi32(a, b); }
 inline VInt operator>>(VInt a, VInt b) { return _mm512_srav_epi32(a, b); }
 inline VInt operator<<(VInt a, VInt b) { return _mm512_sllv_epi32(a, b); }
 
+
+inline VFloat2 operator+(VFloat2 a, VFloat2 b) { return { a.x + b.x, a.y + b.y }; }
+inline VFloat2 operator-(VFloat2 a, VFloat2 b) { return { a.x - b.x, a.y - b.y }; }
+inline VFloat2 operator*(VFloat2 a, VFloat2 b) { return { a.x * b.x, a.y * b.y }; }
+inline VFloat2 operator/(VFloat2 a, VFloat2 b) { return { a.x / b.x, a.y / b.y }; }
+
 inline VFloat3 operator+(VFloat3 a, VFloat3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
 inline VFloat3 operator-(VFloat3 a, VFloat3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
 inline VFloat3 operator*(VFloat3 a, VFloat3 b) { return { a.x * b.x, a.y * b.y, a.z * b.z }; }
 inline VFloat3 operator/(VFloat3 a, VFloat3 b) { return { a.x / b.x, a.y / b.y, a.z / b.z }; }
+
+inline VFloat4 operator+(VFloat4 a, VFloat4 b) { return { a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w }; }
+inline VFloat4 operator-(VFloat4 a, VFloat4 b) { return { a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w }; }
+inline VFloat4 operator*(VFloat4 a, VFloat4 b) { return { a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w }; }
+inline VFloat4 operator/(VFloat4 a, VFloat4 b) { return { a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w }; }
 
 namespace simd {
 
@@ -143,8 +154,11 @@ inline VFloat fms(VFloat x, VFloat y, VFloat z) { return _mm512_fmsub_ps(x, y, z
 // https://fgiesen.wordpress.com/2012/08/15/linear-interpolation-past-present-and-future/
 inline VFloat lerp(VFloat a, VFloat b, VFloat t) { return _mm512_fmadd_ps(t, b, _mm512_fnmadd_ps(t, a, a)); }
 
+inline VFloat sqrt(VFloat x) { return _mm512_sqrt_ps(x); }
 // approximate sqrt (14-bits precision)
-inline VFloat sqrt14(VFloat x) { return _mm512_rcp14_ps(_mm512_rsqrt14_ps(x)); }
+inline VFloat sqrt14(VFloat x) { return _mm512_mul_ps(_mm512_rsqrt14_ps(x), x); }
+// approximate reciprocal sqrt (14-bits precision)
+inline VFloat rsqrt14(VFloat x) { return _mm512_rsqrt14_ps(x); }
 // approximate reciprocal (14-bits precision)
 inline VFloat rcp14(VFloat x) { return _mm512_rcp14_ps(x); }
 
@@ -179,8 +193,10 @@ inline VFloat3 cross(VFloat3 a, VFloat3 b) {
         fms(a.x, b.y, a.y * b.x),
     };
 }
+inline VFloat3 reflect(VFloat3 i, VFloat3 n) { return i - 2.0f * dot(n, i) * n; }
 
 inline const float pi = 3.141592653589793f;
+inline const float tau = 6.283185307179586f;
 inline const float inv_pi = 0.3183098861837907f;
 
 // Sleef xfastsinf_u3500()
@@ -193,7 +209,7 @@ inline VFloat sin(VFloat a) {
     u = fma(u, s, +0.8323502727e-2f);
     u = fma(u, s, -0.1666651368e+0f);
     u = fma(s * d, u, d);
-    u = u ^ re2f(shrl(q, 31));  // if ((q & 1) != 0) u = -u;
+    u = u ^ re2f(q << 31);  // if ((q & 1) != 0) u = -u;
     return u;
 }
 
@@ -207,7 +223,7 @@ inline VFloat cos(VFloat a) {
     u = fma(u, s, +0.8323502727e-2f);
     u = fma(u, s, -0.1666651368e+0f);
     u = fma(s * d, u, d);
-    u = u ^ re2f(shrl(~0 ^ q, 31));  // if ((q & 1) == 0) u = -u;
+    u = u ^ re2f((~0 ^ q) << 31);  // if ((q & 1) == 0) u = -u;
     return u;
 }
 
@@ -215,6 +231,15 @@ inline VFloat cos(VFloat a) {
 inline VFloat approx_log2(VFloat x) {
     VFloat y = conv2f(re2i(x));
     return fma(y, 1.1920928955078125e-7f, -126.94269504f);
+}
+inline VFloat approx_exp2(VFloat x) {
+    x = max(x, -126.0f);
+    return re2f(round2i((1 << 23) * (x + 126.94269504f)));
+}
+inline VFloat approx_pow(VFloat x, VFloat y) { return approx_exp2(approx_log2(x) * y); }
+
+inline VInt ilog2(VFloat x) {
+    return (re2i(x) >> 23) - 127;  // log(x) for x <= 0 is undef, so no need to mask sign out
 }
 
 // Calculate coarse partial derivatives for a 4x4 fragment.

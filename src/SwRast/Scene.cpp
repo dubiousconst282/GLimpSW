@@ -23,7 +23,7 @@ static std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
     return std::string(path.data, path.length);
 }
 
-static swr::Texture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextureType type) {
+static swr::RgbaTexture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextureType type) {
     std::string name = GetTexturePath(mat, type);
 
     auto basePath = std::filesystem::path(m.BasePath);
@@ -49,11 +49,11 @@ static swr::Texture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextureTyp
         if (mrName.empty() || !std::filesystem::exists(mrPath)) {
             mrPath = "";
         }
-        auto tex = swr::Texture2D::LoadNormalMap(fullPath.string(), mrPath.string());
+        auto tex = swr::texutil::LoadNormalMap(fullPath.string(), mrPath.string());
         auto slot = m.Textures.insert({ name, std::move(tex) });
         return &slot.first->second;
     } else {
-        auto tex = swr::Texture2D::LoadImage(fullPath.string());
+        auto tex = swr::texutil::LoadImage(fullPath.string());
         auto slot = m.Textures.insert({ name, std::move(tex) });
         return &slot.first->second;
     }

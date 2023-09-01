@@ -129,7 +129,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         auto binRange = std::ranges::iota_view(0u, batch.NumBins);
 
-        std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](const uint32_t& bid) {
+        std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](uint32_t bid) {
             std::vector<uint16_t>& bin = batch.Bins[bid];
             if (bin.size() == 0) return;
 
@@ -148,6 +148,18 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         STAT_TIME_END(Rasterize);
     }
+}
+
+void Framebuffer::IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor) {
+    downscaleFactor *= 4;
+
+    auto range = std::ranges::iota_view(0u, Height / downscaleFactor);
+
+    std::for_each(std::execution::par_unseq, range.begin(), range.end(), [&](uint32_t y) {
+        for (uint32_t x = 0; x < Width; x += downscaleFactor) {
+            visitor(x, y * downscaleFactor);
+        }
+    });
 }
 
 ProfilerStats g_Stats = {};

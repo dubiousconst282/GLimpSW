@@ -10,62 +10,6 @@
 
 namespace swr {
 
-struct Texture2D {
-    uint32_t Width, Height, MipLevels;
-    uint32_t RowShift; //Shift amount to get row offset from Y coord. Used to avoid expansive i32 vector mul.
-    std::unique_ptr<uint32_t[]> Data;  // RGBA8 pixel data.
-
-    Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels);
-
-    static Texture2D LoadImage(std::string_view path, uint32_t mipLevels = 16);
-    static Texture2D LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath = "", uint32_t mipLevels = 16);
-
-    void SetPixels(const uint32_t* pixels, uint32_t stride);
-
-    // NearestMipmapNearest
-    VFloat4 __vectorcall SampleNearest(VFloat u, VFloat v) const;
-
-    // Linear (no mipmap)
-    VFloat4 __vectorcall SampleLinear(VFloat u, VFloat v) const;
-
-    // Mag: Linear, Min: NearestMipmapNearest
-    VFloat4 __vectorcall SampleHybrid(VFloat u, VFloat v) const;
-
-private:
-    float _scaleU, _scaleV, _scaleLerpU, _scaleLerpV;
-    int32_t _maskU, _maskV, _maskLerpU, _maskLerpV;
-    VInt _mipOffsets;
-
-    VInt GatherPixels(VInt indices) const {
-        return VInt::gather<4>((int32_t*)Data.get(), indices);
-    }
-    void GenerateMips();
-};
-// HDR float multi-layer texture
-struct HdrTexture2D {
-    uint32_t Width, Height, NumLayers;
-    uint32_t RowShift, LayerShift;
-    std::unique_ptr<uint32_t[]> Data;  // R11F_G11F_B10F float pixel data.
-
-    HdrTexture2D(uint32_t width, uint32_t height, uint32_t numLayers);
-
-    // Initializes the texture with RGB float pixels.
-    void SetPixels(const float* pixels, uint32_t stride, uint32_t layer);
-
-    VFloat3 __vectorcall SampleNearest(VFloat u, VFloat v, VInt layer) const;
-
-    // Projects the given direction vector (may be unnormalized) to cubemap face UV and layer.
-    // This is incompatible with other graphics APIs, UVs are not flipped depending on faces.
-    static void __vectorcall ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx);
-
-    static HdrTexture2D LoadImage(std::string_view filename);
-    static HdrTexture2D LoadCubemapFromPanorama(std::string_view filename);
-
-private:
-    float _scaleU, _scaleV;
-    int32_t _maskU, _maskV;
-};
-
 struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
     static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
@@ -98,6 +42,9 @@ struct Framebuffer {
         ClearDepth(depth);
     }
     void ClearDepth(float depth) { std::fill(&DepthBuffer[0], &DepthBuffer[Width * Height], depth); }
+
+    // Iterate through framebuffer tiles, potentially in parallel. `visitor` takes base tile X and Y coords.
+    void IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor = 1);
 
     size_t GetPixelOffset(uint32_t x, uint32_t y) const {
         size_t tileId = (x >> TileShift) + (y >> TileShift) * TileStride;
@@ -230,7 +177,7 @@ struct ShadedVertexPacket {
     VFloat Attribs[MaxAttribs];
 
     template<typename T>
-    void SetAttribs(int32_t attrId, const T& values) {
+    void SetAttribs(uint32_t attrId, const T& values) {
         static_assert(sizeof(T) % sizeof(VFloat) == 0);
         assert(attrId + sizeof(T) / sizeof(VFloat) <= MaxAttribs);
 
@@ -466,7 +413,7 @@ class Rasterizer {
                         vars.TileMask = tileMask;
                         vars.TileOffset = tileOffset;
 
-                        shader.ShadePixels(fb, vars);
+                        [[clang::always_inline]] shader.ShadePixels(fb, vars);
                     }
                 }
                 w0 += stepX0, w1 += stepX1, w2 += stepX2;

@@ -1,7 +1,9 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+
 #include "SwRast.h"
+#include "Texture.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -43,7 +45,7 @@ public:
         _model = std::make_unique<scene::Model>("assets/models/Sponza/Sponza.gltf");
         _shadowModel = std::make_unique<scene::Model>("assets/models/Sponza/Sponza_LowPoly.gltf");
 
-        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::HdrTexture2D::LoadCubemapFromPanorama("assets/skyboxes/sunflowers_puresky_4k.hdr"));
+        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr"));
 
         //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
         //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");

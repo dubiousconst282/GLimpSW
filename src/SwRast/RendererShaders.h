@@ -1,28 +1,42 @@
 #pragma once
 
 #include "SwRast.h"
+#include "Texture.h"
 #include <random>
-
-#include <execution>
-#include <ranges>
 
 namespace renderer {
 
 using swr::VInt, swr::VFloat, swr::VFloat2, swr::VFloat3, swr::VFloat4, swr::VMask;
 using namespace swr::simd;
 
+// Deferred PBR shader
 // https://google.github.io/filament/Filament.html
+// https://bruop.github.io/ibl/
 struct DefaultShader {
     static const uint32_t NumCustomAttribs = 8;
 
+    static constexpr swr::SamplerDesc SurfaceSampler = {
+        .Wrap = swr::WrapMode::Repeat,
+        .MagFilter = swr::FilterMode::Linear,
+        .MinFilter = swr::FilterMode::Nearest,
+        .EnableMips = true,
+    };
+    static constexpr swr::SamplerDesc CubeSampler = {
+        .Wrap = swr::WrapMode::ClampToEdge,
+        .MagFilter = swr::FilterMode::Linear,
+        .MinFilter = swr::FilterMode::Linear,
+        .EnableMips = false, // TODO: fix cubemap seams when using mips
+    };
+
     // Forward
     glm::mat4 ProjMat, ModelMat;
-    const swr::Texture2D* BaseColorTex;
-    const swr::Texture2D* NormalMetallicRoughnessTex;
+    const swr::RgbaTexture2D* BaseColorTex;
+    const swr::RgbaTexture2D* NormalMetallicRoughnessTex;
 
     // Compose pass
     const swr::Framebuffer* ShadowBuffer;
     const swr::HdrTexture2D* SkyboxTex;
+    const swr::HdrTexture2D* EnvironmentTex;
     glm::mat4 ShadowProjMat, ViewMat;
     glm::vec3 LightPos, ViewPos;
 
@@ -44,7 +58,7 @@ struct DefaultShader {
 
         VFloat u = vars.GetSmooth(0);
         VFloat v = vars.GetSmooth(1);
-        VFloat4 baseColor = BaseColorTex->SampleHybrid(u, v);
+        VFloat4 baseColor = UnpackRGBA(BaseColorTex->Sample<SurfaceSampler>(u, v));
 
         VFloat3 N = normalize(vars.GetSmooth<VFloat3>(2));
 
@@ -52,6 +66,7 @@ struct DefaultShader {
         VFloat roughness = 0.5f;
 
         if (NormalMetallicRoughnessTex != nullptr) {
+            VFloat4 SN = UnpackRGBA(NormalMetallicRoughnessTex->Sample<SurfaceSampler>(u, v));
             // T = normalize(T - dot(T, N) * N);
             // mat3 TBN = mat3(T, cross(N, T), N);
             // vec3 n = texture(u_NormalMetallicRoughnessTex, UV).rgb * 2.0 - 1.0;
@@ -63,7 +78,10 @@ struct DefaultShader {
             T = normalize(T - dot(T, N) * N);
             VFloat3 B = cross(N, T);
 
-            VFloat4 SN = NormalMetallicRoughnessTex->SampleHybrid(u, v);
+            // Flip bitangent depending on whether UVs are mirrored - https://stackoverflow.com/a/44901073
+            // TODO: maybe cheaper to compute tangents using screen derivatives all the way. (maybe too blocky?)
+            VFloat det = (dFdy(u) * dFdx(v) - dFdx(u) * dFdy(v)) & -0.0f;
+            B = { B.x ^ det, B.y ^ det, B.z ^ det };  // det < 0 ? -B : B
 
             // Reconstruct Z from 2-channel normap map
             // https://aras-p.info/texts/CompactNormalStorage.html
@@ -80,7 +98,7 @@ struct DefaultShader {
             metalness = SN.z;
             roughness = SN.w;
         }
-        VMask mask = vars.TileMask & (baseColor.w > 0.9f);
+        VMask mask = vars.TileMask & (baseColor.w > 0.5f);
 
         // GBuffer
         //   #1 [888: RGB]    [8: Metalness]
@@ -98,74 +116,84 @@ struct DefaultShader {
 
         float minDepth = 1.0f;
 
-        for (uint32_t y = 0; y < fb.Height; y += 4) {
-            for (uint32_t x = 0; x < fb.Width; x += 4) {
-                uint32_t tileOffset = fb.GetPixelOffset(x, y);
-                VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
-                VMask skyMask = tileDepth >= minDepth;
+        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+            uint32_t tileOffset = fb.GetPixelOffset(x, y);
+            VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
+            VMask skyMask = tileDepth >= minDepth;
 
-                VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
-                VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
-                VFloat3 worldPos = VFloat3(PerspectiveDiv(TransformVector(invProj, { u, v, tileDepth, 1.0f })));
+            VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
+            VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
+            VFloat3 worldPos = VFloat3(PerspectiveDiv(TransformVector(invProj, { u, v, tileDepth, 1.0f })));
 
-                VFloat3 finalColor;
+            VFloat3 finalColor;
 
-                if (!all(skyMask)) {
-                    VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
-                    VFloat4 G2 = UnpackRGBA(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
+            if (!all(skyMask)) {
+                VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
+                VFloat4 G2 = UnpackRGBA(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
 
-                    VFloat3 baseColor = VFloat3(G1);
-                    VFloat3 N = VFloat3(G2) * 2.0f - 1.0f;
-                    VFloat metalness = G1.w;
-                    VFloat roughness = max(G2.w * G2.w, 0.045f);  // square to remap from perceptual roughness,  bias to prevent div by zero
+                VFloat3 baseColor = VFloat3(G1);
+                VFloat3 N = VFloat3(G2) * 2.0f - 1.0f;
+                VFloat metalness = G1.w;
+                VFloat roughness = max(G2.w * G2.w, 0.002f);  // square to remap from perceptual roughness, clamp to prevent div by zero
 
-                    // Renormalization helps reduce quantization artifacts (8-bits are not enough, maybe compress with Signed Octahedron?)
-                    N = normalize(N);
-                    baseColor = baseColor * baseColor;
+                // Renormalization helps reduce quantization artifacts
+                // TODO: compress G-Buffer normals at higher bit depth with Signed Octahedron (linked in aras-p blog)
+                N = normalize(N);
 
-                    VFloat3 VP = normalize(ViewPos - worldPos);
-                    VFloat3 L = normalize(LightPos - worldPos);
-                    VFloat3 H = normalize(VP + L);
+                VFloat3 V = normalize(ViewPos - worldPos);
+                VFloat3 L = normalize(LightPos);
+                VFloat3 H = normalize(V + L);
 
-                    VFloat NoV = max(dot(N, VP), 0.05f);
-                    VFloat NoL = max(dot(N, L), 0.0f);
-                    VFloat NoH = max(dot(N, H), 0.0f);
-                    VFloat LoH = max(dot(L, H), 0.0f);
+                VFloat NoV = max(dot(N, V), 1e-4f);
+                VFloat NoL = max(dot(N, L), 0.0f);
+                VFloat NoH = max(dot(N, H), 0.0f);
+                VFloat LoH = max(dot(L, H), 0.0f);
 
-                    float reflectance = 0.5f;
+                float reflectance = 0.5f;
 
-                    VFloat D = D_GGX(NoH, roughness); // microfacet distribution
-                    VFloat V = V_SmithGGXCorrelatedFast(NoV, NoL, roughness);  // microfacet visibility
-                    VFloat3 F0 = (0.16f * reflectance * reflectance) * (1.0f - metalness) + baseColor * metalness;
-                    VFloat3 F = F_Schlick(LoH, F0);
-                    
-                    // specular BRDF
-                    VFloat3 Fr = D * V * F;
+                VFloat D = D_GGX(NoH, roughness);
+                VFloat G = V_SmithGGXCorrelatedFast(NoV, NoL, roughness);
+                VFloat3 f0 = (0.16f * reflectance * reflectance) * (1.0f - metalness) + baseColor * metalness;
+                VFloat3 F = F_Schlick(LoH, f0);
 
-                    // diffuse BRDF
-                    VFloat3 diffuseColor = (1.0f - metalness) * VFloat3(baseColor);
-                    VFloat3 Fd = diffuseColor * Fd_Lambert();
+                // specular BRDF
+                VFloat3 Fr = D * G * F;
 
-                    finalColor = Fd + Fr;
-                }
+                // diffuse BRDF
+                VFloat3 diffuseColor = (1.0f - metalness) * VFloat3(baseColor);
+                VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
-                if (any(skyMask)) {
-                    // Render skybox using cubemap texture. https://gamedev.stackexchange.com/a/60377
-                    VFloat faceU, faceV;
-                    VInt faceIdx;
-                    swr::HdrTexture2D::ProjectCubemap(worldPos - ViewPos, faceU, faceV, faceIdx);
-                    VFloat3 skyColor = SkyboxTex->SampleNearest(faceU, faceV, faceIdx);
+                finalColor = (Fd + Fr) * NoL * 4.5f;  // TODO: directional illuminance, pre-exposed lights
+                VFloat3 R = reflect(0 - V, N);
 
-                    finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
-                    finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
-                    finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
-                }
-                _mm512_store_epi32(&fb.ColorBuffer[tileOffset], PackRGBA({ finalColor, 1.0f }));
+                //finalColor = finalColor + EnvironmentTex->SampleCube(R, true) * 0.1f;
+
+                // finalColor = finalColor * NoL * (ShadowBuffer ? max(0.2f, GetShadow(worldPos, NoL)) : 1.0f);
             }
-        }
+
+            if (any(skyMask)) {
+                // Render skybox using cubemap texture. https://gamedev.stackexchange.com/a/60377
+                VFloat3 skyColor = SkyboxTex->SampleCube<CubeSampler>(worldPos - ViewPos);
+
+                finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
+                finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
+                finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
+            }
+
+            VFloat luma = (finalColor.x + finalColor.y + finalColor.z) * (1.0f / 4);
+            VFloat mappedLuma = luma / (luma + 1);
+
+            //finalColor = finalColor * (mappedLuma / luma);
+
+            PackRGBA({ finalColor, 1.0f }).store(&fb.ColorBuffer[tileOffset]);
+        });
     }
 
+private:
+
     VFloat GetShadow(VFloat3 worldPos, VFloat NoL) {
+        if (all(NoL <= 0.0f)) return 0.0f;
+        
         static const int8_t PoissonDisk[2][16] = {
             { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
             { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
@@ -192,7 +220,7 @@ struct DefaultShader {
                 break;
             }
             VFloat occlusionDepth = ShadowBuffer->SampleDepth((x + PoissonDisk[0][i]) >> 6, (y + PoissonDisk[1][i]) >> 6);
-            samples = _mm_mask_add_epi8(samples, _mm512_cmp_ps_mask(occlusionDepth, currentDepth, _CMP_GE_OQ), samples, _mm_set1_epi8(1));
+            samples = _mm_mask_add_epi8(samples, occlusionDepth >= currentDepth, samples, _mm_set1_epi8(1));
         }
         return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
     }
@@ -203,11 +231,9 @@ struct DefaultShader {
         return k * k * (1.0f / pi);
     }
     static VFloat V_SmithGGXCorrelatedFast(VFloat NoV, VFloat NoL, VFloat roughness) {
-        // Hammon 2017, "PBR Diffuse Lighting for GGX+Smith Microsurfaces"
-        //float v = 0.5 / mix(2.0 * NoL * NoV, NoL + NoV, roughness);
         VFloat a = 2.0f * NoL * NoV;
         VFloat b = NoL + NoV;
-        return 0.5f / (a + (b - a) * roughness);
+        return 0.5f / lerp(a, b, roughness);
     }
     static VFloat3 F_Schlick(VFloat u, VFloat3 f0) {
         //VFloat f = pow(1.0 - u, 5.0);
@@ -218,6 +244,79 @@ struct DefaultShader {
         return f + f0 * (1.0f - f);
     }
     static VFloat Fd_Lambert() { return 1.0f / pi; }
+
+    static glm::vec2 Hammersley(uint32_t i, uint32_t numSamples) {
+        uint32_t bits = i;
+        bits = (bits << 16) | (bits >> 16);
+        bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1);
+        bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2);
+        bits = ((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4);
+        bits = ((bits & 0x00FF00FF) << 8) | ((bits & 0xFF00FF00) >> 8);
+        return { i / (float)numSamples, bits * (1.0 / UINT_MAX) };
+    }
+    static VFloat3 ImportanceSampleGGX(glm::vec2 Xi, VFloat roughness) {
+        VFloat a = roughness * roughness;
+
+        VFloat phi = 2.0 * pi * Xi.x;
+        VFloat cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+        VFloat sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+        return { cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta };
+    }
+
+    // https://www.unrealengine.com/en-US/blog/physically-based-shading-on-mobile
+    static VFloat2 EnvBRDFApprox(VFloat NoV, VFloat roughness) {
+        const VFloat4 c0 = { -1, -0.0275, -0.572, 0.022 };
+        const VFloat4 c1 = { 1, 0.0425, 1.04, -0.04 };
+        VFloat4 r = roughness * c0 + c1;
+        VFloat a004 = min(r.x * r.x, approx_exp2(-9.28 * NoV)) * r.x + r.y;
+        return { a004 * -1.04 + r.z, a004 * 1.04 + r.w };
+    }
+
+    // This is currently unused because it apparently needs 16F textures, which I don't wanna implement just yet.
+    static VFloat2 IntegrateBRDF(VFloat NoV, VFloat roughness) {
+        // N = vec3(0, 0, 1)
+        VFloat3 V = { sqrt(1.0f - NoV * NoV), 0.0f, NoV };
+        VFloat2 r = { 0.0f, 0.0f };
+        const uint32_t sampleCount = 1024;
+
+        for (uint32_t i = 0; i < sampleCount; i++) {
+            glm::vec2 Xi = Hammersley(i, sampleCount);
+            VFloat3 H = ImportanceSampleGGX(Xi, roughness);
+            VFloat3 L = 2.0f * dot(V, H) * H - V;
+
+            VFloat VoH = max(0.0f, dot(V, H));
+            VFloat NoL = max(0.0f, L.z);
+            VFloat NoH = max(0.0f, H.z);
+
+            if (any(NoL > 0.0f)) {
+                VFloat G = V_SmithGGXCorrelatedFast(NoV, NoL, roughness * roughness);
+                VFloat Gv = G * 4.0f * VoH * NoL / NoH;
+                Gv = csel(NoL > 0.0f, Gv, 0.0f);
+
+                // VFloat Fc = pow(1 - VoH, 5.0f);
+                VFloat Fc = 1 - VoH;
+                VFloat Fc2 = Fc * Fc;
+                Fc = Fc * Fc2 * Fc2;
+
+                r.x += Gv * (1 - Fc);
+                r.y += Gv * Fc;
+            }
+        }
+        return { r.x * (1.0f / sampleCount), r.y * (1.0f / sampleCount) };
+    }
+
+    // https://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
+    static VFloat3 SrgbToLinear(VFloat3 x) {
+        return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878);
+    }
+    static VFloat3 LinearToSrgb(VFloat3 x) {
+        return x;
+        //VFloat3 S1 = sqrt(x);
+        //VFloat3 S2 = sqrt(S1);
+        //VFloat3 S3 = sqrt(S2);
+        //return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
+    }
 };
 struct DepthOnlyShader {
     static const uint32_t NumCustomAttribs = 0;
@@ -234,6 +333,7 @@ struct DepthOnlyShader {
     }
 };
 
+// TODO: Replace this garbage with something better ("Scalable Ambient Obscurance" + maybe copy a few tricks from XeGTAO?)
 struct SSAO {
     static const uint32_t KernelSize = 16, FbAttachId = 4;
 
@@ -278,74 +378,68 @@ struct SSAO {
         uint32_t stride = fb.Width / 2;
         uint8_t* aoBuffer = fb.GetAttachmentBuffer<uint8_t>(FbAttachId);
 
-        auto range = std::ranges::iota_view(0u, (fb.Height + 7) / 8);
+        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+            VInt rng = _randSeed ^ (int32_t)(x * 12345 + y);
 
-        std::for_each(std::execution::par_unseq, range.begin(), range.end(), [&](uint32_t y_) {
-            VInt rng = _randSeed ^ (int32_t)(y_ * 12345);
-            uint32_t y = y_ * 8;
+            VInt iu = (int32_t)x + (VInt::ramp() & 3) * 2;
+            VInt iv = (int32_t)y + (VInt::ramp() >> 2) * 2;
+            VFloat z = depthMap.SampleDepth(iu, iv, 0);
 
-            for (uint32_t x = 0; x < fb.Width; x += 8) {
-                VInt iu = (int32_t)x + (VInt::ramp() & 3) * 2;
-                VInt iv = (int32_t)y + (VInt::ramp() >> 2) * 2;
-                VFloat z = depthMap.SampleDepth(iu, iv, 0);
+            if (!_mm512_cmp_ps_mask(z, _mm512_set1_ps(1.0f), _CMP_LT_OQ)) return;
 
-                if (!_mm512_cmp_ps_mask(z, _mm512_set1_ps(1.0f), _CMP_LT_OQ)) continue;
+            VFloat4 pos = PerspectiveDiv(TransformVector(invProj, { conv2f(iu), conv2f(iv), z, 1.0f }));
 
-                VFloat4 pos = PerspectiveDiv(TransformVector(invProj, { conv2f(iu), conv2f(iv), z, 1.0f }));
+            // TODO: better normal reconstruction - https://atyuwen.github.io/posts/normal-reconstruction/
+            VFloat3 posDx = { dFdx(pos.x), dFdx(pos.y), dFdx(pos.z) };
+            VFloat3 posDy = { dFdy(pos.x), dFdy(pos.y), dFdy(pos.z) };
+            VFloat3 N = normalize(cross(posDx, posDy));
 
-                // TODO: better normal reconstruction - https://atyuwen.github.io/posts/normal-reconstruction/
-                VFloat3 posDx = { dFdx(pos.x), dFdx(pos.y), dFdx(pos.z) };
-                VFloat3 posDy = { dFdy(pos.x), dFdy(pos.y), dFdy(pos.z) };
-                VFloat3 N = normalize(cross(posDx, posDy));
+            XorShiftStep(rng);
+            VFloat3 rotation = normalize({ conv2f(rng & 255) * (1.0f / 127) - 1.0f, conv2f(rng >> 8 & 255) * (1.0f / 127) - 1.0f,0.0f });
+            
+            VFloat NdotR = dot(rotation, N);
+            VFloat3 T = normalize({
+                rotation.x - N.x * NdotR,
+                rotation.y - N.y * NdotR,
+                rotation.z - N.z * NdotR,
+            });
+            VFloat3 B = cross(N, T);
 
-                // Tiled random texture causes some quite ugly artifacts, xorshift is cheap enough
-                XorShiftStep(rng);
-                VFloat3 rotation = normalize({ conv2f(rng & 255) * (1.0f / 127) - 1.0f, conv2f(rng >> 8 & 255) * (1.0f / 127) - 1.0f,0.0f });
-               
-                VFloat NdotR = dot(rotation, N);
-                VFloat3 T = normalize({
-                    rotation.x - N.x * NdotR,
-                    rotation.y - N.y * NdotR,
-                    rotation.z - N.z * NdotR,
-                });
-                VFloat3 B = cross(N, T);
+            auto occlusion = _mm_set1_epi8(0);
 
-                auto occlusion = _mm_set1_epi8(0);
+            for (uint32_t i = 0; i < KernelSize; i++) {
+                VFloat kx = Kernel[0][i], ky = Kernel[1][i], kz = Kernel[2][i];
 
-                for (uint32_t i = 0; i < KernelSize; i++) {
-                    VFloat kx = Kernel[0][i], ky = Kernel[1][i], kz = Kernel[2][i];
+                VFloat sx = (T.x * kx + B.x * ky + N.x * kz) * Radius + pos.x;
+                VFloat sy = (T.y * kx + B.y * ky + N.y * kz) * Radius + pos.y;
+                VFloat sz = (T.z * kx + B.z * ky + N.z * kz) * Radius + pos.z;
 
-                    VFloat sx = (T.x * kx + B.x * ky + N.x * kz) * Radius + pos.x;
-                    VFloat sy = (T.y * kx + B.y * ky + N.y * kz) * Radius + pos.y;
-                    VFloat sz = (T.z * kx + B.z * ky + N.z * kz) * Radius + pos.z;
+                VFloat4 samplePos = PerspectiveDiv(TransformVector(projViewMat, { sx, sy, sz, 1.0f }));
+                VFloat sampleDepth = LinearizeDepth(depthMap.SampleDepth(samplePos.x * 0.5f + 0.5f, samplePos.y * 0.5f + 0.5f, 0));
+                // FIXME: range check kinda breaks when the camera gets close to geom
+                //        depth linearization might be wrong (cam close ups)
+                VFloat sampleDist = abs(LinearizeDepth(z) - sampleDepth);
 
-                    VFloat4 samplePos = PerspectiveDiv(TransformVector(projViewMat, { sx, sy, sz, 1.0f }));
-                    VFloat sampleDepth = LinearizeDepth(depthMap.SampleDepth(samplePos.x * 0.5f + 0.5f, samplePos.y * 0.5f + 0.5f, 0));
-                    // FIXME: range check kinda breaks when the camera gets close to geom
-                    //        depth linearization might also be wrong (cam close ups)
-                    VFloat sampleDist = abs(LinearizeDepth(z) - sampleDepth);
+                VMask rangeMask = sampleDist < MaxRange;
+                VMask occluMask = sampleDepth <= LinearizeDepth(samplePos.z) - 0.02f;
+                occlusion = _mm_sub_epi8(occlusion, _mm_movm_epi8(occluMask & rangeMask));
 
-                    uint16_t rangeMask = _mm512_cmp_ps_mask(sampleDist, _mm512_set1_ps(MaxRange), _CMP_LT_OQ);
-                    uint16_t occluMask = _mm512_cmp_ps_mask(sampleDepth, LinearizeDepth(samplePos.z) - 0.02f, _CMP_LE_OQ);
-                    occlusion = _mm_sub_epi8(occlusion, _mm_movm_epi8(occluMask & rangeMask));
-
-                    // float rangeCheck = abs(origin.z - sampleDepth) < uRadius ? 1.0 : 0.0;
-                    // occlusion += (sampleDepth <= sample.z ? 1.0 : 0.0) * rangeCheck;
-                }
-                occlusion = _mm_slli_epi16(occlusion, 9 - std::bit_width(KernelSize));
-                occlusion = _mm_sub_epi8(_mm_set1_epi8((char)255), occlusion);
-
-                // pow(occlusion, 3)
-                __m256i o1 = _mm256_cvtepu8_epi16(occlusion);
-                __m256i o2 = _mm256_srli_epi16(_mm256_mullo_epi16(o1, o1), 8);
-                __m256i o3 = _mm256_srli_epi16(_mm256_mullo_epi16(o1, o2), 8);
-                occlusion = _mm256_cvtepi16_epi8(o3);
-
-                for (uint32_t sy = 0; sy < 4; sy++) {
-                    std::memcpy(&aoBuffer[(x / 2) + (y / 2 + sy) * stride], (uint32_t*)&occlusion + sy, 4);
-                }
+                // float rangeCheck = abs(origin.z - sampleDepth) < uRadius ? 1.0 : 0.0;
+                // occlusion += (sampleDepth <= sample.z ? 1.0 : 0.0) * rangeCheck;
             }
-        });
+            occlusion = _mm_slli_epi16(occlusion, 9 - std::bit_width(KernelSize));
+            occlusion = _mm_sub_epi8(_mm_set1_epi8((char)255), occlusion);
+
+            // pow(occlusion, 3)
+            __m256i o1 = _mm256_cvtepu8_epi16(occlusion);
+            __m256i o2 = _mm256_srli_epi16(_mm256_mullo_epi16(o1, o1), 8);
+            __m256i o3 = _mm256_srli_epi16(_mm256_mullo_epi16(o1, o2), 8);
+            occlusion = _mm256_cvtepi16_epi8(o3);
+
+            for (uint32_t sy = 0; sy < 4; sy++) {
+                std::memcpy(&aoBuffer[(x / 2) + (y / 2 + sy) * stride], (uint32_t*)&occlusion + sy, 4);
+            }
+        }, 2);
         ApplyBlur(fb);
     }
 

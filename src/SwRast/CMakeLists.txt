@@ -15,7 +15,6 @@ add_executable(SwRast
     Main.cpp
     Scene.cpp
     
-    Texture2D.cpp
     Rasterizer.cpp
     VertexReader.cpp
     Clipper.cpp

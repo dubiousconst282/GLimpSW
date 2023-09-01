@@ -1,4 +1,5 @@
 #include "SwRast.h"
+#include "Texture.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -8,19 +9,21 @@
 
 namespace swr {
 
-Texture2D Texture2D::LoadImage(std::string_view path, uint32_t mipLevels) {
+namespace texutil {
+
+RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels) {
     int width, height, channels;
     stbi_uc* pixels = stbi_load(path.data(), &width, &height, &channels, 4);
 
-    auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
-    tex.SetPixels((uint32_t*)pixels, tex.Width);
+    auto tex = RgbaTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
+    tex.SetPixels(pixels, tex.Width, 0);
+    tex.GenerateMips();
 
     stbi_image_free(pixels);
-
     return tex;
 }
 
-Texture2D Texture2D::LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath, uint32_t mipLevels) {
+RgbaTexture2D LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath, uint32_t mipLevels) {
     int width, height, channels;
     stbi_uc* pixels = stbi_load(normalPath.data(), &width, &height, &channels, 4);
     stbi_uc* mrPixels = nullptr;
@@ -49,9 +52,10 @@ Texture2D Texture2D::LoadNormalMap(std::string_view normalPath, std::string_view
             pixels[i * 4 + 3] = mrPixels[i * 4 + 1];  // Roughness
         }
     }
-    
-    auto tex = Texture2D((uint32_t)width, (uint32_t)height, mipLevels);
-    tex.SetPixels((uint32_t*)pixels, tex.Width);
+
+    auto tex = RgbaTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
+    tex.SetPixels(pixels, tex.Width, 0);
+    tex.GenerateMips();
 
     stbi_image_free(pixels);
     stbi_image_free(mrPixels);
@@ -59,62 +63,71 @@ Texture2D Texture2D::LoadNormalMap(std::string_view normalPath, std::string_view
     return tex;
 }
 
-HdrTexture2D HdrTexture2D::LoadImage(std::string_view filename) {
+HdrTexture2D LoadImageHDR(std::string_view path, uint32_t mipLevels) {
     int width, height, channels;
-    float* pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
+    float* pixels = stbi_loadf(path.data(), &width, &height, &channels, 3);
 
-    auto tex = HdrTexture2D((uint32_t)width, (uint32_t)height, 1);
-    tex.SetPixels(pixels, tex.Width, 0);
+    auto tex = HdrTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
 
-    stbi_image_free(pixels);
+    for (uint32_t y = 0; y < tex.Height; y += 4) {
+        for (uint32_t x = 0; x < tex.Width; x += 4) {
+            VFloat3 tile;
 
-    return tex;
-}
-HdrTexture2D HdrTexture2D::LoadCubemapFromPanorama(std::string_view filename) {
-    int width, height, channels;
-    float* pixels = stbi_loadf(filename.data(), &width, &height, &channels, 3);
-
-    uint32_t faceSize = (uint32_t)width / 4;
-
-    auto tex = HdrTexture2D(faceSize, faceSize, 6);
-    auto temp = std::make_unique<float[]>(faceSize * faceSize * 3);
-
-    for (uint32_t layer = 0; layer < 6; layer++) {
-        for (uint32_t y = 0; y < faceSize; y++) {
-            for (uint32_t x = 0; x < faceSize; x++) {
-                float u = x / (float)(faceSize - 1) * 2.0f - 1.0f;
-                float v = y / (float)(faceSize - 1) * 2.0f - 1.0f;
-
-                // clang-format off
-                glm::vec3 dirs[6]{
-                    {  1,  v,  u }, 
-                    { -1,  v,  u }, 
-                    {  u,  1,  v }, 
-                    {  u, -1,  v }, 
-                    {  u,  v,  1 }, 
-                    {  u,  v, -1 },
-                };
-                glm::vec3 dir = glm::normalize(dirs[layer]);
-
-                float tu = std::atan2f(dir.z, dir.x) / (simd::pi * 2.0f) + 0.5f;
-                float tv = std::asinf(-dir.y) / simd::pi + 0.5f;
-
-                // TODO: re-use linear sampling from HdrTextures if/when they support it
-                uint32_t px = std::min((uint32_t)(tu * width), (uint32_t)width - 1);
-                uint32_t py = std::min((uint32_t)(tv * height), (uint32_t)height - 1);
-
-                for (uint32_t ch = 0; ch < 3; ch++) {
-                    temp[(x + y * faceSize) * 3 + ch] = pixels[(px + py * (uint32_t)width) * 3 + ch];
+            for (uint32_t sy = 0; sy < 4; sy++) {
+                for (uint32_t sx = 0; sx < 4; sx++) {
+                    uint32_t idx = (x + sx) + (y + sy) * tex.Width;
+                    tile.x[sx + sy * 4] = pixels[idx * 3 + 0];
+                    tile.y[sx + sy * 4] = pixels[idx * 3 + 1];
+                    tile.z[sx + sy * 4] = pixels[idx * 3 + 2];
                 }
             }
+            tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(tile), x, y);
         }
-        tex.SetPixels(temp.get(), faceSize, layer);
     }
-
     stbi_image_free(pixels);
+
+    tex.GenerateMips();
 
     return tex;
 }
+HdrTexture2D LoadCubemapFromPanoramaHDR(std::string_view path, uint32_t mipLevels) {
+    auto panoTex = LoadImageHDR(path, 1);
+
+    uint32_t faceSize = panoTex.Width / 4;
+    auto cubeTex = HdrTexture2D(faceSize, faceSize, mipLevels, 6);
+
+    constexpr SamplerDesc PanoSampler = {
+        .Wrap = WrapMode::Repeat,
+        .MagFilter = FilterMode::Linear,
+        .MinFilter = FilterMode::Linear,
+        .EnableMips = false,
+    };
+
+    for (uint32_t layer = 0; layer < 6; layer++) {
+        for (uint32_t y = 0; y < faceSize; y += 4) {
+            for (uint32_t x = 0; x < faceSize; x += 4) {
+                float scaleUV = 1.0f / (faceSize - 1);
+                VFloat u = simd::conv2f((int32_t)x + (VInt::ramp() & 3)) * scaleUV;
+                VFloat v = simd::conv2f((int32_t)y + (VInt::ramp() >> 2)) * scaleUV;
+
+                VFloat3 dir = UnprojectCubemap(u, v, (int32_t)layer);
+
+                for (uint32_t i = 0; i < VFloat::Length; i++) {
+                    u[i] = std::atan2f(dir.z[i], dir.x[i]) / simd::tau + 0.5f;
+                    v[i] = std::asinf(-dir.y[i]) / simd::pi + 0.5f;
+                }
+
+                VFloat3 tile = panoTex.Sample<PanoSampler>(u, v, (int32_t)layer);
+                cubeTex.WriteTile(swr::pixfmt::R11G11B10f::Pack(tile), x, y, layer);
+            }
+        }
+    }
+
+    cubeTex.GenerateMips();
+    return cubeTex;
+}
+
+};  // namespace texutil
 
 void Framebuffer::GetPixels(uint32_t* __restrict dest, uint32_t stride) const {
     for (uint32_t y = 0; y < Height; y += 4) {
