@@ -23,7 +23,7 @@ class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
     std::unique_ptr<scene::Model> _model, _shadowModel;
-    std::unique_ptr<swr::HdrTexture2D> _skyboxTex;
+    std::unique_ptr<renderer::DefaultShader> _shader;
 
     Camera _cam;
     scene::DepthPyramid _depthPyramid;
@@ -45,12 +45,12 @@ public:
         _model = std::make_unique<scene::Model>("assets/models/Sponza/Sponza.gltf");
         _shadowModel = std::make_unique<scene::Model>("assets/models/Sponza/Sponza_LowPoly.gltf");
 
+        // TODO: change scenes and stuff with gui generic settings
         _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr"));
+        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
+        _shader = std::make_unique<renderer::DefaultShader>(std::move(skyboxTex));
 
-        //_model = std::make_unique<scene::Model>("Models/sea_keep_lonely_watcher/scene.gltf");
-        //_model = std::make_unique<scene::Model>("Models/SunTemple_v4/SunTemple.fbx");
-
-        _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 10.0f };
+        _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 5.0f };
 
         InitRasterizer(1280, 720);
 
@@ -115,14 +115,11 @@ public:
         glm::mat4 viewMat = _cam.GetViewMatrix();
         glm::mat4 projViewMat = projMat * viewMat;
 
-        renderer::DefaultShader shader = {
-            .ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr,
-            .SkyboxTex = _skyboxTex.get(),
-            .ShadowProjMat = _shadowProjMat,
-            .ViewMat = viewMat,
-            .LightPos = _lightPos,
-            .ViewPos = _cam._ViewPosition,
-        };
+        _shader->ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr;
+        _shader->ShadowProjMat = _shadowProjMat;
+        _shader->ViewMat = viewMat;
+        _shader->LightPos = _lightPos;
+        _shader->ViewPos = _cam._ViewPosition;
 
         _fb->ClearDepth(1.0f);
 
@@ -132,20 +129,19 @@ public:
             for (uint32_t meshId : node.Meshes) {
                 scene::Mesh& mesh = _model->Meshes[meshId];
 
-                shader.ProjMat = projViewMat * modelMat;
-                shader.ModelMat = modelMat;
-
                 if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
 
-                shader.BaseColorTex = mesh.Material->DiffuseTex;
-                shader.NormalMetallicRoughnessTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
+                _shader->ProjMat = projViewMat * modelMat;
+                _shader->ModelMat = modelMat;
+                _shader->BaseColorTex = mesh.Material->DiffuseTex;
+                _shader->NormalMetallicRoughnessTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
 
                 swr::VertexReader data(
                     (uint8_t*)&_model->VertexBuffer[mesh.VertexOffset], 
                     (uint8_t*)&_model->IndexBuffer[mesh.IndexOffset],
                     mesh.IndexCount, swr::VertexReader::U16);
 
-                _rast->Draw(data, shader);
+                _rast->Draw(data, *_shader);
                 drawCalls++;
             }
             return true;
@@ -154,15 +150,15 @@ public:
         STAT_TIME_BEGIN(Compose);
 
         if (s_HzbOcclusion) {
-            _depthPyramid.Update(*_fb, shader.ProjMat);
+            _depthPyramid.Update(*_fb, _shader->ProjMat);
             RenderDebugHzb();
         }
         if (s_EnableSSAO) {
             _ssao.Generate(*_fb, _depthPyramid, projViewMat);
         }
 
-        shader.ProjMat = projViewMat;
-        shader.Compose(*_fb, s_EnableSSAO);
+        _shader->ProjMat = projViewMat;
+        _shader->Compose(*_fb, s_EnableSSAO);
 
         STAT_TIME_END(Compose);
 

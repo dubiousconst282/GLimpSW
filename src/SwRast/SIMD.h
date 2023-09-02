@@ -60,6 +60,12 @@ struct VFloat4;
 
 struct VFloat2 {
     VFloat x, y;
+
+    VFloat2() = default;
+    VFloat2(float v) { x = y = v; }
+    VFloat2(VFloat v) { x = y = v; }
+    VFloat2(VFloat x_, VFloat y_) { x = x_, y = y_; }
+    VFloat2(const glm::vec2& v) { x = v.x, y = v.y; }
 };
 struct VFloat3 {
     VFloat x, y, z;

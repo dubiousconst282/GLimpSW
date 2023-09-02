@@ -18,27 +18,36 @@ struct DefaultShader {
     static constexpr swr::SamplerDesc SurfaceSampler = {
         .Wrap = swr::WrapMode::Repeat,
         .MagFilter = swr::FilterMode::Linear,
-        .MinFilter = swr::FilterMode::Nearest,
+        .MinFilter = swr::FilterMode::Nearest,  // Downsample with nearest for better perf, quality loss is quite subtle.
         .EnableMips = true,
     };
-    static constexpr swr::SamplerDesc CubeSampler = {
+    static constexpr swr::SamplerDesc EnvSampler = {
         .Wrap = swr::WrapMode::ClampToEdge,
         .MagFilter = swr::FilterMode::Linear,
         .MinFilter = swr::FilterMode::Linear,
-        .EnableMips = false, // TODO: fix cubemap seams when using mips
+        .EnableMips = true,
     };
 
-    // Forward
+    // Owned
+    swr::HdrTexture2D IrradianceMap, FilteredEnvMap;
+    swr::Texture2D<swr::pixfmt::RG16f> BRDFEnvLut;
+    swr::HdrTexture2D SkyboxTex;
+
+    // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
     const swr::RgbaTexture2D* BaseColorTex;
     const swr::RgbaTexture2D* NormalMetallicRoughnessTex;
 
-    // Compose pass
+    // Uniform: Compose pass
     const swr::Framebuffer* ShadowBuffer;
-    const swr::HdrTexture2D* SkyboxTex;
-    const swr::HdrTexture2D* EnvironmentTex;
     glm::mat4 ShadowProjMat, ViewMat;
     glm::vec3 LightPos, ViewPos;
+
+    DefaultShader(swr::HdrTexture2D&& envTex)
+        : IrradianceMap(GenerateIrradianceMap(envTex)),
+          FilteredEnvMap(GenerateRadianceMap(envTex)),
+          BRDFEnvLut(GenerateBRDFEnvLut()),
+          SkyboxTex(std::move(envTex)) {} // note member decl order
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
         VFloat3 pos = data.ReadAttribs<VFloat3>(&scene::Vertex::x);
@@ -131,10 +140,12 @@ struct DefaultShader {
                 VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
                 VFloat4 G2 = UnpackRGBA(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
 
-                VFloat3 baseColor = VFloat3(G1);
+                VFloat3 baseColor = SrgbToLinear(VFloat3(G1));
                 VFloat3 N = VFloat3(G2) * 2.0f - 1.0f;
                 VFloat metalness = G1.w;
-                VFloat roughness = max(G2.w * G2.w, 0.002f);  // square to remap from perceptual roughness, clamp to prevent div by zero
+
+                VFloat perceptualRoughness = G2.w;
+                VFloat roughness = max(perceptualRoughness * perceptualRoughness, 0.002f);  // clamp to prevent div by zero
 
                 // Renormalization helps reduce quantization artifacts
                 // TODO: compress G-Buffer normals at higher bit depth with Signed Octahedron (linked in aras-p blog)
@@ -163,37 +174,75 @@ struct DefaultShader {
                 VFloat3 diffuseColor = (1.0f - metalness) * VFloat3(baseColor);
                 VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
-                finalColor = (Fd + Fr) * NoL * 4.5f;  // TODO: directional illuminance, pre-exposed lights
+                // IBL
                 VFloat3 R = reflect(0 - V, N);
+                VFloat3 Ld = IrradianceMap.SampleCube<EnvSampler>(R) * diffuseColor;
+                VFloat3 Lld = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
+                VFloat2 Ldfg = BRDFEnvLut.Sample<EnvSampler>(dot(N, V), perceptualRoughness);
+                VFloat3 Lr = (f0 * Ldfg.x + Ldfg.y) * Lld;
+                VFloat3 ibl = Ld + Lr;
 
-                //finalColor = finalColor + EnvironmentTex->SampleCube(R, true) * 0.1f;
+                if (ShadowBuffer != nullptr && any(NoL > 0.0f)) {
+                    NoL *= GetShadow(worldPos, NoL);
+                }
+                finalColor = (Fd + Fr) * NoL + ibl;
 
-                // finalColor = finalColor * NoL * (ShadowBuffer ? max(0.2f, GetShadow(worldPos, NoL)) : 1.0f);
+                // TODO: energy preserve / multiscatter / light power
             }
 
             if (any(skyMask)) {
-                // Render skybox using cubemap texture. https://gamedev.stackexchange.com/a/60377
-                VFloat3 skyColor = SkyboxTex->SampleCube<CubeSampler>(worldPos - ViewPos);
+                VFloat3 skyColor = SkyboxTex.SampleCube<SurfaceSampler>(worldPos - ViewPos);
 
                 finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
                 finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
                 finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
             }
 
-            VFloat luma = (finalColor.x + finalColor.y + finalColor.z) * (1.0f / 4);
-            VFloat mappedLuma = luma / (luma + 1);
-
-            //finalColor = finalColor * (mappedLuma / luma);
-
+            finalColor = Tonemap_Unreal(finalColor);
             PackRGBA({ finalColor, 1.0f }).store(&fb.ColorBuffer[tileOffset]);
         });
     }
 
-private:
+    static swr::HdrTexture2D GenerateIrradianceMap(const swr::HdrTexture2D& envTex) {
+        swr::HdrTexture2D tex(32, 32, 1, 6);
+
+        for (uint32_t layer = 0; layer < 6; layer++) {
+            swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, VFloat u, VFloat v) {
+                VFloat3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
+                VFloat3 color = PrefilterDiffuseIrradiance(envTex, dir);
+                tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(color), x, y, layer);
+            });
+        }
+        return tex;
+    }
+    static swr::HdrTexture2D GenerateRadianceMap(const swr::HdrTexture2D& envTex) {
+        swr::HdrTexture2D tex(128, 128, 8, 6);
+
+        for (uint32_t layer = 0; layer < 6; layer++) {
+            for (uint32_t level = 0; level < tex.MipLevels; level++) {
+                uint32_t w = tex.Width >> level;
+                uint32_t h = tex.Height >> level;
+
+                swr::texutil::IterateTiles(w, h, [&](uint32_t x, uint32_t y, VFloat u, VFloat v) {
+                    VFloat3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
+                    VFloat3 color = PrefilterEnvMap(envTex, level / (tex.MipLevels - 1.0f), dir);
+                    tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(color), x, y, layer, level);
+                });
+            }
+        }
+        return tex;
+    }
+    static swr::Texture2D<swr::pixfmt::RG16f> GenerateBRDFEnvLut() {
+        swr::Texture2D<swr::pixfmt::RG16f> tex(128, 128, 1, 1);
+
+        swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, VFloat u, VFloat v) {
+            VFloat2 f_ab = IntegrateBRDF(u, 1.0f - v);
+            tex.WriteTile(swr::pixfmt::RG16f::Pack(f_ab), x, y);
+        });
+        return tex;
+    }
 
     VFloat GetShadow(VFloat3 worldPos, VFloat NoL) {
-        if (all(NoL <= 0.0f)) return 0.0f;
-        
         static const int8_t PoissonDisk[2][16] = {
             { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
             { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
@@ -215,7 +264,7 @@ private:
 
         for (uint32_t i = 0; i < 16; i++) {
             // If at the 4th iter samples are all 0 or 4, assume this area is not in a shadow edge
-            if (i == 4 && (!_mm_cmpgt_epu8_mask(samples, _mm_set1_epi8(0)) || !_mm_cmplt_epu8_mask(samples, _mm_set1_epi8(4)))) {
+            if (i == 4 && (_mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(0)) || _mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(4)))) {
                 weight = 1.0f / 4;
                 break;
             }
@@ -225,64 +274,87 @@ private:
         return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
     }
 
-    static VFloat D_GGX(VFloat NoH, VFloat roughness) {
-        VFloat a = NoH * roughness;
-        VFloat k = roughness / (1.0f - NoH * NoH + a * a);
-        return k * k * (1.0f / pi);
-    }
-    static VFloat V_SmithGGXCorrelatedFast(VFloat NoV, VFloat NoL, VFloat roughness) {
-        VFloat a = 2.0f * NoL * NoV;
-        VFloat b = NoL + NoV;
-        return 0.5f / lerp(a, b, roughness);
-    }
-    static VFloat3 F_Schlick(VFloat u, VFloat3 f0) {
-        //VFloat f = pow(1.0 - u, 5.0);
-        //return f + f0 * (1.0 - f);
-        VFloat f = 1.0 - u;
-        VFloat f2 = f * f;
-        f = f2 * f2 * f;
-        return f + f0 * (1.0f - f);
-    }
-    static VFloat Fd_Lambert() { return 1.0f / pi; }
+    static VFloat3 PrefilterDiffuseIrradiance(const swr::HdrTexture2D& envTex, VFloat3 N) {
+        VMask nzMask = abs(N.z) < 0.999f;
+        VFloat3 up = { csel(nzMask, VFloat(0.0f), 1.0f), 0.0, csel(nzMask, VFloat(1.0f), 0.0f) };
+        VFloat3 right = normalize(cross(up, N));
+        up = cross(N, right);
 
-    static glm::vec2 Hammersley(uint32_t i, uint32_t numSamples) {
-        uint32_t bits = i;
-        bits = (bits << 16) | (bits >> 16);
-        bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1);
-        bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2);
-        bits = ((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4);
-        bits = ((bits & 0x00FF00FF) << 8) | ((bits & 0xFF00FF00) >> 8);
-        return { i / (float)numSamples, bits * (1.0 / UINT_MAX) };
-    }
-    static VFloat3 ImportanceSampleGGX(glm::vec2 Xi, VFloat roughness) {
-        VFloat a = roughness * roughness;
+        VFloat3 color = 0.0f;
+        uint32_t sampleCount = 0;
 
-        VFloat phi = 2.0 * pi * Xi.x;
-        VFloat cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
-        VFloat sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        const float twoPi = tau, halfPi = pi * 0.5;
+        float deltaPhi = twoPi / 360.0;
+        float deltaTheta = halfPi / 90.0;
 
-        return { cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta };
+        for (float phi = 0.0; phi < twoPi; phi += deltaPhi) {
+            for (float theta = 0.0; theta < halfPi; theta += deltaTheta) {
+                // Spherical to World Space in two steps...
+                VFloat3 tempVec = cosf(phi) * right + sinf(phi) * up;
+                VFloat3 sampleVector = cosf(theta) * N + sinf(theta) * tempVec;
+                VFloat3 envColor = envTex.SampleCube<SurfaceSampler>(sampleVector, 2);
+
+                // Shitty workaround to reduce artifacts around overly bright spots
+                envColor.x = min(envColor.x, 1000.0f);
+                envColor.y = min(envColor.y, 1000.0f);
+                envColor.z = min(envColor.z, 1000.0f);
+
+                color = color + envColor * cosf(theta) * sinf(theta);
+                sampleCount++;
+            }
+        }
+        return color * (pi * 1.0f / sampleCount);
     }
 
-    // https://www.unrealengine.com/en-US/blog/physically-based-shading-on-mobile
-    static VFloat2 EnvBRDFApprox(VFloat NoV, VFloat roughness) {
-        const VFloat4 c0 = { -1, -0.0275, -0.572, 0.022 };
-        const VFloat4 c1 = { 1, 0.0425, 1.04, -0.04 };
-        VFloat4 r = roughness * c0 + c1;
-        VFloat a004 = min(r.x * r.x, approx_exp2(-9.28 * NoV)) * r.x + r.y;
-        return { a004 * -1.04 + r.z, a004 * 1.04 + r.w };
+    // From Karis, 2014
+    static VFloat3 PrefilterEnvMap(const swr::HdrTexture2D& envTex, float roughness, VFloat3 R) {
+        const uint32_t numSamples = 64;
+        VFloat3 N = R;
+        VFloat3 V = R;
+
+        roughness = std::max(roughness, 0.01f);
+
+        VFloat3 prefilteredColor = 0.0f;
+        VFloat totalWeight = 0.0f;
+
+        for (uint32_t i = 0; i < numSamples; i++) {
+            glm::vec2 Xi = Hammersley(i, numSamples);
+            VFloat3 H = ImportanceSampleGGX(Xi, roughness, N);
+            VFloat VoH = dot(V, H);
+            VFloat NoH = max(VoH, 0.0f);  // Since N = V in our approximation
+            // Use microfacet normal H to find L
+            VFloat3 L = 2.0f * VoH * H - V;
+            VFloat NoL = max(dot(N, L), 0.0f);
+
+            if (any(NoL > 0.0f)) {
+                // Based off https://developer.nvidia.com/gpugems/GPUGems3/gpugems3_ch20.html
+                // Typically you'd have the following:
+                // float pdf = D_GGX(NoH, roughness) * NoH / (4.0 * VoH);
+                // but since V = N => VoH == NoH
+                VFloat pdf = D_GGX(NoH, roughness) / 4.0f + 0.001f;
+                // Solid angle of current sample -- bigger for less likely samples
+                VFloat omegaS = 1.0f / (numSamples * pdf);
+                // Solid angle of texel
+                float omegaP = 4.0f * pi / (6 * envTex.Width * envTex.Width);
+                // Mip level is determined by the ratio of our sample's solid angle to a texel's solid angle
+                VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0);
+
+                prefilteredColor = prefilteredColor + envTex.SampleCube<SurfaceSampler>(L, mipLevel) * NoL;
+                totalWeight += NoL;
+            }
+        }
+        return prefilteredColor / totalWeight;
     }
 
-    // This is currently unused because it apparently needs 16F textures, which I don't wanna implement just yet.
     static VFloat2 IntegrateBRDF(VFloat NoV, VFloat roughness) {
-        // N = vec3(0, 0, 1)
+        VFloat3 N = { 0, 0, 1 };
         VFloat3 V = { sqrt(1.0f - NoV * NoV), 0.0f, NoV };
         VFloat2 r = { 0.0f, 0.0f };
         const uint32_t sampleCount = 1024;
 
         for (uint32_t i = 0; i < sampleCount; i++) {
             glm::vec2 Xi = Hammersley(i, sampleCount);
-            VFloat3 H = ImportanceSampleGGX(Xi, roughness);
+            VFloat3 H = ImportanceSampleGGX(Xi, roughness, N);
             VFloat3 L = 2.0f * dot(V, H) * H - V;
 
             VFloat VoH = max(0.0f, dot(V, H));
@@ -306,17 +378,77 @@ private:
         return { r.x * (1.0f / sampleCount), r.y * (1.0f / sampleCount) };
     }
 
+    static VFloat D_GGX(VFloat NoH, VFloat roughness) {
+        VFloat a = NoH * roughness;
+        VFloat k = roughness / (1.0f - NoH * NoH + a * a);
+        return k * k * (1.0f / pi);
+    }
+    static VFloat V_SmithGGXCorrelatedFast(VFloat NoV, VFloat NoL, VFloat roughness) {
+        VFloat a = 2.0f * NoL * NoV;
+        VFloat b = NoL + NoV;
+        return 0.5f / lerp(a, b, roughness);
+    }
+    static VFloat3 F_Schlick(VFloat u, VFloat3 f0) {
+        // VFloat f = pow(1.0 - u, 5.0);
+        // return f + f0 * (1.0 - f);
+        VFloat f = 1.0 - u;
+        VFloat f2 = f * f;
+        f = f2 * f2 * f;
+        return f + f0 * (1.0f - f);
+    }
+    static VFloat Fd_Lambert() { return 1.0f / pi; }
+
+    static glm::vec2 Hammersley(uint32_t i, uint32_t numSamples) {
+        uint32_t bits = i;
+        bits = (bits << 16) | (bits >> 16);
+        bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1);
+        bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2);
+        bits = ((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4);
+        bits = ((bits & 0x00FF00FF) << 8) | ((bits & 0xFF00FF00) >> 8);
+        return { i / (float)numSamples, bits * (1.0 / UINT_MAX) };
+    }
+    static VFloat3 ImportanceSampleGGX(glm::vec2 Xi, VFloat roughness, VFloat3 N) {
+        VFloat a = roughness * roughness;
+
+        VFloat phi = 2.0 * pi * Xi.x;
+        VFloat cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+        VFloat sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+        VFloat3 H = { cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta };
+
+        // vec3 upVector = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+        VMask nzMask = abs(N.z) < 0.999f;
+        VFloat3 upVector = { csel(nzMask, VFloat(0.0f), 1.0f), 0.0, csel(nzMask, VFloat(1.0f), 0.0f) };
+        VFloat3 tangentX = normalize(cross(upVector, N));
+        VFloat3 tangentY = cross(N, tangentX);
+        return tangentX * H.x + tangentY * H.y + N * H.z;
+    }
+
+    // https://www.unrealengine.com/en-US/blog/physically-based-shading-on-mobile
+    static VFloat2 EnvBRDFApprox(VFloat NoV, VFloat roughness) {
+        const VFloat4 c0 = { -1, -0.0275, -0.572, 0.022 };
+        const VFloat4 c1 = { 1, 0.0425, 1.04, -0.04 };
+        VFloat4 r = roughness * c0 + c1;
+        VFloat a004 = min(r.x * r.x, approx_exp2(-9.28 * NoV)) * r.x + r.y;
+        return { a004 * -1.04 + r.z, a004 * 1.04 + r.w };
+    }
+
     // https://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
     static VFloat3 SrgbToLinear(VFloat3 x) {
         return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878);
     }
-    static VFloat3 LinearToSrgb(VFloat3 x) {
-        return x;
-        //VFloat3 S1 = sqrt(x);
-        //VFloat3 S2 = sqrt(S1);
-        //VFloat3 S3 = sqrt(S2);
-        //return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
+    static VFloat3 Tonemap_Unreal(VFloat3 x) {
+        // Unreal 3, Documentation: "Color Grading"
+        // Adapted to be close to Tonemap_ACES, with similar range
+        // Gamma 2.2 correction is baked in, don't use with sRGB conversion!
+        return x / (x + 0.155) * 1.019;
     }
+    //static VFloat3 LinearToSrgb(VFloat3 x) {
+    //    VFloat3 S1 = sqrt(x);
+    //    VFloat3 S2 = sqrt(S1);
+    //    VFloat3 S3 = sqrt(S2);
+    //    return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
+    //}
 };
 struct DepthOnlyShader {
     static const uint32_t NumCustomAttribs = 0;
