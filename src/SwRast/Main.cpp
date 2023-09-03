@@ -1,6 +1,7 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+#include <filesystem>
 
 #include "SwRast.h"
 #include "Texture.h"
@@ -22,7 +23,7 @@
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
-    std::unique_ptr<scene::Model> _model, _shadowModel;
+    std::unique_ptr<scene::Model> _scene, _shadowScene;
     std::unique_ptr<renderer::DefaultShader> _shader;
 
     Camera _cam;
@@ -38,16 +39,20 @@ class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _shadowFb;
     std::unique_ptr<swr::Rasterizer> _shadowRast;
 
+    std::vector<std::filesystem::path> _scenePaths;
+    std::string _currSceneName;
+
     renderer::SSAO _ssao;
 
 public:
     SwRenderer() {
-        _model = std::make_unique<scene::Model>("assets/models/Sponza/Sponza.gltf");
-        _shadowModel = std::make_unique<scene::Model>("assets/models/Sponza/Sponza_LowPoly.gltf");
+        SearchScenes("assets/", _scenePaths);
+        SearchScenes("logs/assets/", _scenePaths); // git ignored
 
-        // TODO: change scenes and stuff with gui generic settings
-        _skyboxTex = std::make_unique<swr::HdrTexture2D>(swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr"));
-        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
+        LoadScene("assets/models/Sponza/Sponza.gltf");
+
+        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/footprint_court.hdr");
+        //auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
         _shader = std::make_unique<renderer::DefaultShader>(std::move(skyboxTex));
 
         _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 5.0f };
@@ -62,11 +67,17 @@ public:
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
-        _fb = std::make_shared<swr::Framebuffer>(width, height, 5);
+        _fb = std::make_shared<swr::Framebuffer>(width, height, 5); // 4 attachments for deferred normals/roughness + 1 for AO
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
+    }
+    void LoadScene(const std::filesystem::path& path) {
+        _scene = std::make_unique<scene::Model>(path.string());
+        _shadowScene = nullptr;
+
+        _currSceneName = path.filename().string();
     }
 
     void Render() {
@@ -76,7 +87,14 @@ public:
         static bool s_HzbOcclusion = true;
 
         ImGui::Begin("Settings");
-
+        if (ImGui::BeginCombo("Scene", _currSceneName.c_str())) {
+            for (auto& path : _scenePaths) {
+                if (ImGui::Selectable(path.filename().string().c_str())) {
+                    LoadScene(path);
+                }
+            }
+            ImGui::EndCombo();
+        }
         std::string currRes = std::format("{}x{}", _fb->Width, _fb->Height);
         if (ImGui::BeginCombo("Res", currRes.c_str())) {
             if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1088);
@@ -105,7 +123,7 @@ public:
 
         auto renderStart = std::chrono::high_resolution_clock::now();
 
-        if (s_EnableShadows) {
+        if (s_EnableShadows && _shadowScene != nullptr) {
             RenderShadow();
         }
 
@@ -125,9 +143,9 @@ public:
 
         uint32_t drawCalls = 0;
 
-        _model->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
+        _scene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
             for (uint32_t meshId : node.Meshes) {
-                scene::Mesh& mesh = _model->Meshes[meshId];
+                scene::Mesh& mesh = _scene->Meshes[meshId];
 
                 if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
 
@@ -137,8 +155,8 @@ public:
                 _shader->NormalMetallicRoughnessTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
 
                 swr::VertexReader data(
-                    (uint8_t*)&_model->VertexBuffer[mesh.VertexOffset], 
-                    (uint8_t*)&_model->IndexBuffer[mesh.IndexOffset],
+                    (uint8_t*)&_scene->VertexBuffer[mesh.VertexOffset], 
+                    (uint8_t*)&_scene->IndexBuffer[mesh.IndexOffset],
                     mesh.IndexCount, swr::VertexReader::U16);
 
                 _rast->Draw(data, *_shader);
@@ -150,8 +168,8 @@ public:
         STAT_TIME_BEGIN(Compose);
 
         if (s_HzbOcclusion) {
-            _depthPyramid.Update(*_fb, _shader->ProjMat);
-            RenderDebugHzb();
+            _depthPyramid.Update(*_fb, projViewMat);
+            //RenderDebugHzb();
         }
         if (s_EnableSSAO) {
             _ssao.Generate(*_fb, _depthPyramid, projViewMat);
@@ -196,13 +214,13 @@ public:
 
         _shadowFb->ClearDepth(1.0f);
 
-        _shadowModel->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
+        _shadowScene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
             for (uint32_t meshId : node.Meshes) {
-                scene::Mesh& mesh = _shadowModel->Meshes[meshId];
+                scene::Mesh& mesh = _shadowScene->Meshes[meshId];
 
                 swr::VertexReader data(
-                    (uint8_t*)&_shadowModel->VertexBuffer[mesh.VertexOffset],
-                    (uint8_t*)&_shadowModel->IndexBuffer[mesh.IndexOffset],
+                    (uint8_t*)&_shadowScene->VertexBuffer[mesh.VertexOffset],
+                    (uint8_t*)&_shadowScene->IndexBuffer[mesh.IndexOffset],
                     mesh.IndexCount, swr::VertexReader::U16);
 
                 _shadowRast->Draw(data, renderer::DepthOnlyShader{ .ProjMat = _shadowProjMat * modelMat });
@@ -271,6 +289,23 @@ public:
 
         if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
             ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, &rot.x, scale);
+        }
+    }
+
+    static void SearchScenes(std::string_view basePath, std::vector<std::filesystem::path>& dest) {
+        const std::string_view kExtensions[] = { ".gltf", ".glb", ".fbx", ".obj" };
+
+        for (auto& entry : std::filesystem::recursive_directory_iterator(basePath)) {
+            if (!entry.is_regular_file()) continue;
+
+            bool matchesExt = false;
+
+            for (uint32_t i = 0; i < std::size(kExtensions) && !matchesExt; i++) {
+                matchesExt |= entry.path().extension().compare(kExtensions[i]) == 0;
+            }
+            if (!matchesExt) continue;
+
+            dest.push_back(entry.path());
         }
     }
 };
