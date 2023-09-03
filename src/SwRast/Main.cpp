@@ -180,7 +180,7 @@ public:
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
         ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, STAT_GET_TIME(Compose));
-        ImGui::Text("Setup: %.1fms (clip: %.1fms, bin: %.1fms), %.1fK vertices", STAT_GET_TIME(Setup), STAT_GET_TIME(Clipping), STAT_GET_TIME(Binning), STAT_GET_COUNT(VerticesShaded));
+        ImGui::Text("Setup: %.1fms (%.1fK vertices)", STAT_GET_TIME(Setup), STAT_GET_COUNT(VerticesShaded));
         ImGui::Text("Rasterize: %.1fms", STAT_GET_TIME(Rasterize));
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", STAT_GET_COUNT(TrianglesDrawn), STAT_GET_COUNT(TrianglesClipped), STAT_GET_COUNT(BinsFilled), drawCalls);
         ImGui::End();

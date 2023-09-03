@@ -12,8 +12,6 @@ struct ProfilerStats {
         BinsFilled,
 
         SetupTime,
-        ClippingTime,
-        BinningTime,
         RasterizeTime,
         ComposeTime,
 

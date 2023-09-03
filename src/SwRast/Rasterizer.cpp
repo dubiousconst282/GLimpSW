@@ -20,8 +20,6 @@ Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
 }
 
 void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs) {
-    STAT_TIME_BEGIN(Clipping);
-
     TrianglePacket& tri = batch.PeekLast();
     Clipper::ClipCodes cc = _clipper.ComputeClipCodes(tri);
     uint32_t addedTriangles = 0;
@@ -56,14 +54,11 @@ void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs)
         }
         STAT_INCREMENT(TrianglesClipped, 1);
     }
-    STAT_TIME_END(Clipping);
 
     if (cc.AcceptMask == 0 && addedTriangles == 0) {
         batch.Count--;  // free unused triangle
         return;
     }
-
-    STAT_TIME_BEGIN(Binning);
 
     if (cc.AcceptMask != 0) {
         BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
@@ -73,8 +68,6 @@ void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs)
         uint16_t mask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
         BinTriangles(batch, *(&tri + i / VFloat::Length + 1), mask, numCustomAttribs);
     }
-
-    STAT_TIME_END(Binning);
 }
 
 void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask mask, uint32_t numAttribs) {
