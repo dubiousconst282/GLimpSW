@@ -147,7 +147,7 @@ public:
             for (uint32_t meshId : node.Meshes) {
                 scene::Mesh& mesh = _scene->Meshes[meshId];
 
-                if (s_HzbOcclusion && !_depthPyramid.IsVisibleAABB(mesh.BoundMin, mesh.BoundMax)) continue;
+                if (s_HzbOcclusion && !_depthPyramid.IsVisible(mesh, modelMat)) continue;
 
                 _shader->ProjMat = projViewMat * modelMat;
                 _shader->ModelMat = modelMat;

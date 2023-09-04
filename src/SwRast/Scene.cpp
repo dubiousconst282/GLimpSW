@@ -62,30 +62,29 @@ static swr::RgbaTexture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextur
 Node ConvertNode(const Model& model, aiNode* node) {
     //TODO: figure out wtf is going on with empty nodes
     //FIXME: apply transform on node AABBs
-    Node impNode = {
+    Node cn = {
         .Transform = glm::transpose(*(glm::mat4*)&node->mTransformation),
         .BoundMin = glm::vec3(INFINITY),
         .BoundMax = glm::vec3(-INFINITY),
     };
 
     for (uint32_t i = 0; i < node->mNumMeshes; i++) {
-        impNode.Meshes.push_back(node->mMeshes[i]);
+        cn.Meshes.push_back(node->mMeshes[i]);
 
         const Mesh& mesh = model.Meshes[node->mMeshes[i]];
-        impNode.BoundMin = glm::min(impNode.BoundMin, mesh.BoundMin);
-        impNode.BoundMax = glm::max(impNode.BoundMax, mesh.BoundMax);
+        cn.BoundMin = glm::min(cn.BoundMin, mesh.BoundMin);
+        cn.BoundMax = glm::max(cn.BoundMax, mesh.BoundMax);
     }
     for (uint32_t i = 0; i < node->mNumChildren; i++) {
         Node childNode = ConvertNode(model, node->mChildren[i]);
 
-        impNode.BoundMin = glm::min(impNode.BoundMin, childNode.BoundMin);
-        impNode.BoundMax = glm::max(impNode.BoundMax, childNode.BoundMax);
+        cn.BoundMin = glm::min(cn.BoundMin, childNode.BoundMin);
+        cn.BoundMax = glm::max(cn.BoundMax, childNode.BoundMax);
 
-        impNode.Children.emplace_back(std::move(childNode));
+        cn.Children.emplace_back(std::move(childNode));
     }
-    return impNode;
+    return cn;
 }
-
 
 Model::Model(std::string_view path) {
     const auto processFlags = aiProcess_Triangulate | aiProcess_GenNormals | aiProcess_CalcTangentSpace | 
@@ -189,7 +188,7 @@ float DepthPyramid::GetDepth(float u, float v, float lod) const {
     return std::max({ Sample(0, 0), Sample(1, 0), Sample(0, 1), Sample(1, 1) });
 }
 
-bool DepthPyramid::IsVisibleAABB(const glm::vec3& bbMin, const glm::vec3& bbMax) const {
+bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const {
     if (!_storage) return true;
 
     glm::vec3 rectMin = glm::vec3(INFINITY), rectMax = glm::vec3(-INFINITY);
@@ -198,7 +197,7 @@ bool DepthPyramid::IsVisibleAABB(const glm::vec3& bbMin, const glm::vec3& bbMax)
 
     for (uint32_t i = 0; i < 8; i++) {
         glm::bvec3 corner = { (i >> 0) & 1, (i >> 1) & 1, (i >> 2) & 1 };
-        glm::vec4 p = _viewProj * glm::vec4(glm::mix(bbMin, bbMax, corner), 1.0f);
+        glm::vec4 p = _viewProj * transform * glm::vec4(glm::mix(mesh.BoundMin, mesh.BoundMax, corner), 1.0f);
 
         glm::vec3 rp = {
             p.x / p.w * 0.5f + 0.5f,
@@ -226,6 +225,10 @@ bool DepthPyramid::IsVisibleAABB(const glm::vec3& bbMin, const glm::vec3& bbMax)
     float lod = std::ceil(std::log2(std::max(sizeX, sizeY) / 2.0f));
 
     float screenDepth = GetDepth((rectMin.x + rectMax.x) * 0.5f, (rectMin.y + rectMax.y) * 0.5f, lod);
+
+    //ImGui::GetForegroundDrawList()->AddRect(ImVec2(rectMin.x * _width * 2, (1 - rectMin.y) * _height * 2),
+    //                                        ImVec2(rectMax.x * _width * 2, (1 - rectMax.y) * _height * 2),
+    //                                        rectMin.z <= screenDepth ? 0x8000FF00 : 0x80FFFFFF);
 
     return rectMin.z <= screenDepth;
 }

@@ -87,7 +87,7 @@ public:
 
     float GetDepth(float u, float v, float lod) const;
 
-    bool IsVisibleAABB(const glm::vec3& bbMin, const glm::vec3& bbMax) const;
+    bool IsVisible(const Mesh& mesh, const glm::mat4& transform) const;
 
     float* GetMipBuffer(uint32_t level, uint32_t& width, uint32_t& height) {
         width = _width >> level;
