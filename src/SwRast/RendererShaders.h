@@ -67,7 +67,11 @@ struct DefaultShader {
 
         VFloat u = vars.GetSmooth(0);
         VFloat v = vars.GetSmooth(1);
-        VFloat4 baseColor = UnpackRGBA(BaseColorTex->Sample<SurfaceSampler>(u, v));
+        VFloat4 baseColor;
+
+        if (BaseColorTex != nullptr) {
+            baseColor = UnpackRGBA(BaseColorTex->Sample<SurfaceSampler>(u, v));
+        }
 
         VFloat3 N = normalize(vars.GetSmooth<VFloat3>(2));
 
@@ -111,10 +115,10 @@ struct DefaultShader {
 
         // GBuffer
         //   #1 [888: RGB]    [8: Metalness]
-        //   #2 [888: Normal] [8: Roughness]
+        //   #2 [10.10.1: Normal] [10: Roughness] [1: Unused]
         baseColor.w = metalness;
         fb.WriteTile(vars.TileOffset, mask, PackRGBA(baseColor), vars.Depth);
-        _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), mask, PackRGBA({ N * 0.5f + 0.5f, roughness }));
+        _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), mask, SignedOctEncode(N, roughness));
     }
 
     void Compose(swr::Framebuffer& fb, bool hasSSAO) {
@@ -138,18 +142,14 @@ struct DefaultShader {
 
             if (!all(skyMask)) {
                 VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
-                VFloat4 G2 = UnpackRGBA(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
+                VFloat4 G2 = SignedOctDecode(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
 
                 VFloat3 baseColor = SrgbToLinear(VFloat3(G1));
-                VFloat3 N = VFloat3(G2) * 2.0f - 1.0f;
+                VFloat3 N = VFloat3(G2);
                 VFloat metalness = G1.w;
 
                 VFloat perceptualRoughness = G2.w;
                 VFloat roughness = max(perceptualRoughness * perceptualRoughness, 0.002f);  // clamp to prevent div by zero
-
-                // Renormalization helps reduce quantization artifacts
-                // TODO: compress G-Buffer normals at higher bit depth with Signed Octahedron (linked in aras-p blog)
-                N = normalize(N);
 
                 VFloat3 V = normalize(ViewPos - worldPos);
                 VFloat3 L = normalize(LightPos);
@@ -175,10 +175,11 @@ struct DefaultShader {
                 VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
                 // IBL
+                // TODO: http://www.ludicon.com/castano/blog/articles/seamless-cube-map-filtering/
                 VFloat3 R = reflect(0 - V, N);
                 VFloat3 Ld = IrradianceMap.SampleCube<EnvSampler>(R) * diffuseColor;
                 VFloat3 Lld = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
-                VFloat2 Ldfg = BRDFEnvLut.Sample<EnvSampler>(dot(N, V), perceptualRoughness);
+                VFloat2 Ldfg = BRDFEnvLut.Sample<EnvSampler>(NoV, perceptualRoughness);
                 VFloat3 Lr = (f0 * Ldfg.x + Ldfg.y) * Lld;
                 VFloat3 ibl = Ld + Lr;
 
@@ -449,6 +450,34 @@ struct DefaultShader {
     //    VFloat3 S3 = sqrt(S2);
     //    return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
     //}
+
+    // Encode normal using signed octahedron + arbitrary extra into 10:10:1 + 10 bits (1-bit is unused)
+    // https://johnwhite3d.blogspot.com/2017/10/signed-octahedron-normal-encoding.html
+    static VInt SignedOctEncode(VFloat3 n, VFloat w) {
+        VFloat m = rcp14(abs(n.x) + abs(n.y) + abs(n.z)) * 0.5f;
+        n = n * m;
+
+        VFloat ny = n.y + 0.5;
+        VFloat nx = n.x + ny;
+        ny = ny - n.x;
+
+        return round2i(nx * 1023.0f) << 22 | round2i(ny * 1023.0f) << 12 | round2i(w * 1023.0f) << 2 | shrl(re2i(n.z), 31);
+    }
+    static VFloat4 SignedOctDecode(VInt p) {
+        float scale = 1.0f / 1023.0f;
+        VFloat px = conv2f((p >> 22) & 1023) * scale;
+        VFloat py = conv2f((p >> 12) & 1023) * scale;
+        VFloat pw = conv2f((p >> 2) & 1023) * scale;
+
+        VFloat nx = px - py;
+        VFloat ny = px + py - 1.0f;
+        VFloat nz = (1.0 - abs(nx) - abs(ny)) ^ re2f(p << 31);
+
+        return { normalize({ nx, ny, nz }), pw };
+
+        // OutN.z = n.z * 2.0 - 1.0;  // n.z ? 1 : -1
+        // OutN.z = OutN.z * (1.0 - abs(OutN.x) - abs(OutN.y));
+    }
 };
 struct DepthOnlyShader {
     static const uint32_t NumCustomAttribs = 0;
