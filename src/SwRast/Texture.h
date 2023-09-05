@@ -147,11 +147,18 @@ using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
 namespace texutil {
 
 RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels = 8);
+
+// Load and combine normal and metallic-roughness maps.
+// RG = Normal, B/A = Metallic/Roughness 
+// The Z value of the normal can be approximated with `sqrt(1 - nx*nx + ny*ny)`
 RgbaTexture2D LoadNormalMap(std::string_view path, std::string_view metallicRoughnessPath, uint32_t mipLevels = 8);
+
 HdrTexture2D LoadImageHDR(std::string_view path, uint32_t mipLevels = 8);
+
+// Loads a equirectangular panorama into a cubemap.
 HdrTexture2D LoadCubemapFromPanoramaHDR(std::string_view path, uint32_t mipLevels = 8);
 
-// Iterates over 4x4 tiles. Visitor takes normalized UVs centered around pixel center.
+// Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
 inline void IterateTiles(uint32_t width, uint32_t height, std::function<void(uint32_t, uint32_t, VFloat, VFloat)> visitor) {
     assert(width % 4 == 0 && height % 4 == 0);
 
@@ -164,6 +171,7 @@ inline void IterateTiles(uint32_t width, uint32_t height, std::function<void(uin
     }
 }
 
+// Calculates mip-level for a 4x4 fragment using the partial derivatives of the given scaled UVs.
 inline VInt CalcMipLevel(VFloat scaledU, VFloat scaledV) {
     VFloat dxu = simd::dFdx(scaledU), dyu = simd::dFdy(scaledU);
     VFloat dxv = simd::dFdx(scaledV), dyv = simd::dFdy(scaledV);
@@ -521,7 +529,6 @@ private:
 
     void GenerateMip(uint32_t level, uint32_t layer) {
         uint32_t w = Width >> level, h = Height >> level;
-        uint32_t stride = RowShift - level;
 
         int32_t L = (int32_t)(level - 1);
         int32_t D = (int32_t)(1 << L);  // texel offset on previous level

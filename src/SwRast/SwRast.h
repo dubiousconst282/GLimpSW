@@ -46,9 +46,10 @@ struct Framebuffer {
     // Iterate through framebuffer tiles, potentially in parallel. `visitor` takes base tile X and Y coords.
     void IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor = 1);
 
-    size_t GetPixelOffset(uint32_t x, uint32_t y) const {
-        size_t tileId = (x >> TileShift) + (y >> TileShift) * TileStride;
-        size_t pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
+    uint32_t GetPixelOffset(uint32_t x, uint32_t y) const {
+        assert(x + 3 < Width && y + 3 < Height);
+        uint32_t tileId = (x >> TileShift) + (y >> TileShift) * TileStride;
+        uint32_t pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
         return tileId * TileNumPixels + pixelOffset;
     }
 
@@ -128,7 +129,7 @@ struct VertexReader {
     T ReadAttribs(A V::*vertexMember) const {
         static_assert(sizeof(T) % sizeof(VFloat) == 0);
 
-        uint32_t count = sizeof(T) / sizeof(VFloat);
+        const uint32_t count = sizeof(T) / sizeof(VFloat);
         VFloat dest[count];
 
         size_t offset = (size_t)&(((V*)0)->*vertexMember);
@@ -232,7 +233,7 @@ struct VaryingBuffer {
     T GetSmooth(int32_t attrId) const {
         static_assert(sizeof(T) % sizeof(VFloat) == 0);
 
-        uint32_t count = sizeof(T) / sizeof(VFloat);
+        const uint32_t count = sizeof(T) / sizeof(VFloat);
         VFloat dest[count];
 
         for (uint32_t i = 0; i < count; i++) {
@@ -377,10 +378,10 @@ class Rasterizer {
         __builtin_assume(minX % 4 == 0);
         __builtin_assume(minY % 4 == 0);
 
-        // Barycentric coordinates at start of row
         VInt stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
         VInt stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
 
+        // Barycentric coordinates at start of row
         VInt rowW0 = tri.Weight0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
         VInt rowW1 = tri.Weight1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
         VInt rowW2 = tri.Weight2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
@@ -394,24 +395,23 @@ class Rasterizer {
             VInt w0 = rowW0, w1 = rowW1, w2 = rowW2;
 
             for (uint32_t x = minX; x <= maxX; x += 4) {
-                VMask tileMask = _mm512_cmpge_epi32_mask(w0 | w1 | w2, _mm512_set1_epi32(0));
+                VMask tileMask = (w0 | w1 | w2) >= 0;
 
-                if (tileMask != 0) [[unlikely]] {
+                if (simd::any(tileMask)) [[unlikely]] {
                     VaryingBuffer vars = {
                         .Attribs = (float*)&tri.Vertices->Attribs + i,
+                        .TileOffset = fb.GetPixelOffset(x, y),
                         .W1 = simd::conv2f(w1) * area,
                         .W2 = simd::conv2f(w2) * area,
                     };
-                    uint32_t tileOffset = fb.GetPixelOffset(x, y);
-                    VFloat oldDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
+                    VFloat oldDepth = VFloat::load(&fb.DepthBuffer[vars.TileOffset]);
                     VFloat newDepth = vars.GetSmooth(VaryingBuffer::AttribZ);
 
                     tileMask &= newDepth < oldDepth;
 
-                    if (tileMask != 0) {
+                    if (simd::any(tileMask)) {
                         vars.Depth = newDepth;
                         vars.TileMask = tileMask;
-                        vars.TileOffset = tileOffset;
 
                         [[clang::always_inline]] shader.ShadePixels(fb, vars);
                     }

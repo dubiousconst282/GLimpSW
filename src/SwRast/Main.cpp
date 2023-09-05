@@ -229,8 +229,6 @@ public:
         });
 
         if (ImGui::Begin("Shadow Debug")) {
-            uint32_t n = _shadowFb->Width * _shadowFb->Height;
-
             _shadowDebugTex = std::make_unique<ogl::Texture2D>(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
             auto buf = std::make_unique<uint32_t[]>(_shadowFb->Width * _shadowFb->Height);
 

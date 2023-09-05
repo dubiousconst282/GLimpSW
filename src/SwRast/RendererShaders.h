@@ -288,6 +288,11 @@ struct DefaultShader {
         float deltaPhi = twoPi / 360.0;
         float deltaTheta = halfPi / 90.0;
 
+#ifndef NDEBUG
+        deltaPhi = twoPi / 16.0;
+        deltaTheta = halfPi / 4.0;
+#endif
+
         for (float phi = 0.0; phi < twoPi; phi += deltaPhi) {
             for (float theta = 0.0; theta < halfPi; theta += deltaTheta) {
                 // Spherical to World Space in two steps...
@@ -309,7 +314,11 @@ struct DefaultShader {
 
     // From Karis, 2014
     static VFloat3 PrefilterEnvMap(const swr::HdrTexture2D& envTex, float roughness, VFloat3 R) {
-        const uint32_t numSamples = 64;
+#ifdef NDEBUG
+        const uint32_t numSamples = 512;
+#else
+        const uint32_t numSamples = 16;
+#endif
         VFloat3 N = R;
         VFloat3 V = R;
 
