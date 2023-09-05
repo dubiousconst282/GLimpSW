@@ -122,7 +122,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         auto binRange = std::ranges::iota_view(0u, batch.NumBins);
 
-        std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](uint32_t bid) {
+        std::for_each(std::execution::seq, binRange.begin(), binRange.end(), [&](uint32_t bid) {
             std::vector<uint16_t>& bin = batch.Bins[bid];
             if (bin.size() == 0) return;
 

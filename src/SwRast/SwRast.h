@@ -7,6 +7,7 @@
 
 #include "SIMD.h"
 #include "ProfilerStats.h"
+#include "Misc.h"
 
 namespace swr {
 
@@ -422,6 +423,126 @@ class Rasterizer {
         }
     }
 
+    template<ShaderProgram TShader>
+    void DrawBinnedTriangle_Hier(const TShader& shader, const BinnedTriangle& bin) {
+        Framebuffer& fb = *_fb.get();
+        const TrianglePacket& tri = *bin.Triangle;
+        uint32_t i = bin.TriangleIndex;
+
+        int32_t centerX = (int32_t)(fb.Width / 2), centerY = (int32_t)(fb.Height / 2);
+
+        uint32_t minX = (uint32_t)(tri.MinX[i] + centerX);
+        uint32_t minY = (uint32_t)(tri.MinY[i] + centerY);
+        uint32_t maxX = std::min((uint32_t)(tri.MaxX[i] + centerX), bin.X + TriangleBatch::BinSize - 4);
+        uint32_t maxY = std::min((uint32_t)(tri.MaxY[i] + centerY), bin.Y + TriangleBatch::BinSize - 4);
+
+        VInt tileOffsX = VInt::ramp() & 3;
+        VInt tileOffsY = VInt::ramp() >> 2;
+
+        if (minX < bin.X) {
+            tileOffsX += (int32_t)(bin.X - minX);
+            minX = bin.X;
+        }
+        if (minY < bin.Y) {
+            tileOffsY += (int32_t)(bin.Y - minY);
+            minY = bin.Y;
+        }
+
+        __builtin_assume(minX >= maxX);
+        __builtin_assume(minY >= maxY);
+        __builtin_assume(minX % 4 == 0);
+        __builtin_assume(minY % 4 == 0);
+
+        int32_t stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
+        int32_t stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
+
+        // Barycentric coordinates at the start of the bin
+        VInt baseW0 = tri.Weight0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
+        VInt baseW1 = tri.Weight1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
+        VInt baseW2 = tri.Weight2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
+
+        // Trivial reject corner values
+        int32_t rc0 = (std::max(stepX0, 0) + std::max(stepY0, 0)) * -15;
+        int32_t rc1 = (std::max(stepX1, 0) + std::max(stepY1, 0)) * -15;
+        int32_t rc2 = (std::max(stepX2, 0) + std::max(stepY2, 0)) * -15;
+
+        // Trivial accept corner values
+        int32_t ac0 = (std::min(stepX0, 0) + std::min(stepY0, 0)) * -15;
+        int32_t ac1 = (std::min(stepX1, 0) + std::min(stepY1, 0)) * -15;
+        int32_t ac2 = (std::min(stepX2, 0) + std::min(stepY2, 0)) * -15;
+
+        struct BlockInfo {
+            uint8_t X;
+            uint8_t Y : 7;
+            bool Partial : 1;
+            uint16_t Mask;
+        };
+        const int BlocksPerBin = TriangleBatch::BinSize / 16;
+        BlockInfo blocks[BlocksPerBin * BlocksPerBin * 2];
+        uint32_t numBlocks = 0;
+
+        // 16x16 blocks
+        for (uint32_t y = minY; y <= maxY; y += 16) {
+            VInt w0 = baseW0 + (int32_t)(y - minY) * stepY0;
+            VInt w1 = baseW1 + (int32_t)(y - minY) * stepY1;
+            VInt w2 = baseW2 + (int32_t)(y - minY) * stepY2;
+
+            for (uint32_t x = minX; x <= maxX; x += 16) {
+                VMask rejectMask = w0 < rc0 | w1 < rc1 | w2 < rc2;
+                VMask acceptMask = w0 >= ac0 & w1 >= ac1 & w2 >= ac2;
+                VMask partialMask = ~rejectMask & ~acceptMask;
+
+                uint8_t tx = (x - minX) / 16;
+                uint8_t ty = (y - minY) / 16;
+
+                if (acceptMask != 0) blocks[numBlocks++] = { .X = tx, .Y = ty, .Partial = false, .Mask = acceptMask };
+                if (partialMask != 0) blocks[numBlocks++] = { .X = tx, .Y = ty, .Partial = true, .Mask = partialMask };
+
+                w0 += stepX0 * 16, w1 += stepX1 * 16, w2 += stepX2 * 16;
+            }
+        }
+
+        // 4x4 blocks (shading)
+        float area = tri.RcpArea[i];
+
+        for (uint32_t bi = 0; bi < numBlocks; bi++) {
+            BlockInfo& block = blocks[bi];
+
+            for (uint32_t j : BitIter(block.Mask)) {
+                int32_t x = (int32_t)(block.X * 16 + (j % 4) * 4);
+                int32_t y = (int32_t)(block.Y * 16 + (j / 4) * 4);
+
+                if (minX + (uint32_t)x > maxX || minY + (uint32_t)y > maxY) continue;
+
+                VInt w1 = baseW1 + (x * stepX1 + y * stepY1);
+                VInt w2 = baseW2 + (x * stepX2 + y * stepY2);
+
+                VaryingBuffer vars = {
+                    .Attribs = (float*)&tri.Vertices->Attribs + i,
+                    .TileOffset = fb.GetPixelOffset(minX + (uint32_t)x, minY + (uint32_t)y),
+                    .TileMask = 0xFFFF,
+                    .W1 = simd::conv2f(w1) * area,
+                    .W2 = simd::conv2f(w2) * area,
+                };
+
+                if (block.Partial) {
+                    VInt w0 = baseW0 + (x * stepX0 + y * stepY0);
+                    vars.TileMask = (w0 | w1 | w2) >= 0;
+                }
+
+                VFloat oldDepth = VFloat::load(&fb.DepthBuffer[vars.TileOffset]);
+                VFloat newDepth = vars.GetSmooth(VaryingBuffer::AttribZ);
+
+                vars.TileMask &= newDepth < oldDepth;
+
+                if (simd::any(vars.TileMask)) {
+                    vars.Depth = newDepth;
+                    [[clang::always_inline]] shader.ShadePixels(fb, vars);
+                }
+            }
+        }
+    }
+
 public:
     Rasterizer(std::shared_ptr<Framebuffer> fb);
 
@@ -439,7 +560,13 @@ public:
                     }
                     STAT_INCREMENT(VerticesShaded, VInt::Length * 3);
                 },
-            .DrawFn = [&](const BinnedTriangle& bt) { DrawBinnedTriangle(shader, bt); },
+            .DrawFn =
+                [&](const BinnedTriangle& bt) {
+                    if (clock() / 2000 % 2)
+                        DrawBinnedTriangle_Hier(shader, bt);
+                    else
+                        DrawBinnedTriangle(shader, bt);
+                },
             .NumCustomAttribs = shader.NumCustomAttribs,
         };
         Draw(vertexData, shifc);
