@@ -192,8 +192,9 @@ bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const
     if (!_storage) return true;
 
     glm::vec3 rectMin = glm::vec3(INFINITY), rectMax = glm::vec3(-INFINITY);
-    bool partialOut = false;
-    bool combinedOut = true;
+
+    uint8_t combinedOut = 63;
+    uint8_t partialOut = 0;
 
     for (uint32_t i = 0; i < 8; i++) {
         glm::bvec3 corner = { (i >> 0) & 1, (i >> 1) & 1, (i >> 2) & 1 };
@@ -207,18 +208,28 @@ bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const
         rectMin = glm::min(rectMin, rp);
         rectMax = glm::max(rectMax, rp);
 
-        bool outflag = (p.x < -p.w || p.y > p.w) || (p.y < -p.w || p.y > p.w) || (p.z < 0 || p.z > p.w);
-        partialOut |= outflag;
-        combinedOut &= outflag;
+        uint8_t outcode = 0;
+        outcode |= p.x < -p.w ? 1 : 0;
+        outcode |= p.x > +p.w ? 2 : 0;
+        outcode |= p.y < -p.w ? 4 : 0;
+        outcode |= p.y > +p.w ? 8 : 0;
+        outcode |= p.z < 0 ? 16 : 0;
+        outcode |= p.z > p.w ? 32 : 0;
+
+        combinedOut &= outcode;
+        partialOut |= outcode;
     }
 
-    // Hacky frustum check. Definitely won't work for AABBs bigger than the frustum, but that seems rare enough.
-    if (combinedOut) return false;
+    // Hacky frustum check. Cull if all vertices are outside any of the frustum planes.
+    // Not that this still have false positives for big objects (see below), but it's good enough for our purposes.
+    // - https://bruop.github.io/improved_frustum_culling/
+    // - https://iquilezles.org/articles/frustumcorrect/
+    if (combinedOut != 0) return false;
 
-    // We don't do clipping, so the ccclusion test doesn't work properly with
+    // We don't do clipping, so the ccclusion test wont't work properly with
     // AABBs that are partially out the view frustum.
-    // Consider them as visible, otherwise we'll get constant flicker
-    if (partialOut) return true;
+    // Consider them as visible to prevent flickering.
+    if (partialOut != 0) return true;
 
     float sizeX = (rectMax.x - rectMin.x) * _width;
     float sizeY = (rectMax.y - rectMin.y) * _height;
