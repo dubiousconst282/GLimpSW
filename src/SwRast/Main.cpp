@@ -119,6 +119,9 @@ public:
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
+        if (ImGui::IsKeyPressed(ImGuiKey_C)) {
+            _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
+        }
         _cam.Update();
 
         auto renderStart = std::chrono::high_resolution_clock::now();
@@ -179,10 +182,6 @@ public:
         _shader->Compose(*_fb, s_EnableSSAO);
 
         STAT_TIME_END(Compose);
-
-        if (ImGui::IsKeyPressed(ImGuiKey_M)) {
-            _lightPos = _cam.Position;
-        }
 
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
         _frontTex->SetPixels(_tempPixels.get(), _fb->Width);
