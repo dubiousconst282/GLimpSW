@@ -73,7 +73,7 @@ public:
 // - https://www.rastergrid.com/blog/2010/10/hierarchical-z-map-based-occlusion-culling/
 // - https://vkguide.dev/docs/gpudriven/compute_culling/
 class DepthPyramid {
-    float* _storage = nullptr;
+    swr::AlignedBuffer<float> _storage = nullptr;
     uint32_t _width, _height, _levels;
     uint32_t _offsets[16]{};
     glm::mat4 _viewProj;
@@ -81,8 +81,6 @@ class DepthPyramid {
     void EnsureStorage(uint32_t width, uint32_t height);
 
 public:
-    ~DepthPyramid() { _mm_free(_storage); }
-
     void Update(const swr::Framebuffer& fb, const glm::mat4& viewProj);
 
     float GetDepth(float u, float v, float lod) const;

@@ -307,4 +307,18 @@ inline VFloat4 PerspectiveDiv(const VFloat4& v) {
 
 };  // namespace simd
 
+template<typename T>
+struct DeleteAligned {
+    void operator()(T* data) const { _mm_free(data); }
+};
+
+template<typename T>
+using AlignedBuffer = std::unique_ptr<T[], DeleteAligned<T>>;
+
+template<typename T>
+AlignedBuffer<T> alloc_buffer(size_t count, size_t align = 64) {
+    T* ptr = (T*)_mm_malloc(count * sizeof(T), align);
+    return AlignedBuffer<T>(ptr);
+}
+
 }; // namespace swr

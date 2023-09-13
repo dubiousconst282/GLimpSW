@@ -10,15 +10,21 @@
 
 namespace swr {
 
+// Pixel offsets within a 4x4 tile/fragment
+//   X: [0,1,2,3, 0,1,2,3, ...]
+//   Y: [0,0,0,0, 1,1,1,1, ...]
+inline const VInt FragPixelOffsetsX = VInt::ramp() & 3, FragPixelOffsetsY = VInt::ramp() >> 2;
+
 struct Framebuffer {
     //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
     static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
 
     uint32_t Width, Height, TileStride;
     uint32_t AttachmentStride, NumAttachments;
-    uint32_t* ColorBuffer;
-    float* DepthBuffer;
-    uint8_t* AttachmentBuffer;
+    
+    AlignedBuffer<uint32_t> ColorBuffer;
+    AlignedBuffer<float> DepthBuffer;
+    AlignedBuffer<uint8_t> AttachmentBuffer;
 
     Framebuffer(uint32_t width, uint32_t height, uint32_t numAttachments = 0) {
         Width = (width + TileMask) & ~TileMask;
@@ -27,21 +33,16 @@ struct Framebuffer {
         AttachmentStride = (Width * Height + 63) & ~63u;
         NumAttachments = numAttachments;
 
-        ColorBuffer = (uint32_t*)_mm_malloc(Width * Height * 4, 64);
-        DepthBuffer = (float*)_mm_malloc(Width * Height * 4, 64);
-        AttachmentBuffer = (uint8_t*)_mm_malloc(AttachmentStride * numAttachments, 64);
-    }
-    ~Framebuffer() {
-        _mm_free(ColorBuffer);
-        _mm_free(DepthBuffer);
-        _mm_free(AttachmentBuffer);
+        ColorBuffer = alloc_buffer<uint32_t>(Width * Height);
+        DepthBuffer = alloc_buffer<float>(Width * Height);
+        AttachmentBuffer = alloc_buffer<uint8_t>(AttachmentStride * numAttachments);
     }
 
     void Clear(uint32_t color, float depth) {
-        std::fill(&ColorBuffer[0], &ColorBuffer[Width * Height], color);
+        FillBuffer(ColorBuffer.get(), color);
         ClearDepth(depth);
     }
-    void ClearDepth(float depth) { std::fill(&DepthBuffer[0], &DepthBuffer[Width * Height], depth); }
+    void ClearDepth(float depth) { FillBuffer(DepthBuffer.get(), std::bit_cast<uint32_t>(depth)); }
 
     // Iterate through framebuffer tiles, potentially in parallel. `visitor` takes base tile X and Y coords.
     void IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor = 1);
@@ -76,11 +77,22 @@ struct Framebuffer {
         VInt indices = tileId * TileNumPixels + pixelOffset;
         uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
 
-        return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer, 4);
+        return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer.get(), 4);
     }
 
     void GetPixels(uint32_t* dest, uint32_t stride) const;
     void SaveImage(std::string_view filename) const;
+
+private:
+    void FillBuffer(void* ptr, uint32_t value) {
+        // Non-temporal fill is ~2-3x faster than memset(), but makes rasterization a bit slower. Still a small win overall.
+        // https://en.algorithmica.org/hpc/cpu-cache/bandwidth/
+        uint32_t count = Width * Height;
+
+        for (uint32_t i = 0; i < count; i += 16) {
+            _mm512_stream_si512((uint32_t*)ptr + i, _mm512_set1_epi32((int32_t)value));
+        }
+    }
 };
 
 struct VertexReader {
@@ -247,7 +259,7 @@ struct VaryingBuffer {
         VFloat v0 = GetFlat(AttribW, 0);
         VFloat v1 = GetFlat(AttribW, 1);
         VFloat v2 = GetFlat(AttribW, 2);
-        VFloat vp = _mm512_rcp14_ps(simd::fma(v1 - v0, W1, simd::fma(v2 - v0, W2, v0)));
+        VFloat vp = simd::rcp14(simd::fma(v1 - v0, W1, simd::fma(v2 - v0, W2, v0)));
 
         W1 *= vp * v1;
         W2 *= vp * v2;
@@ -354,15 +366,12 @@ class Rasterizer {
         const TrianglePacket& tri = *bin.Triangle;
         uint32_t i = bin.TriangleIndex;
 
-        int32_t centerX = (int32_t)(fb.Width / 2), centerY = (int32_t)(fb.Height / 2);
+        uint32_t minX = (uint32_t)tri.MinX[i];
+        uint32_t minY = (uint32_t)tri.MinY[i];
+        uint32_t maxX = std::min((uint32_t)tri.MaxX[i], bin.X + TriangleBatch::BinSize - 4);
+        uint32_t maxY = std::min((uint32_t)tri.MaxY[i], bin.Y + TriangleBatch::BinSize - 4);
 
-        uint32_t minX = (uint32_t)(tri.MinX[i] + centerX);
-        uint32_t minY = (uint32_t)(tri.MinY[i] + centerY);
-        uint32_t maxX = std::min((uint32_t)(tri.MaxX[i] + centerX), bin.X + TriangleBatch::BinSize - 4);
-        uint32_t maxY = std::min((uint32_t)(tri.MaxY[i] + centerY), bin.Y + TriangleBatch::BinSize - 4);
-
-        VInt tileOffsX = VInt::ramp() & 3;
-        VInt tileOffsY = VInt::ramp() >> 2;
+        VInt tileOffsX = FragPixelOffsetsX, tileOffsY = FragPixelOffsetsY;
 
         if (minX < bin.X) {
             tileOffsX += (int32_t)(bin.X - minX);

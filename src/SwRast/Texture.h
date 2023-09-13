@@ -164,8 +164,8 @@ inline void IterateTiles(uint32_t width, uint32_t height, std::function<void(uin
 
     for (int32_t y = 0; y < height; y += 4) {
         for (int32_t x = 0; x < width; x += 4) {
-            VFloat u = simd::conv2f(x + (VInt::ramp() & 3)) + 0.5f;
-            VFloat v = simd::conv2f(y + (VInt::ramp() >> 2)) + 0.5f;
+            VFloat u = simd::conv2f(x + FragPixelOffsetsX) + 0.5f;
+            VFloat v = simd::conv2f(y + FragPixelOffsetsY) + 0.5f;
             visitor((uint32_t)x, (uint32_t)y, u * (1.0f / width), v * (1.0f / height));
         }
     }
@@ -283,7 +283,7 @@ struct Texture2D {
     uint32_t RowShift, LayerShift;  // Shift amount to get row offset from Y coord / layer offset. Used to avoid expansive i32 vector mul.
 
     // Indexing: (layer << LayerShift) + _mipOffsets[mipLevel] + (ix >> mipLevel) + (iy >> mipLevel) << RowShift
-    std::unique_ptr<uint32_t[]> Data;
+    AlignedBuffer<uint32_t> Data;
 
     Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels, uint32_t numLayers) {
         assert(std::has_single_bit(width) && std::has_single_bit(height));
@@ -312,7 +312,7 @@ struct Texture2D {
             assert(layerSize * (uint64_t)numLayers < UINT_MAX);
         }
 
-        Data = std::make_unique<uint32_t[]>(layerSize * numLayers + 16);
+        Data = alloc_buffer<uint32_t>(layerSize * numLayers + 16);
 
         _scaleU = (float)width;
         _scaleV = (float)height;
@@ -524,7 +524,7 @@ private:
     template<typename T>
     T GatherTexels(VInt indices) const {
         VInt v = VInt::gather<4>(Data.get(), indices);
-        return *(T*)&v;
+        return std::bit_cast<T>(v);
     }
 
     void GenerateMip(uint32_t level, uint32_t layer) {
@@ -535,8 +535,8 @@ private:
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
-                VInt ix = ((int32_t)x + (VInt::ramp() & 3)) << level;
-                VInt iy = ((int32_t)y + (VInt::ramp() >> 2)) << level;
+                VInt ix = ((int32_t)x + FragPixelOffsetsX) << level;
+                VInt iy = ((int32_t)y + FragPixelOffsetsY) << level;
 
                 // This will never go out of bounds if texture size is POT and >4x4.
                 // Storage is padded by +16*4 bytes so nothing bad should happen if we do.

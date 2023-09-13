@@ -300,7 +300,7 @@ void DepthPyramid::EnsureStorage(uint32_t width, uint32_t height) {
         _offsets[i] = offset;
         offset += (_width >> i) * (_height >> i);
     }
-    _storage = (float*)_mm_malloc(offset * 4 + 128, 64);
+    _storage = swr::alloc_buffer<float>(offset + 16);
 }
 
 }; // namespace scene

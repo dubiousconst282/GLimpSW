@@ -132,8 +132,8 @@ struct DefaultShader {
             VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
             VMask skyMask = tileDepth >= 1.0f;
 
-            VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
-            VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
+            VFloat u = conv2f((int32_t)x + swr::FragPixelOffsetsX);
+            VFloat v = conv2f((int32_t)y + swr::FragPixelOffsetsY);
             VFloat3 worldPos = VFloat3(PerspectiveDiv(TransformVector(invProj, { u, v, tileDepth, 1.0f })));
 
             VFloat3 finalColor;
@@ -577,8 +577,8 @@ struct SSAO {
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
             VInt rng = _randSeed * (int32_t)(x * 12345 + y * 9875);
 
-            VInt iu = (int32_t)x + (VInt::ramp() & 3) * 2;
-            VInt iv = (int32_t)y + (VInt::ramp() >> 2) * 2;
+            VInt iu = (int32_t)x + swr::FragPixelOffsetsX * 2;
+            VInt iv = (int32_t)y + swr::FragPixelOffsetsY * 2;
             VFloat z = depthMap.SampleDepth(iu, iv, 0);
 
             if (!any(z < 1.0f)) return; // skip over tiles that don't have geometry
