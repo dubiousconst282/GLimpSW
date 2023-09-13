@@ -9,6 +9,8 @@ namespace renderer {
 using swr::VInt, swr::VFloat, swr::VFloat2, swr::VFloat3, swr::VFloat4, swr::VMask;
 using namespace swr::simd;
 
+enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, Occlusion, EmissiveMask, Overdraw };
+
 // Deferred PBR shader
 // https://google.github.io/filament/Filament.html
 // https://bruop.github.io/ibl/
@@ -207,6 +209,34 @@ struct DefaultShader {
 
             finalColor = Tonemap_Unreal(finalColor * Exposure);
             PackRGBA({ finalColor, 1.0f }).store(&fb.ColorBuffer[tileOffset]);
+        });
+    }
+
+    void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
+        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+            uint32_t tileOffset = fb.GetPixelOffset(x, y);
+            VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
+            VMask skyMask = tileDepth >= 1.0f;
+
+            VFloat3 finalColor = 0.0f;
+
+            VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
+            VFloat4 G2 = SignedOctDecode(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
+
+            if (layer == DebugLayer::BaseColor) {
+                finalColor = VFloat3(G1);
+            } else if (layer == DebugLayer::Normals) {
+                finalColor = VFloat3(G2) * 0.5f + 0.5f;
+            } else if (layer == DebugLayer::MetallicRoughness) {
+                finalColor = { G1.w, G2.w, 0.0f };
+            } else if (layer == DebugLayer::Occlusion) {
+                finalColor = GetAO(fb, x, y);
+            }
+
+            uint32_t backgroundRGB = (x / 4 + y / 4) % 2 ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
+            VInt finalRGB = csel(skyMask, (int32_t)backgroundRGB, PackRGBA({ finalColor, 1.0f }));
+
+            finalRGB.store(&fb.ColorBuffer[tileOffset]);
         });
     }
 
@@ -523,8 +553,24 @@ struct DepthOnlyShader {
         vars.Position = TransformVector(ProjMat, pos);
     }
 
-    void ShadePixels(const swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
         _mm512_mask_storeu_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
+    }
+};
+struct OverdrawShader {
+    static const uint32_t NumCustomAttribs = 0;
+
+    glm::mat4 ProjMat;
+
+    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+        VFloat4 pos = { data.ReadAttribs<VFloat3>(&scene::Vertex::x), 1.0f };
+        vars.Position = TransformVector(ProjMat, pos);
+    }
+
+    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+        VInt color = VInt::load(&fb.ColorBuffer[vars.TileOffset]);
+        color = _mm512_adds_epu8(color, _mm512_set1_epi32((int32_t)0xFF'000020));
+        fb.WriteTile(vars.TileOffset, 0xFFFF, color, vars.Depth);
     }
 };
 

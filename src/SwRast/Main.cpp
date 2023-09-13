@@ -63,7 +63,7 @@ public:
         _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
 
         _lightRot = glm::vec3(0.0f, -90.0f, 0.0f);
-        _lightPos = glm::vec3(3.5f, 12.0f, 2.9f);
+        _lightPos = glm::vec3(0.589494, 0.684509, 0.428906) * 18.0f;
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
@@ -90,6 +90,7 @@ public:
         static bool s_EnableShadows = false;
         static bool s_EnableSSAO = false;
         static bool s_HzbOcclusion = true;
+        static renderer::DebugLayer s_Layer = renderer::DebugLayer::None;
 
         ImGui::Begin("Settings");
         if (ImGui::BeginCombo("Scene", _currSceneName.c_str())) {
@@ -108,6 +109,14 @@ public:
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
             ImGui::EndCombo();
         }
+        ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0Metallic-Roughness\0Ambient Occlusion\0Emissive Mask\0Overdraw\0");
+        ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
+
+        ImGui::Separator();
+        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+
+        ImGui::Separator();
         ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
@@ -119,12 +128,6 @@ public:
             ImGui::InputFloat("Range", &_ssao.MaxRange, 0.1f);
         }
 
-        ImGui::Separator();
-
-        ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
-
-        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();
 
         if (ImGui::IsKeyPressed(ImGuiKey_C)) {
@@ -150,7 +153,11 @@ public:
         _shader->LightPos = _lightPos;
         _shader->ViewPos = _cam._ViewPosition;
 
-        _fb->ClearDepth(1.0f);
+        if (s_Layer == renderer::DebugLayer::Overdraw) {
+            _fb->Clear(0xFF000000, 1.0f);
+        } else {
+            _fb->ClearDepth(1.0f);
+        }
 
         uint32_t drawCalls = 0;
 
@@ -170,7 +177,11 @@ public:
                     (uint8_t*)&_scene->IndexBuffer[mesh.IndexOffset],
                     mesh.IndexCount, swr::VertexReader::U16);
 
-                _rast->Draw(data, *_shader);
+                if (s_Layer == renderer::DebugLayer::Overdraw) {
+                    _rast->Draw(data, renderer::OverdrawShader{ .ProjMat = _shader->ProjMat });
+                } else {
+                    _rast->Draw(data, *_shader);
+                }
                 drawCalls++;
             }
             return true;
@@ -187,7 +198,12 @@ public:
         }
 
         _shader->ProjMat = projViewMat;
-        _shader->Compose(*_fb, s_EnableSSAO);
+
+        if (s_Layer == renderer::DebugLayer::None) {
+            _shader->Compose(*_fb, s_EnableSSAO);
+        } else if (s_Layer != renderer::DebugLayer::Overdraw) {
+            _shader->ComposeDebug(*_fb, s_Layer);
+        }
 
         STAT_TIME_END(Compose);
 
