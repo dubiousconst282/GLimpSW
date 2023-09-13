@@ -23,7 +23,7 @@
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
     std::unique_ptr<swr::Rasterizer> _rast;
-    std::unique_ptr<scene::Model> _scene, _shadowScene;
+    std::shared_ptr<scene::Model> _scene, _shadowScene;
     std::unique_ptr<renderer::DefaultShader> _shader;
 
     Camera _cam;
@@ -51,8 +51,8 @@ public:
 
         LoadScene("assets/models/Sponza/Sponza.gltf");
 
-        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/footprint_court.hdr");
-        //auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
+        //auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/footprint_court.hdr");
+        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
         _shader = std::make_unique<renderer::DefaultShader>(std::move(skyboxTex));
 
         _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 5.0f };
@@ -74,9 +74,14 @@ public:
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
     }
     void LoadScene(const std::filesystem::path& path) {
-        _scene = std::make_unique<scene::Model>(path.string());
-        _shadowScene = nullptr;
+        _scene = std::make_shared<scene::Model>(path.string());
 
+        if (path.filename().compare("Sponza.gltf") == 0) {
+            auto shadowModelPath = path;
+            _shadowScene = std::make_shared<scene::Model>(shadowModelPath.replace_filename("Sponza_LowPoly.gltf").string());
+        } else {
+            _shadowScene = _scene;
+        }
         _currSceneName = path.filename().string();
     }
 
@@ -115,6 +120,9 @@ public:
         }
 
         ImGui::Separator();
+
+        ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
 
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
         ImGui::End();

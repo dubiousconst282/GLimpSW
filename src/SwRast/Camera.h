@@ -28,7 +28,7 @@ struct Camera {
         }
         return glm::translate(glm::mat4_cast(_ViewRotation), -_ViewPosition);
     }
-    glm::mat4 GetProjMatrix() { return glm::perspective(FieldOfView, AspectRatio, NearZ, FarZ); }
+    glm::mat4 GetProjMatrix() { return glm::perspective(glm::radians(FieldOfView), AspectRatio, NearZ, FarZ); }
 
     void Update() {
         ImGuiIO& io = ImGui::GetIO();

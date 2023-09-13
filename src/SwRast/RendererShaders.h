@@ -35,6 +35,7 @@ struct DefaultShader {
 
     // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
+    // TODO: combine these two into a single layered texture (may help get mip/scaled UVs and stuff CSE'ed)
     const swr::RgbaTexture2D* BaseColorTex;
     const swr::RgbaTexture2D* NormalMetallicRoughnessTex;
 
@@ -42,6 +43,9 @@ struct DefaultShader {
     const swr::Framebuffer* ShadowBuffer;
     glm::mat4 ShadowProjMat, ViewMat;
     glm::vec3 LightPos, ViewPos;
+
+    float IntensityIBL = 0.3f;
+    float Exposure = 1.0f;
 
     DefaultShader(swr::HdrTexture2D&& envTex)
         : IrradianceMap(GenerateIrradianceMap(envTex)),
@@ -80,10 +84,6 @@ struct DefaultShader {
 
         if (NormalMetallicRoughnessTex != nullptr) {
             VFloat4 SN = UnpackRGBA(NormalMetallicRoughnessTex->Sample<SurfaceSampler>(u, v));
-            // T = normalize(T - dot(T, N) * N);
-            // mat3 TBN = mat3(T, cross(N, T), N);
-            // vec3 n = texture(u_NormalMetallicRoughnessTex, UV).rgb * 2.0 - 1.0;
-            // norm = normalize(TBN * n);
             VFloat3 T = vars.GetSmooth<VFloat3>(5);
 
             // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
@@ -127,12 +127,10 @@ struct DefaultShader {
         invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
         invProj = glm::scale(invProj, glm::vec3(2.0f / fb.Width, 2.0f / fb.Height, 1.0f));
 
-        float minDepth = 1.0f;
-
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
-            VMask skyMask = tileDepth >= minDepth;
+            VMask skyMask = tileDepth >= 1.0f;
 
             VFloat u = conv2f((int32_t)x + (VInt::ramp() & 3));
             VFloat v = conv2f((int32_t)y + (VInt::ramp() >> 2));
@@ -148,8 +146,8 @@ struct DefaultShader {
                 VFloat3 N = VFloat3(G2);
                 VFloat metalness = G1.w;
 
-                VFloat perceptualRoughness = G2.w;
-                VFloat roughness = max(perceptualRoughness * perceptualRoughness, 0.002f);  // clamp to prevent div by zero
+                VFloat perceptualRoughness = max(G2.w, 0.045f);  // clamp to prevent div by zero
+                VFloat roughness = perceptualRoughness * perceptualRoughness;
 
                 VFloat3 V = normalize(ViewPos - worldPos);
                 VFloat3 L = normalize(LightPos);
@@ -174,34 +172,87 @@ struct DefaultShader {
                 VFloat3 diffuseColor = (1.0f - metalness) * VFloat3(baseColor);
                 VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
-                // IBL
-                // TODO: http://www.ludicon.com/castano/blog/articles/seamless-cube-map-filtering/
-                VFloat3 R = reflect(0 - V, N);
-                VFloat3 Ld = IrradianceMap.SampleCube<EnvSampler>(R) * diffuseColor;
-                VFloat3 Lld = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
-                VFloat2 Ldfg = BRDFEnvLut.Sample<EnvSampler>(NoV, perceptualRoughness);
-                VFloat3 Lr = (f0 * Ldfg.x + Ldfg.y) * Lld;
-                VFloat3 ibl = Ld + Lr;
-
                 if (ShadowBuffer != nullptr && any(NoL > 0.0f)) {
                     NoL *= GetShadow(worldPos, NoL);
                 }
-                finalColor = (Fd + Fr) * NoL + ibl;
+                finalColor = (Fd + Fr) * NoL;
 
-                // TODO: energy preserve / multiscatter / light power
+                if (IntensityIBL > 0.0f) {
+                    // TODO: cubemap seams are _very_ noticeable for things like spheres with high roughness
+                    //       http://www.ludicon.com/castano/blog/articles/seamless-cube-map-filtering/
+                    VFloat3 R = reflect(0 - V, N);
+                    VFloat3 irradiance = IrradianceMap.SampleCube<EnvSampler>(R);
+                    VFloat3 radiance = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
+                    VFloat2 dfg = BRDFEnvLut.Sample<EnvSampler>(NoV, perceptualRoughness);
+                    VFloat3 specularColor = f0 * dfg.x + dfg.y;
+                    VFloat3 ibl = irradiance * diffuseColor + radiance * specularColor;
+
+                    // TODO: multi-scatter IBL
+
+                    if (hasSSAO) {
+                        ibl = ibl * GetAO(fb, x, y);
+                    }
+                    finalColor = finalColor + ibl * IntensityIBL;
+                }
             }
 
             if (any(skyMask)) {
                 VFloat3 skyColor = SkyboxTex.SampleCube<SurfaceSampler>(worldPos - ViewPos);
+                //VFloat3 skyColor = FilteredEnvMap.SampleCube<EnvSampler>(worldPos - ViewPos, 1.2f);
 
                 finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
                 finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
                 finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
             }
 
-            finalColor = Tonemap_Unreal(finalColor);
+            finalColor = Tonemap_Unreal(finalColor * Exposure);
             PackRGBA({ finalColor, 1.0f }).store(&fb.ColorBuffer[tileOffset]);
         });
+    }
+
+private:
+    VFloat GetShadow(VFloat3 worldPos, VFloat NoL) {
+        static const int8_t PoissonDisk[2][16] = {
+            { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
+            { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
+        };
+
+        VFloat4 shadowPos = TransformVector(ShadowProjMat, { worldPos, 1.0f });
+        shadowPos.w = rcp14(shadowPos.w);
+
+        VFloat bias = max((1.0f - NoL) * 0.015f, 0.003f);
+        VFloat currentDepth = shadowPos.z * shadowPos.w - bias;
+
+        VFloat sx = shadowPos.x * shadowPos.w * 0.5f + 0.5f;
+        VFloat sy = shadowPos.y * shadowPos.w * 0.5f + 0.5f;
+        VInt x = round2i(sx * (float)(ShadowBuffer->Width << 6)) + 31;
+        VInt y = round2i(sy * (float)(ShadowBuffer->Height << 6)) + 31;
+
+        auto samples = _mm_set1_epi8(0);
+        float weight = 1.0f / 16;
+
+        for (uint32_t i = 0; i < 16; i++) {
+            // If at the 4th iter samples are all 0 or 4, assume this area is not in a shadow edge
+            if (i == 4 && (_mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(0)) || _mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(4)))) {
+                weight = 1.0f / 4;
+                break;
+            }
+            VFloat occlusionDepth = ShadowBuffer->SampleDepth((x + PoissonDisk[0][i]) >> 6, (y + PoissonDisk[1][i]) >> 6);
+            samples = _mm_mask_add_epi8(samples, occlusionDepth >= currentDepth, samples, _mm_set1_epi8(1));
+        }
+        return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
+    }
+    static VFloat GetAO(swr::Framebuffer& fb, uint32_t x, uint32_t y) {
+        uint8_t* basePtr = fb.GetAttachmentBuffer<uint8_t>(4);
+        uint32_t stride = fb.Width / 2;
+        uint8_t temp[4 * 4];
+
+        for (uint32_t ty = 0; ty < 4; ty++) {
+            for (uint32_t tx = 0; tx < 4; tx++) {
+                temp[tx + ty * 4] = basePtr[((x + tx) / 2) + ((y + ty) / 2) * stride];
+            }
+        }
+        return conv2f(_mm512_cvtepu8_epi32(_mm_loadu_epi8(temp))) * (1.0f / 255);
     }
 
     static swr::HdrTexture2D GenerateIrradianceMap(const swr::HdrTexture2D& envTex) {
@@ -237,42 +288,10 @@ struct DefaultShader {
         swr::Texture2D<swr::pixfmt::RG16f> tex(128, 128, 1, 1);
 
         swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, VFloat u, VFloat v) {
-            VFloat2 f_ab = IntegrateBRDF(u, 1.0f - v);
+            VFloat2 f_ab = IntegrateBRDF(u, v);
             tex.WriteTile(swr::pixfmt::RG16f::Pack(f_ab), x, y);
         });
         return tex;
-    }
-
-    VFloat GetShadow(VFloat3 worldPos, VFloat NoL) {
-        static const int8_t PoissonDisk[2][16] = {
-            { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
-            { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
-        };
-
-        VFloat4 shadowPos = TransformVector(ShadowProjMat, { worldPos, 1.0f });
-        shadowPos.w = rcp14(shadowPos.w);
-
-        VFloat bias = max((1.0f - NoL) * 0.015f, 0.003f);
-        VFloat currentDepth = shadowPos.z * shadowPos.w - bias;
-
-        VFloat sx = shadowPos.x * shadowPos.w * 0.5f + 0.5f;
-        VFloat sy = shadowPos.y * shadowPos.w * 0.5f + 0.5f;
-        VInt x = round2i(sx * (float)(ShadowBuffer->Width << 6)) + 31;
-        VInt y = round2i(sy * (float)(ShadowBuffer->Height << 6)) + 31;
-
-        auto samples = _mm_set1_epi8(0);
-        float weight = 1.0f / 16;
-
-        for (uint32_t i = 0; i < 16; i++) {
-            // If at the 4th iter samples are all 0 or 4, assume this area is not in a shadow edge
-            if (i == 4 && (_mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(0)) || _mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(4)))) {
-                weight = 1.0f / 4;
-                break;
-            }
-            VFloat occlusionDepth = ShadowBuffer->SampleDepth((x + PoissonDisk[0][i]) >> 6, (y + PoissonDisk[1][i]) >> 6);
-            samples = _mm_mask_add_epi8(samples, occlusionDepth >= currentDepth, samples, _mm_set1_epi8(1));
-        }
-        return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
     }
 
     static VFloat3 PrefilterDiffuseIrradiance(const swr::HdrTexture2D& envTex, VFloat3 N) {
@@ -315,7 +334,7 @@ struct DefaultShader {
     // From Karis, 2014
     static VFloat3 PrefilterEnvMap(const swr::HdrTexture2D& envTex, float roughness, VFloat3 R) {
 #ifdef NDEBUG
-        const uint32_t numSamples = 512;
+        const uint32_t numSamples = 1024;
 #else
         const uint32_t numSamples = 16;
 #endif
@@ -349,7 +368,14 @@ struct DefaultShader {
                 // Mip level is determined by the ratio of our sample's solid angle to a texel's solid angle
                 VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0);
 
-                prefilteredColor = prefilteredColor + envTex.SampleCube<SurfaceSampler>(L, mipLevel) * NoL;
+                VFloat3 envColor = envTex.SampleCube<SurfaceSampler>(L, mipLevel);
+
+                // Shitty workaround to reduce artifacts around overly bright spots
+                envColor.x = min(envColor.x, 50.0f);
+                envColor.y = min(envColor.y, 50.0f);
+                envColor.z = min(envColor.z, 50.0f);
+
+                prefilteredColor = prefilteredColor + envColor * NoL;
                 totalWeight += NoL;
             }
         }
@@ -399,14 +425,13 @@ struct DefaultShader {
         return 0.5f / lerp(a, b, roughness);
     }
     static VFloat3 F_Schlick(VFloat u, VFloat3 f0) {
-        // VFloat f = pow(1.0 - u, 5.0);
-        // return f + f0 * (1.0 - f);
-        VFloat f = 1.0 - u;
-        VFloat f2 = f * f;
-        f = f2 * f2 * f;
+        VFloat f = pow5(1.0 - u);
         return f + f0 * (1.0f - f);
     }
     static VFloat Fd_Lambert() { return 1.0f / pi; }
+
+    static VFloat pow5(VFloat x) { return x * x * x * x * x; }
+    static VFloat3 max3(VFloat3 a, VFloat3 b) { return { max(a.x, b.x), max(a.y, b.y), max(a.z, b.z) }; }
 
     static glm::vec2 Hammersley(uint32_t i, uint32_t numSamples) {
         uint32_t bits = i;
@@ -503,11 +528,12 @@ struct DepthOnlyShader {
     }
 };
 
-// TODO: Replace this garbage with something better ("Scalable Ambient Obscurance" + maybe copy a few tricks from XeGTAO?)
+// TODO: Implement possibly better and faster approach from "Scalable Ambient Obscurance" +/or maybe copy a few tricks from XeGTAO or something?
+// https://www.shadertoy.com/view/3dK3zR
 struct SSAO {
     static const uint32_t KernelSize = 16, FbAttachId = 4;
 
-    float Radius = 0.75f, MaxRange = 0.25f;
+    float Radius = 1.3f, MaxRange = 0.35f;
 
     float Kernel[3][KernelSize];
     VInt _randSeed;
@@ -549,13 +575,13 @@ struct SSAO {
         uint8_t* aoBuffer = fb.GetAttachmentBuffer<uint8_t>(FbAttachId);
 
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
-            VInt rng = _randSeed ^ (int32_t)(x * 12345 + y);
+            VInt rng = _randSeed * (int32_t)(x * 12345 + y * 9875);
 
             VInt iu = (int32_t)x + (VInt::ramp() & 3) * 2;
             VInt iv = (int32_t)y + (VInt::ramp() >> 2) * 2;
             VFloat z = depthMap.SampleDepth(iu, iv, 0);
 
-            if (!_mm512_cmp_ps_mask(z, _mm512_set1_ps(1.0f), _CMP_LT_OQ)) return;
+            if (!any(z < 1.0f)) return; // skip over tiles that don't have geometry
 
             VFloat4 pos = PerspectiveDiv(TransformVector(invProj, { conv2f(iu), conv2f(iv), z, 1.0f }));
 
@@ -591,7 +617,7 @@ struct SSAO {
                 VFloat sampleDist = abs(LinearizeDepth(z) - sampleDepth);
 
                 VMask rangeMask = sampleDist < MaxRange;
-                VMask occluMask = sampleDepth <= LinearizeDepth(samplePos.z) - 0.02f;
+                VMask occluMask = sampleDepth <= LinearizeDepth(samplePos.z) - 0.03f;
                 occlusion = _mm_sub_epi8(occlusion, _mm_movm_epi8(occluMask & rangeMask));
 
                 // float rangeCheck = abs(origin.z - sampleDepth) < uRadius ? 1.0 : 0.0;
@@ -611,25 +637,6 @@ struct SSAO {
             }
         }, 2);
         ApplyBlur(fb);
-    }
-
-    static VFloat SampleTileAO(swr::Framebuffer& fb, uint32_t x, uint32_t y) {
-        VFloat res = 0;
-        uint8_t* basePtr = fb.GetAttachmentBuffer<uint8_t>(FbAttachId);
-        uint32_t stride = fb.Width / 2;
-
-        for (uint32_t ty = 0; ty < 4; ty++) {
-            for (uint32_t tx = 0; tx < 4; tx++) {
-                uint8_t ao = basePtr[((x + tx) / 2) + ((y + ty) / 2) * stride];
-                res[tx + ty * 4] = ao * (1.0f / 255);
-            }
-        }
-        return res;
-
-        //__m128i rowOffs = _mm_add_epi32(_mm_set1_epi32(y), _mm_setr_epi32(0, 1, 2, 3));
-        //__m128i indices = _mm_mullo_epi32(_mm_srli_epi32(rowOffs, 1), _mm_set1_epi32(stride));
-        //__m128i values = _mm_i32gather_epi32(basePtr + (x / 2), indices, 1);
-        //return 1.0f - conv2f(_mm512_cvtepu8_epi32(values)) / 255.0f;
     }
 
 private:
@@ -656,7 +663,7 @@ private:
         }
     }
     static void BlurX32(uint8_t* dst, uint8_t* src, int32_t lineStride) {
-        const int BlurRadius = 3, BlurSamples = BlurRadius * 2 + 1;
+        const int BlurRadius = 2, BlurSamples = BlurRadius * 2 + 1;
         __m512i accum = _mm512_set1_epi16(0);
 
         for (int32_t so = -BlurRadius; so <= BlurRadius; so++) {
@@ -667,7 +674,8 @@ private:
     }
 
     static VFloat LinearizeDepth(VFloat d) {
-        const float zNear = 0.05f, zFar = 1000.0f;
+        // TODO: avoid hardcoding this, get from Camera&
+        const float zNear = 0.01f, zFar = 1000.0f;
         return (zNear * zFar) / (zFar + d * (zNear - zFar));
     }
 
