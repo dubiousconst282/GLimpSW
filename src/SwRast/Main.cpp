@@ -67,7 +67,7 @@ public:
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
-        _fb = std::make_shared<swr::Framebuffer>(width, height, 5); // 4 attachments for deferred normals/roughness + 1 for AO
+        _fb = std::make_shared<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
@@ -86,7 +86,6 @@ public:
     }
 
     void Render() {
-        static bool s_NormalMapping = true;
         static bool s_EnableShadows = false;
         static bool s_EnableSSAO = false;
         static bool s_HzbOcclusion = true;
@@ -117,7 +116,6 @@ public:
         ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 
         ImGui::Separator();
-        ImGui::Checkbox("Normal Mapping", &s_NormalMapping);
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
         ImGui::Checkbox("SSAO", &s_EnableSSAO);
@@ -169,8 +167,7 @@ public:
 
                 _shader->ProjMat = projViewMat * modelMat;
                 _shader->ModelMat = modelMat;
-                _shader->BaseColorTex = mesh.Material->DiffuseTex;
-                _shader->NormalMetallicRoughnessTex = s_NormalMapping ? mesh.Material->NormalTex : nullptr;
+                _shader->MaterialTex = mesh.Material->Texture;
 
                 swr::VertexReader data(
                     (uint8_t*)&_scene->VertexBuffer[mesh.VertexOffset], 
@@ -220,9 +217,9 @@ public:
 
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.1fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, STAT_GET_TIME(Compose));
+        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.2fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, STAT_GET_TIME(Compose));
         ImGui::Text("Setup: %.1fms (%.1fK vertices)", STAT_GET_TIME(Setup), STAT_GET_COUNT(VerticesShaded));
-        ImGui::Text("Rasterize: %.1fms", STAT_GET_TIME(Rasterize));
+        ImGui::Text("Rasterize: %.2fms", STAT_GET_TIME(Rasterize));
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", STAT_GET_COUNT(TrianglesDrawn), STAT_GET_COUNT(TrianglesClipped), STAT_GET_COUNT(BinsFilled), drawCalls);
         ImGui::End();
         // clang-format on

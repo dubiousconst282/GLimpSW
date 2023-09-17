@@ -144,14 +144,19 @@ struct Texture2D;
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
 
+struct StbImage {
+    enum class PixelType { Empty, RGBA_U8, RGB_F32 };
+
+    uint32_t Width, Height;
+    PixelType Type;
+    std::unique_ptr<uint8_t[], decltype(&std::free)> Data = { nullptr, &std::free };
+
+    static StbImage Load(std::string_view path, PixelType type = PixelType::RGBA_U8);
+};
+
 namespace texutil {
 
 RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels = 8);
-
-// Load and combine normal and metallic-roughness maps.
-// RG = Normal, B/A = Metallic/Roughness 
-// The Z value of the normal can be approximated with `sqrt(1 - nx*nx + ny*ny)`
-RgbaTexture2D LoadNormalMap(std::string_view path, std::string_view metallicRoughnessPath, uint32_t mipLevels = 8);
 
 HdrTexture2D LoadImageHDR(std::string_view path, uint32_t mipLevels = 8);
 
@@ -357,8 +362,12 @@ struct Texture2D {
         }
     }
 
+    // Sample() functions are almost always called from very register-pressured places, and so
+    // there will be massive spills across the call boundaries if they're not inlined...
+    // Not sure if it's a good idea to always_inline everything (instr cache clobbering and such) but let's do it for now...
+
     template<SamplerDesc SD>
-    Texel::LerpedTy Sample(VFloat u, VFloat v, VInt layer = 0) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy Sample(VFloat u, VFloat v, VInt layer = 0, VInt mipLevel = 0, bool calcMipFromUvDerivs = true) const {
         VFloat su = u * _scaleLerpU, sv = v * _scaleLerpV;
         VInt ix = simd::round2i(su), iy = simd::round2i(sv);
 
@@ -370,7 +379,10 @@ struct Texture2D {
             ix = simd::min(simd::max(ix, 0), _maskLerpU);
             iy = simd::min(simd::max(iy, 0), _maskLerpV);
         }
-        VInt mipLevel = texutil::CalcMipLevel(su, sv) - LerpFracBits;
+
+        if (calcMipFromUvDerivs) {
+            mipLevel = texutil::CalcMipLevel(su, sv) - LerpFracBits;
+        }
 
         FilterMode filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
         mipLevel = SD.EnableMips ? simd::min(simd::max(mipLevel, 0), (int32_t)MipLevels - 1) : 0;
@@ -388,35 +400,7 @@ struct Texture2D {
     }
 
     template<SamplerDesc SD>
-    Texel::LerpedTy Sample(VFloat u, VFloat v, VInt layer, VInt mipLevel) const {
-        VFloat su = u * _scaleLerpU, sv = v * _scaleLerpV;
-        VInt ix = simd::round2i(su), iy = simd::round2i(sv);
-
-        if (SD.Wrap == WrapMode::Repeat) {
-            ix = ix & _maskLerpU;
-            iy = iy & _maskLerpV;
-        } else {
-            assert(SD.Wrap == WrapMode::ClampToEdge);
-            ix = simd::min(simd::max(ix, 0), _maskLerpU);
-            iy = simd::min(simd::max(iy, 0), _maskLerpV);
-        }
-        FilterMode filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
-        mipLevel = simd::min(simd::max(mipLevel, 0), (int32_t)MipLevels - 1);
-
-        if (filter == FilterMode::Nearest) [[likely]] {
-            auto res = FetchNearest(ix >> LerpFracBits, iy >> LerpFracBits, layer, mipLevel);
-
-            if constexpr (std::is_same<typename Texel::LerpedTy, VInt>()) {
-                return res.Packed;
-            } else {
-                return res.Unpack();
-            }
-        }
-        return FetchLinear(ix, iy, layer, mipLevel);
-    }
-
-    template<SamplerDesc SD>
-    Texel::LerpedTy SampleCube(const VFloat3& dir, VFloat mipLevel = -1.0f) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleCube(const VFloat3& dir, VFloat mipLevel = -1.0f) const {
         constexpr SamplerDesc CubeSampler = {
             .Wrap = WrapMode::ClampToEdge,
             .MagFilter = SD.MagFilter,
@@ -426,32 +410,38 @@ struct Texture2D {
         VFloat u, v;
         VInt faceIdx;
         texutil::ProjectCubemap(dir, u, v, faceIdx);
+
+        int tmp = mipLevel[0];  // __builtin_constant_p() only works with variables - https://github.com/llvm/llvm-project/issues/65741
+        if (__builtin_constant_p(tmp) && tmp < 0) {
+            return Sample<CubeSampler>(u, v, faceIdx);
+        }
         VInt baseMip = simd::trunc2i(mipLevel);
-        auto baseSample = Sample<CubeSampler>(u, v, faceIdx, baseMip);
+        auto baseSample = Sample<CubeSampler>(u, v, faceIdx, baseMip, false);
 
         VFloat mipFrac = mipLevel - simd::conv2f(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
-            auto lowerSample = Sample<CubeSampler>(u, v, faceIdx, baseMip + 1);
+            auto lowerSample = Sample<CubeSampler>(u, v, faceIdx, baseMip + 1, false);
             return baseSample + (lowerSample - baseSample) * mipFrac;
         }
         return baseSample;
     }
 
     // Fetches the texel at the specified pixel coords. No bounds check.
-    Texel FetchNearest(VInt ix, VInt iy, VInt layer, VInt mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Texel FetchNearest(VInt ix, VInt iy, VInt layer, VInt mipLevel) const {
         VInt stride = (int32_t)RowShift;
+        VInt offset = layer << LayerShift;
 
         if (simd::any(mipLevel > 0)) {
             ix = ix >> mipLevel;
             iy = iy >> mipLevel;
             stride -= mipLevel;
-            ix += _mm512_permutexvar_epi32(mipLevel, _mipOffsets);
+            offset += _mm512_permutexvar_epi32(mipLevel, _mipOffsets);
         }
-        return GatherTexels<Texel>((layer << LayerShift) + ix + (iy << stride));
+        return GatherTexels<Texel>(offset + ix + (iy << stride));
     }
 
     // Interpolates the texels overlapping the specified pixel coords (in N.LerpFracBits fixed-point). No bounds check.
-    Texel::LerpedTy FetchLinear(VInt ixf, VInt iyf, VInt layer, VInt mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy FetchLinear(VInt ixf, VInt iyf, VInt layer, VInt mipLevel) const {
         VInt stride = (int32_t)RowShift;
         VInt offset = layer << LayerShift;
 

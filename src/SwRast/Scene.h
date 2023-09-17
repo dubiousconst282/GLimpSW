@@ -11,8 +11,10 @@
 namespace scene {
 
 struct Material {
-    const swr::RgbaTexture2D* DiffuseTex;
-    const swr::RgbaTexture2D* NormalTex;
+    // Layer 0: BaseColor
+    // Layer 1?: Normal (XY), Metallic (Z), Roughness (W)
+    // Layer 2?: Emissive, BaseColor.A==255 is a mask for non-zero emission. Normal values range between [0..254]
+    const swr::RgbaTexture2D* Texture;
 };
 
 struct Mesh {

@@ -14,7 +14,7 @@ static void PackNorm(int8_t* dst, float* src) {
         dst[i] = (int8_t)std::round(src[i] * 127.0f);
     }
 }
-static std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
+static std::string GetTextureName(const aiMaterial* mat, aiTextureType type) {
     if (mat->GetTextureCount(type) <= 0) {
         return "";
     }
@@ -23,40 +23,77 @@ static std::string GetTexturePath(const aiMaterial* mat, aiTextureType type) {
     return std::string(path.data, path.length);
 }
 
-static swr::RgbaTexture2D* LoadTexture(Model& m, const aiMaterial* mat, aiTextureType type) {
-    std::string name = GetTexturePath(mat, type);
+static void CombineNormalMR(swr::StbImage& normalMap, const swr::StbImage& mrMap) {
+    uint32_t count = normalMap.Width * normalMap.Height * 4;
+    uint8_t* pixels = normalMap.Data.get();
+    uint8_t* mrPixels = mrMap.Data.get();
 
-    auto basePath = std::filesystem::path(m.BasePath);
+    for (uint32_t i = 0; i < count; i += 4) {
+        // Re-normalize to get rid of JPEG artifacts
+        glm::vec3 N = glm::vec3(pixels[i + 0], pixels[i + 1], pixels[i + 2]);
+        N = glm::normalize(N / 127.0f - 1.0f) * 127.0f + 127.0f;
 
-    auto fullPath = basePath / name;
+        pixels[i + 0] = (uint8_t)roundf(N.x);
+        pixels[i + 1] = (uint8_t)roundf(N.y);
+
+        // Overwrite BA channels from normal map with Metallic and Roughness.
+        // The normal Z can be reconstructed with `sqrt(1.0f - dot(n.xy, n.xy))`
+        if (mrPixels != nullptr) {
+            pixels[i + 2] = mrPixels[i + 2];  // Metallic
+            pixels[i + 3] = mrPixels[i + 1];  // Roughness
+        }
+    }
+}
+
+static void InsertEmissiveMask(swr::StbImage& baseMap, const swr::StbImage& emissiveMap) {
+    uint32_t count = baseMap.Width * baseMap.Height * 4;
+    uint8_t* pixels = baseMap.Data.get();
+    uint8_t* emissivePixels = emissiveMap.Data.get();
+
+    for (uint32_t i = 0; i < count; i += 4) {
+        const uint8_t L = 8;
+        bool isLit = emissivePixels[i + 0] > L || emissivePixels[i + 1] > L || emissivePixels[i + 2] > L;
+        pixels[i + 3] = isLit ? 255 : std::min(pixels[i + 3], (uint8_t)254);
+    }
+}
+
+static swr::StbImage LoadImage(Model& m, std::string_view name) {
+    auto fullPath = std::filesystem::path(m.BasePath) / name;
 
     if (name.empty() || !std::filesystem::exists(fullPath)) {
-        return nullptr;
+        return { };
     }
+    return swr::StbImage::Load(fullPath.string());
+}
 
+static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {
+    std::string name = GetTextureName(mat, aiTextureType_BASE_COLOR);
     auto cached = m.Textures.find(name);
 
     if (cached != m.Textures.end()) {
         return &cached->second;
     }
+    swr::StbImage baseColorImg = LoadImage(m, name);
+    swr::StbImage normalImg = LoadImage(m, GetTextureName(mat, aiTextureType_NORMALS));
+    swr::StbImage metalRoughImg = LoadImage(m, GetTextureName(mat, aiTextureType_DIFFUSE_ROUGHNESS));
+    swr::StbImage emissiveImg = LoadImage(m, GetTextureName(mat, aiTextureType_EMISSIVE));
 
-    if (type == aiTextureType_NORMALS) {
-        // Merge Metallic-Roughness map into normals texture
-        // RG: Normals, BA: MR
-        std::string mrName = GetTexturePath(mat, aiTextureType_DIFFUSE_ROUGHNESS);
-        auto mrPath = basePath / mrName;
+    uint32_t numLayers = 1 + (normalImg.Width ? 1 : 0) + (emissiveImg.Width ? 1 : 0);
+    swr::RgbaTexture2D tex(baseColorImg.Width, baseColorImg.Height, 8, numLayers);
 
-        if (mrName.empty() || !std::filesystem::exists(mrPath)) {
-            mrPath = "";
-        }
-        auto tex = swr::texutil::LoadNormalMap(fullPath.string(), mrPath.string());
-        auto slot = m.Textures.insert({ name, std::move(tex) });
-        return &slot.first->second;
-    } else {
-        auto tex = swr::texutil::LoadImage(fullPath.string());
-        auto slot = m.Textures.insert({ name, std::move(tex) });
-        return &slot.first->second;
+    if (normalImg.Width) {
+        CombineNormalMR(normalImg, metalRoughImg);
+        tex.SetPixels(normalImg.Data.get(), normalImg.Width, 1);
     }
+    if (emissiveImg.Width) {
+        InsertEmissiveMask(baseColorImg, emissiveImg);
+        tex.SetPixels(emissiveImg.Data.get(), emissiveImg.Width, 2);
+    }
+    tex.SetPixels(baseColorImg.Data.get(), baseColorImg.Width, 0);
+    tex.GenerateMips();
+
+    auto slot = m.Textures.insert({ name, std::move(tex) });
+    return &slot.first->second;
 }
 
 Node ConvertNode(const Model& model, aiNode* node) {
@@ -109,8 +146,7 @@ Model::Model(std::string_view path) {
         aiMaterial* mat = scene->mMaterials[i];
 
         Materials.push_back(Material{
-            .DiffuseTex = LoadTexture(*this, mat, aiTextureType_BASE_COLOR),
-            .NormalTex = LoadTexture(*this, mat, aiTextureType_NORMALS),
+            .Texture = LoadTextures(*this, mat),
         });
     }
 

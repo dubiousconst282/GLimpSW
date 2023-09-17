@@ -9,6 +9,23 @@
 
 namespace swr {
 
+StbImage StbImage::Load(std::string_view path, PixelType type) {
+    int width, height;
+    uint8_t* pixels = type == PixelType::RGBA_U8 ? (uint8_t*)stbi_load(path.data(), &width, &height, nullptr, 4) :
+                      type == PixelType::RGB_F32 ? (uint8_t*)stbi_loadf(path.data(), &width, &height, nullptr, 4) :
+                                                   nullptr;
+
+    if (pixels == nullptr) {
+        throw std::exception("Failed to load image");
+    }
+    return {
+        .Width = (uint32_t)width,
+        .Height = (uint32_t)height,
+        .Type = type,
+        .Data = { pixels, stbi_image_free },
+    };
+}
+
 namespace texutil {
 
 RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels) {
@@ -20,46 +37,6 @@ RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels) {
     tex.GenerateMips();
 
     stbi_image_free(pixels);
-    return tex;
-}
-
-RgbaTexture2D LoadNormalMap(std::string_view normalPath, std::string_view metallicRoughnessPath, uint32_t mipLevels) {
-    int width, height, channels;
-    stbi_uc* pixels = stbi_load(normalPath.data(), &width, &height, &channels, 4);
-    stbi_uc* mrPixels = nullptr;
-
-    if (!metallicRoughnessPath.empty()) {
-        int mrWidth, mrHeight, mrChannels;
-        mrPixels = stbi_load(metallicRoughnessPath.data(), &mrWidth, &mrHeight, &mrChannels, 4);
-
-        if (mrWidth != width || mrHeight != height) {
-            throw std::exception("Bad Metallic-Roughness map");
-        }
-    }
-
-    for (uint32_t i = 0; i < width * height; i++) {
-        // Re-normalize to get rid of JPEG artifacts
-        glm::vec3 N = glm::vec3(pixels[i * 4 + 0], pixels[i * 4 + 1], pixels[i * 4 + 2]);
-        N = glm::normalize(N / 127.0f - 1.0f) * 127.0f + 127.0f;
-
-        pixels[i * 4 + 0] = (uint8_t)roundf(N.x);
-        pixels[i * 4 + 1] = (uint8_t)roundf(N.y);
-
-        // Overwrite BA channels from normal map with Metallic and Roughness.
-        // The normal Z can be reconstructed with `sqrt(1.0f - dot(n.xy, n.xy))`
-        if (mrPixels != nullptr) {
-            pixels[i * 4 + 2] = mrPixels[i * 4 + 2];  // Metallic
-            pixels[i * 4 + 3] = mrPixels[i * 4 + 1];  // Roughness
-        }
-    }
-
-    auto tex = RgbaTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
-    tex.SetPixels(pixels, tex.Width, 0);
-    tex.GenerateMips();
-
-    stbi_image_free(pixels);
-    stbi_image_free(mrPixels);
-
     return tex;
 }
 

@@ -15,7 +15,7 @@ enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, Occlusion, 
 // https://google.github.io/filament/Filament.html
 // https://bruop.github.io/ibl/
 struct DefaultShader {
-    static const uint32_t NumCustomAttribs = 8;
+    static const uint32_t NumCustomAttribs = 8, NumFbAttachments = 9;
 
     static constexpr swr::SamplerDesc SurfaceSampler = {
         .Wrap = swr::WrapMode::Repeat,
@@ -37,9 +37,7 @@ struct DefaultShader {
 
     // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
-    // TODO: combine these two into a single layered texture (may help get mip/scaled UVs and stuff CSE'ed)
-    const swr::RgbaTexture2D* BaseColorTex;
-    const swr::RgbaTexture2D* NormalMetallicRoughnessTex;
+    const swr::RgbaTexture2D* MaterialTex;  // See `scene::Material` for what's on this texture.
 
     // Uniform: Compose pass
     const swr::Framebuffer* ShadowBuffer;
@@ -73,19 +71,15 @@ struct DefaultShader {
 
         VFloat u = vars.GetSmooth(0);
         VFloat v = vars.GetSmooth(1);
-        VFloat4 baseColor;
 
-        if (BaseColorTex != nullptr) {
-            baseColor = UnpackRGBA(BaseColorTex->Sample<SurfaceSampler>(u, v));
-        }
-
+        VInt baseColor = MaterialTex->Sample<SurfaceSampler>(u, v, 0);
         VFloat3 N = normalize(vars.GetSmooth<VFloat3>(2));
 
         VFloat metalness = 0.0f;
         VFloat roughness = 0.5f;
 
-        if (NormalMetallicRoughnessTex != nullptr) {
-            VFloat4 SN = UnpackRGBA(NormalMetallicRoughnessTex->Sample<SurfaceSampler>(u, v));
+        if (MaterialTex->NumLayers >= 2) [[likely]] {
+            VFloat4 SN = UnpackRGBA(MaterialTex->Sample<SurfaceSampler>(u, v, 1));
             VFloat3 T = vars.GetSmooth<VFloat3>(5);
 
             // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
@@ -113,14 +107,26 @@ struct DefaultShader {
             metalness = SN.z;
             roughness = SN.w;
         }
-        VMask mask = vars.TileMask & (baseColor.w > 0.5f);
+        // G-Buffer channels
+        //               LSB 0  ...  31 MSB
+        //   #1 [24: BaseColor] [8: Metalness]
+        //   #2 [1: NormalSign] [1: HasEmissive] [10: Roughness] [20: EncNormal]
+        //   #3 [8: Unused] [24: EmissiveColor]
+        VInt alpha = shrl(baseColor, 24);
+        vars.TileMask &= alpha >= 128;  // alpha test
 
-        // GBuffer
-        //   #1 [888: RGB]    [8: Metalness]
-        //   #2 [10.10.1: Normal] [10: Roughness] [1: Unused]
-        baseColor.w = metalness;
-        fb.WriteTile(vars.TileOffset, mask, PackRGBA(baseColor), vars.Depth);
-        _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), mask, SignedOctEncode(N, roughness));
+        bool hasEmissive = MaterialTex->NumLayers >= 3 && any(alpha == 255);
+
+        if (hasEmissive) [[unlikely]] {
+            VInt emissiveColor = MaterialTex->Sample<SurfaceSampler>(u, v, 2);
+            _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(4, vars.TileOffset), vars.TileMask, emissiveColor);
+        }
+
+        VInt G1 = (baseColor & 0xFFFFFF) | round2i(metalness * 255.0f) << 24;
+        fb.WriteTile(vars.TileOffset, vars.TileMask, G1, vars.Depth);
+
+        VInt G2 = SignedOctEncode(N, roughness) | (hasEmissive ? 2 : 0);
+        _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), vars.TileMask, G2);
     }
 
     void Compose(swr::Framebuffer& fb, bool hasSSAO) {
@@ -142,7 +148,8 @@ struct DefaultShader {
 
             if (!all(skyMask)) {
                 VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
-                VFloat4 G2 = SignedOctDecode(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
+                VInt G2r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
+                VFloat4 G2 = SignedOctDecode(G2r);
 
                 VFloat3 baseColor = SrgbToLinear(VFloat3(G1));
                 VFloat3 N = VFloat3(G2);
@@ -196,6 +203,16 @@ struct DefaultShader {
                     }
                     finalColor = finalColor + ibl * IntensityIBL;
                 }
+
+                // Emissive color
+                VMask emissiveMask = (G2r & 2) != 0;
+                if (any(emissiveMask)) {
+                    VInt G3r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(4, tileOffset));
+                    G3r = csel(emissiveMask, G3r, 0);
+
+                    VFloat3 emissiveColor = VFloat3(UnpackRGBA(G3r));
+                    finalColor = finalColor + SrgbToLinear(emissiveColor);
+                }
             }
 
             if (any(skyMask)) {
@@ -221,7 +238,8 @@ struct DefaultShader {
             VFloat3 finalColor = 0.0f;
 
             VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
-            VFloat4 G2 = SignedOctDecode(VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset)));
+            VInt G2r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
+            VFloat4 G2 = SignedOctDecode(G2r);
 
             if (layer == DebugLayer::BaseColor) {
                 finalColor = VFloat3(G1);
@@ -231,6 +249,8 @@ struct DefaultShader {
                 finalColor = { G1.w, G2.w, 0.0f };
             } else if (layer == DebugLayer::Occlusion) {
                 finalColor = GetAO(fb, x, y);
+            } else if (layer == DebugLayer::EmissiveMask) {
+                finalColor.x = csel((G2r & 2) != 0, VFloat(1.0f), 0);
             }
 
             uint32_t backgroundRGB = (x / 4 + y / 4) % 2 ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
@@ -273,7 +293,7 @@ private:
         return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
     }
     static VFloat GetAO(swr::Framebuffer& fb, uint32_t x, uint32_t y) {
-        uint8_t* basePtr = fb.GetAttachmentBuffer<uint8_t>(4);
+        uint8_t* basePtr = fb.GetAttachmentBuffer<uint8_t>(8);
         uint32_t stride = fb.Width / 2;
         uint8_t temp[4 * 4];
 
@@ -515,7 +535,7 @@ private:
     //    return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
     //}
 
-    // Encode normal using signed octahedron + arbitrary extra into 10:10:1 + 10 bits (1-bit is unused)
+    // Encode normal using signed octahedron + arbitrary extra into 10:10:1 + 10 bits (bit at index 1 is unused)
     // https://johnwhite3d.blogspot.com/2017/10/signed-octahedron-normal-encoding.html
     static VInt SignedOctEncode(VFloat3 n, VFloat w) {
         VFloat m = rcp14(abs(n.x) + abs(n.y) + abs(n.z)) * 0.5f;
@@ -577,7 +597,7 @@ struct OverdrawShader {
 // TODO: Implement possibly better and faster approach from "Scalable Ambient Obscurance" +/or maybe copy a few tricks from XeGTAO or something?
 // https://www.shadertoy.com/view/3dK3zR
 struct SSAO {
-    static const uint32_t KernelSize = 16, FbAttachId = 4;
+    static const uint32_t KernelSize = 16, FbAttachId = 8;
 
     float Radius = 1.3f, MaxRange = 0.35f;
 

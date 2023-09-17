@@ -11,5 +11,6 @@ AllowShortCaseLabelsOnASingleLine: true
 AllowShortEnumsOnASingleLine: true
 Cpp11BracedListStyle: false
 BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: false
 
 # https://clang.llvm.org/docs/ClangFormatStyleOptions.html
