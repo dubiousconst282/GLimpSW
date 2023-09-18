@@ -596,6 +596,7 @@ struct OverdrawShader {
 
 // TODO: Implement possibly better and faster approach from "Scalable Ambient Obscurance" +/or maybe copy a few tricks from XeGTAO or something?
 // https://www.shadertoy.com/view/3dK3zR
+// https://github.com/godotengine/godot/pull/44182
 struct SSAO {
     static const uint32_t KernelSize = 16, FbAttachId = 8;
 

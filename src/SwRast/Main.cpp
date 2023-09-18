@@ -328,7 +328,43 @@ public:
     }
 };
 
-int main(int argc, char** args) {
+#include <benchmark/benchmark.h>
+
+[[gnu::noinline]] swr::VFloat2 Rotate(swr::VFloat x, swr::VFloat y, float angle) {
+    angle = glm::radians(angle);
+
+    x -= 0.5f, y -= 0.5f;
+    swr::VFloat rx = x * cos(angle) - y * sin(angle);
+    swr::VFloat ry = x * sin(angle) + y * cos(angle);
+    return { rx + 0.5f, ry + 0.5f };
+}
+
+template<int SwizzleMode>
+static void BM_TexSampling(benchmark::State& state) {
+    auto tex = swr::texutil::LoadImage("logs/assets/lake_2k.png");
+    constexpr swr::SamplerDesc SD = {
+        .MagFilter = swr::FilterMode::Nearest,
+        .MinFilter = swr::FilterMode::Nearest,
+        .SwizzleMode = SwizzleMode,
+    };
+    float scale = state.range(0) == 0 ? 0.001f : 1.0f;
+    float angle = state.range(0) == 0 ? 0 : (state.range(0) - 1) * 45;
+
+    for (auto _ : state) {
+        swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, swr::VFloat u, swr::VFloat v) {
+            auto pos = Rotate(u, v, angle) * scale;
+            swr::VInt color = tex.Sample<SD>(pos.x, pos.y);
+            benchmark::DoNotOptimize(color);
+        });
+    }
+}
+BENCHMARK(BM_TexSampling<0>)->Name("Linear")->Arg(0)->Arg(1)->Arg(2)->Arg(3);
+BENCHMARK(BM_TexSampling<1>)->Name("Tiled")->Arg(0)->Arg(1)->Arg(2)->Arg(3);
+BENCHMARK(BM_TexSampling<2>)->Name("ZOrder")->Arg(0)->Arg(1)->Arg(2)->Arg(3);
+
+BENCHMARK_MAIN();
+
+int main2(int argc, char** args) {
     if (!glfwInit()) return -1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);

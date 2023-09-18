@@ -275,6 +275,7 @@ struct SamplerDesc {
     FilterMode MagFilter = FilterMode::Linear;
     FilterMode MinFilter = FilterMode::Nearest;
     bool EnableMips = true;
+    int SwizzleMode = 0;
 };
 
 template<pixfmt::Texel Texel>
@@ -388,7 +389,7 @@ struct Texture2D {
         mipLevel = SD.EnableMips ? simd::min(simd::max(mipLevel, 0), (int32_t)MipLevels - 1) : 0;
 
         if (filter == FilterMode::Nearest) [[likely]] {
-            auto res = FetchNearest(ix >> LerpFracBits, iy >> LerpFracBits, layer, mipLevel);
+            auto res = FetchNearest<SD.SwizzleMode>(ix >> LerpFracBits, iy >> LerpFracBits, layer, mipLevel);
 
             if constexpr (std::is_same<typename Texel::LerpedTy, VInt>()) {
                 return res.Packed;
@@ -427,6 +428,7 @@ struct Texture2D {
     }
 
     // Fetches the texel at the specified pixel coords. No bounds check.
+    template<int SwizzleMode = 0>
     [[gnu::pure, gnu::always_inline]] Texel FetchNearest(VInt ix, VInt iy, VInt layer, VInt mipLevel) const {
         VInt stride = (int32_t)RowShift;
         VInt offset = layer << LayerShift;
@@ -437,7 +439,14 @@ struct Texture2D {
             stride -= mipLevel;
             offset += _mm512_permutexvar_epi32(mipLevel, _mipOffsets);
         }
-        return GatherTexels<Texel>(offset + ix + (iy << stride));
+        if constexpr (SwizzleMode == 0) {
+            offset += ix + (iy << stride);
+        } else if constexpr (SwizzleMode == 1) {
+            offset += texutil::GetTiledOffset(ix, iy, stride);
+        } else {
+            offset += texutil::Interleave(ix, iy);
+        }
+        return GatherTexels<Texel>(offset);
     }
 
     // Interpolates the texels overlapping the specified pixel coords (in N.LerpFracBits fixed-point). No bounds check.
