@@ -74,18 +74,26 @@ static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {
         return &cached->second;
     }
     swr::StbImage baseColorImg = LoadImage(m, name);
+
+    if (!baseColorImg.Width) {
+        auto slot = m.Textures.insert({ name, swr::RgbaTexture2D(4, 4, 1, 1) });
+        return &slot.first->second;
+    }
     swr::StbImage normalImg = LoadImage(m, GetTextureName(mat, aiTextureType_NORMALS));
     swr::StbImage metalRoughImg = LoadImage(m, GetTextureName(mat, aiTextureType_DIFFUSE_ROUGHNESS));
     swr::StbImage emissiveImg = LoadImage(m, GetTextureName(mat, aiTextureType_EMISSIVE));
 
-    uint32_t numLayers = 1 + (normalImg.Width ? 1 : 0) + (emissiveImg.Width ? 1 : 0);
+    bool hasNormals = normalImg.Width == baseColorImg.Width && normalImg.Height == baseColorImg.Height;
+    bool hasEmissive = emissiveImg.Width == baseColorImg.Width && emissiveImg.Height == baseColorImg.Height;
+
+    uint32_t numLayers = hasEmissive ? 3 : (hasNormals ? 2 : 1);
     swr::RgbaTexture2D tex(baseColorImg.Width, baseColorImg.Height, 8, numLayers);
 
-    if (normalImg.Width) {
+    if (hasNormals) {
         CombineNormalMR(normalImg, metalRoughImg);
         tex.SetPixels(normalImg.Data.get(), normalImg.Width, 1);
     }
-    if (emissiveImg.Width) {
+    if (hasEmissive) {
         InsertEmissiveMask(baseColorImg, emissiveImg);
         tex.SetPixels(emissiveImg.Data.get(), emissiveImg.Width, 2);
     }

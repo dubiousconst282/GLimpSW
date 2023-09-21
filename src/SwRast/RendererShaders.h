@@ -216,7 +216,7 @@ struct DefaultShader {
             }
 
             if (any(skyMask)) {
-                VFloat3 skyColor = SkyboxTex.SampleCube<SurfaceSampler>(worldPos - ViewPos);
+                VFloat3 skyColor = SkyboxTex.SampleCube<EnvSampler>(worldPos - ViewPos, 1);  // override mip-level to avoid seams
                 //VFloat3 skyColor = FilteredEnvMap.SampleCube<EnvSampler>(worldPos - ViewPos, 1.2f);
 
                 finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
@@ -367,12 +367,13 @@ private:
                 // Spherical to World Space in two steps...
                 VFloat3 tempVec = cosf(phi) * right + sinf(phi) * up;
                 VFloat3 sampleVector = cosf(theta) * N + sinf(theta) * tempVec;
-                VFloat3 envColor = envTex.SampleCube<SurfaceSampler>(sampleVector, 2);
+                VFloat3 envColor = envTex.SampleCube<EnvSampler>(sampleVector, 2);
 
                 // Shitty workaround to reduce artifacts around overly bright spots
-                envColor.x = min(envColor.x, 1000.0f);
-                envColor.y = min(envColor.y, 1000.0f);
-                envColor.z = min(envColor.z, 1000.0f);
+                // TODO: http://graphicrants.blogspot.com/2013/12/tone-mapping.html
+                envColor.x = min(envColor.x, 50.0f);
+                envColor.y = min(envColor.y, 50.0f);
+                envColor.z = min(envColor.z, 50.0f);
 
                 color = color + envColor * cosf(theta) * sinf(theta);
                 sampleCount++;
@@ -384,7 +385,7 @@ private:
     // From Karis, 2014
     static VFloat3 PrefilterEnvMap(const swr::HdrTexture2D& envTex, float roughness, VFloat3 R) {
 #ifdef NDEBUG
-        const uint32_t numSamples = 1024;
+        const uint32_t numSamples = 64;
 #else
         const uint32_t numSamples = 16;
 #endif
@@ -416,9 +417,9 @@ private:
                 // Solid angle of texel
                 float omegaP = 4.0f * pi / (6 * envTex.Width * envTex.Width);
                 // Mip level is determined by the ratio of our sample's solid angle to a texel's solid angle
-                VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0);
+                VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0f) + 1.0f;
 
-                VFloat3 envColor = envTex.SampleCube<SurfaceSampler>(L, mipLevel);
+                VFloat3 envColor = envTex.SampleCube<EnvSampler>(L, mipLevel);
 
                 // Shitty workaround to reduce artifacts around overly bright spots
                 envColor.x = min(envColor.x, 50.0f);

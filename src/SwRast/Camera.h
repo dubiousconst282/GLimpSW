@@ -61,7 +61,9 @@ struct Camera {
 
                 Position += mv * destRotation * speed;
             } else if (Mode == InputMode::Arcball) {
-                ArcDistance = std::clamp(ArcDistance - io.MouseWheel * 0.5f, NearZ, FarZ * 0.8f);
+                if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+                    ArcDistance = std::clamp(ArcDistance - io.MouseWheel * 0.5f, NearZ, FarZ * 0.8f);
+                }
                 _ViewArcDistance = glm::lerp(_ViewArcDistance, ArcDistance, damping);
 
                 Position = glm::vec3(0, 0, ArcDistance) * destRotation;

@@ -236,7 +236,7 @@ inline VFloat3 UnprojectCubemap(VFloat u, VFloat v, VInt faceIdx) {
     return unnormDir * simd::rsqrt14(u * u + v * v + 1.0f);
 }
 
-// TODO: maybe re-evaluate use of swizzling
+// Texture swizzling doesn't improve performance by much, these functions are keept below for reference.
 
 // 32-bit Z-curve/morton encode. Takes ~8.5 cycles per 16 coord pairs on TigerLake, according to llvm-mca.
 // - https://lemire.me/blog/2018/01/09/how-fast-can-you-bit-interleave-32-bit-integers-simd-edition/

@@ -133,13 +133,13 @@ public:
         }
         _cam.Update();
 
-        auto renderStart = std::chrono::high_resolution_clock::now();
+        STAT_TIME_BEGIN(Frame);
 
         if (s_EnableShadows && _shadowScene != nullptr) {
+            STAT_TIME_BEGIN(Shadow);
             RenderShadow();
+            STAT_TIME_END(Shadow);
         }
-
-        double shadowElapsed = (std::chrono::high_resolution_clock::now() - renderStart).count() / 1000000.0;
 
         glm::mat4 projMat = _cam.GetProjMatrix();
         glm::mat4 viewMat = _cam.GetViewMatrix();
@@ -207,8 +207,7 @@ public:
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
         _frontTex->SetPixels(_tempPixels.get(), _fb->Width);
 
-        double totalElapsed = (std::chrono::high_resolution_clock::now() - renderStart).count() / 1000000.0;
-        swr::ProfilerStats& stats = swr::g_Stats;
+        STAT_TIME_END(Frame);
 
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
 
@@ -217,14 +216,14 @@ public:
 
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.2fms", totalElapsed, 1000.0 / totalElapsed, shadowElapsed, STAT_GET_TIME(Compose));
+        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.2fms", STAT_GET_TIME(Frame), 1000.0 / STAT_GET_TIME(Frame), STAT_GET_TIME(Shadow), STAT_GET_TIME(Compose));
         ImGui::Text("Setup: %.1fms (%.1fK vertices)", STAT_GET_TIME(Setup), STAT_GET_COUNT(VerticesShaded));
         ImGui::Text("Rasterize: %.2fms", STAT_GET_TIME(Rasterize));
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", STAT_GET_COUNT(TrianglesDrawn), STAT_GET_COUNT(TrianglesClipped), STAT_GET_COUNT(BinsFilled), drawCalls);
         ImGui::End();
         // clang-format on
 
-        stats.Reset();
+        swr::g_Stats.Reset();
         DrawTranslationGizmo(_lightPos, _lightRot);
     }
 

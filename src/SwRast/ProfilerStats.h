@@ -15,6 +15,9 @@ struct ProfilerStats {
         RasterizeTime,
         ComposeTime,
 
+        ShadowTime,
+        FrameTime,
+
         _Count,
         _TimeFirst = SetupTime,
     };
