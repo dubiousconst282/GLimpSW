@@ -35,6 +35,11 @@ struct DefaultShader {
     swr::Texture2D<swr::pixfmt::RG16f> BRDFEnvLut;
     swr::HdrTexture2D SkyboxTex;
 
+    // TAA
+    uint32_t FrameNo;
+    glm::vec2 Jitter, PrevJitter;
+    glm::mat4 PrevProjMat;
+
     // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
     const swr::RgbaTexture2D* MaterialTex;  // See `scene::Material` for what's on this texture.
@@ -46,6 +51,7 @@ struct DefaultShader {
 
     float IntensityIBL = 0.3f;
     float Exposure = 1.0f;
+    bool EnableTAA = true;
 
     DefaultShader(swr::HdrTexture2D&& envTex)
         : IrradianceMap(GenerateIrradianceMap(envTex)),
@@ -129,7 +135,7 @@ struct DefaultShader {
         _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), vars.TileMask, G2);
     }
 
-    void Compose(swr::Framebuffer& fb, bool hasSSAO) {
+    void Compose(swr::Framebuffer& fb, bool hasSSAO, swr::Framebuffer& prevFb) {
         glm::mat4 invProj = glm::inverse(ProjMat);
         // Bias matrix to take UVs in range [0..screen] rather than [-1..1]
         invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
@@ -140,15 +146,17 @@ struct DefaultShader {
             VFloat tileDepth = VFloat::load(&fb.DepthBuffer[tileOffset]);
             VMask skyMask = tileDepth >= 1.0f;
 
-            VFloat u = conv2f((int32_t)x + swr::FragPixelOffsetsX);
-            VFloat v = conv2f((int32_t)y + swr::FragPixelOffsetsY);
-            VFloat3 worldPos = VFloat3(PerspectiveDiv(TransformVector(invProj, { u, v, tileDepth, 1.0f })));
+            VInt tileX = (int32_t)x + swr::FragPixelOffsetsX;
+            VInt tileY = (int32_t)y + swr::FragPixelOffsetsY;
+            VFloat3 worldPos = VFloat3(PerspectiveDiv(TransformVector(invProj, { conv2f(tileX), conv2f(tileY), tileDepth, 1.0f })));
 
             VFloat3 finalColor;
 
             if (!all(skyMask)) {
+                // Unpack G-Buffer
                 VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
                 VInt G2r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
+                VMask emissiveMask = (G2r & 2) != 0;
                 VFloat4 G2 = SignedOctDecode(G2r);
 
                 VFloat3 baseColor = SrgbToLinear(VFloat3(G1));
@@ -158,6 +166,7 @@ struct DefaultShader {
                 VFloat perceptualRoughness = max(G2.w, 0.045f);  // clamp to prevent div by zero
                 VFloat roughness = perceptualRoughness * perceptualRoughness;
 
+                // PBR stuff...
                 VFloat3 V = normalize(ViewPos - worldPos);
                 VFloat3 L = normalize(LightPos);
                 VFloat3 H = normalize(V + L);
@@ -198,14 +207,19 @@ struct DefaultShader {
 
                     // TODO: multi-scatter IBL
 
-                    if (hasSSAO) {
-                        ibl = ibl * GetAO(fb, x, y);
-                    }
+                    //if (hasSSAO) {
+                    //    ibl = ibl * GetAO(fb, x, y);
+                    //}
                     finalColor = finalColor + ibl * IntensityIBL;
                 }
 
+                // This is technically not PBR but if we add AO to IBL it will never be intense enough.
+                // (though it's not like anything here is strictly correct anyway...)
+                if (hasSSAO) {
+                    finalColor = finalColor * GetAO(fb, x, y);
+                }
+
                 // Emissive color
-                VMask emissiveMask = (G2r & 2) != 0;
                 if (any(emissiveMask)) {
                     VInt G3r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(4, tileOffset));
                     G3r = csel(emissiveMask, G3r, 0);
@@ -225,8 +239,80 @@ struct DefaultShader {
             }
 
             finalColor = Tonemap_Unreal(finalColor * Exposure);
-            PackRGBA({ finalColor, 1.0f }).store(&fb.ColorBuffer[tileOffset]);
+            VInt packedColor = PackRGBA({ finalColor, 1.0f });
+            packedColor.store(&fb.ColorBuffer[tileOffset]);
+
+            if (EnableTAA && FrameNo != 0) {
+                VFloat4 prevNDC = PerspectiveDiv(TransformVector(PrevProjMat, { VFloat3(worldPos), 1.0f }));
+                prevNDC.x -= Jitter.x;
+                prevNDC.y -= Jitter.y;
+                prevNDC = prevNDC * 0.5 + 0.5;
+
+                VInt prevX = round2i(prevNDC.x * fb.Width);
+                VInt prevY = round2i(prevNDC.y * fb.Height);
+
+                // Save prevColor to avoid having to recompute worldDepth on the TAA pass
+                VInt prevColor = prevFb.SampleColor(prevX, prevY, packedColor);
+                prevColor.store(fb.GetAttachmentBuffer<int32_t>(0, tileOffset));
+            }
         });
+
+        // Temporal Anti-Alias
+        // - https://www.elopezr.com/temporal-aa-and-the-quest-for-the-holy-trail/
+        // - https://alextardif.com/TAA.html
+        // - https://sugulee.wordpress.com/2021/06/21/temporal-anti-aliasingtaa-tutorial/
+        // 
+        // TODO: it might be possible to work in tiles rather than on the entire fb to improve cache-ability
+        if (EnableTAA && FrameNo > 0) {
+            auto temp = swr::alloc_buffer<uint32_t>(fb.Width * fb.Height);
+
+            fb.IterateTiles([&](uint32_t x, uint32_t y) {
+                uint32_t tileOffset = fb.GetPixelOffset(x, y);
+                VInt currColor = VInt::load(&fb.ColorBuffer[tileOffset]);
+                VInt prevColor = VInt::load(fb.GetAttachmentBuffer<int32_t>(0, tileOffset));
+
+                VInt minColor = (int32_t)0xFFFF'FFFF, maxColor = 0;
+                VInt tileX = (int32_t)x + swr::FragPixelOffsetsX;
+                VInt tileY = (int32_t)y + swr::FragPixelOffsetsY;
+
+                // Sample a 3x3 neighborhood to create a box in color space
+                for (int32_t xo = -1; xo <= 1; xo++) {
+                    for (int32_t yo = -1; yo <= 1; yo++) {
+                        VInt color = fb.SampleColor(tileX + xo, tileY + yo, currColor);
+                        minColor = _mm512_min_epu8(minColor, color);
+                        maxColor = _mm512_max_epu8(maxColor, color);
+                    }
+                }
+
+                prevColor = _mm512_min_epu8(_mm512_max_epu8(prevColor, minColor), maxColor);
+
+                VFloat3 currColorF = VFloat3(UnpackRGBA(currColor));
+                VFloat3 prevColorF = VFloat3(UnpackRGBA(prevColor));
+                VFloat3 resolvedColor = prevColorF + (currColorF - prevColorF) * 0.1f;
+                VInt finalColor = PackRGBA({ resolvedColor, 1.0f });
+                //VInt alpha = 0.1f * (1 << 15);
+                //VInt finalColor = lerp16((prevColor >> 0) & 0x00FF'00FF, (currColor >> 0) & 0x00FF'00FF, alpha) |
+                //                  lerp16((prevColor >> 8) & 0x00FF'00FF, (currColor >> 8) & 0x00FF'00FF, alpha) << 8;
+
+                finalColor.store(&temp[tileOffset]);
+            });
+            fb.ColorBuffer = std::move(temp);
+        }
+        FrameNo++;
+        PrevProjMat = ProjMat;
+    }
+    
+    void UpdateJitter(glm::mat4& projMat, swr::Framebuffer& fb, swr::Framebuffer& prevFb) {
+        if (!EnableTAA) return;
+        
+        PrevJitter = Jitter;
+        Jitter = (Halton23[FrameNo % 8] * 2.0f - 1.0f) / glm::vec2(fb.Width, fb.Height);
+        projMat[2][0] += Jitter.x;
+        projMat[2][1] += Jitter.y;
+
+        assert(fb.Width == prevFb.Width && fb.Height == prevFb.Height);
+        std::swap(fb.ColorBuffer, prevFb.ColorBuffer);
+        std::swap(fb.DepthBuffer, prevFb.DepthBuffer);
     }
 
     void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
@@ -453,11 +539,7 @@ private:
                 VFloat Gv = G * 4.0f * VoH * NoL / NoH;
                 Gv = csel(NoL > 0.0f, Gv, 0.0f);
 
-                // VFloat Fc = pow(1 - VoH, 5.0f);
-                VFloat Fc = 1 - VoH;
-                VFloat Fc2 = Fc * Fc;
-                Fc = Fc * Fc2 * Fc2;
-
+                VFloat Fc = pow5(1 - VoH);
                 r.x += Gv * (1 - Fc);
                 r.y += Gv * Fc;
             }
@@ -481,8 +563,7 @@ private:
     }
     static VFloat Fd_Lambert() { return 1.0f / pi; }
 
-    static VFloat pow5(VFloat x) { return x * x * x * x * x; }
-    static VFloat3 max3(VFloat3 a, VFloat3 b) { return { max(a.x, b.x), max(a.y, b.y), max(a.z, b.z) }; }
+    static VFloat pow5(VFloat x) { return (x * x) * (x * x) * x; }
 
     static glm::vec2 Hammersley(uint32_t i, uint32_t numSamples) {
         uint32_t bits = i;
@@ -563,6 +644,16 @@ private:
         // OutN.z = n.z * 2.0 - 1.0;  // n.z ? 1 : -1
         // OutN.z = OutN.z * (1.0 - abs(OutN.x) - abs(OutN.y));
     }
+
+    // Temporal anti-alias sub-pixel jitter offsets - Halton(2, 3)
+    static inline const glm::vec2 Halton23[16] = {
+        { 0.50000, 0.33333 }, { 0.25000, 0.66667 }, { 0.75000, 0.11111 }, { 0.12500, 0.44444 },  //
+        { 0.62500, 0.77778 }, { 0.37500, 0.22222 }, { 0.87500, 0.55556 }, { 0.06250, 0.88889 },  //
+        { 0.56250, 0.03704 }, { 0.31250, 0.37037 }, { 0.81250, 0.70370 }, { 0.18750, 0.14815 },  //
+        { 0.68750, 0.48148 }, { 0.43750, 0.81481 }, { 0.93750, 0.25926 }, { 0.03125, 0.59259 },
+    };
+
+    friend struct SSAO;
 };
 struct DepthOnlyShader {
     static const uint32_t NumCustomAttribs = 0;
@@ -641,6 +732,8 @@ struct SSAO {
         uint32_t stride = fb.Width / 2;
         uint8_t* aoBuffer = fb.GetAttachmentBuffer<uint8_t>(FbAttachId);
 
+        XorShiftStep(_randSeed); // update RNG on each frame for TAA
+
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
             VInt rng = _randSeed * (int32_t)(x * 12345 + y * 9875);
 
@@ -653,9 +746,13 @@ struct SSAO {
             VFloat4 pos = PerspectiveDiv(TransformVector(invProj, { conv2f(iu), conv2f(iv), z, 1.0f }));
 
             // TODO: better normal reconstruction - https://atyuwen.github.io/posts/normal-reconstruction/
-            VFloat3 posDx = { dFdx(pos.x), dFdx(pos.y), dFdx(pos.z) };
-            VFloat3 posDy = { dFdy(pos.x), dFdy(pos.y), dFdy(pos.z) };
-            VFloat3 N = normalize(cross(posDx, posDy));
+            // VFloat3 posDx = { dFdx(pos.x), dFdx(pos.y), dFdx(pos.z) };
+            // VFloat3 posDy = { dFdy(pos.x), dFdy(pos.y), dFdy(pos.z) };
+            // VFloat3 N = normalize(cross(posDx, posDy));
+
+            // Using textured normals is better than reconstructing from blocky derivatives, particularly around edges.
+            VInt G2r = VInt::gather<4>(fb.GetAttachmentBuffer<uint32_t>(0), fb.GetPixelOffset(iu, iv));
+            VFloat3 N = VFloat3(DefaultShader::SignedOctDecode(G2r));
 
             XorShiftStep(rng);
             VFloat3 rotation = normalize({ conv2f(rng & 255) * (1.0f / 127) - 1.0f, conv2f(rng >> 8 & 255) * (1.0f / 127) - 1.0f,0.0f });
@@ -703,7 +800,8 @@ struct SSAO {
                 std::memcpy(&aoBuffer[(x / 2) + (y / 2 + sy) * stride], (uint32_t*)&occlusion + sy, 4);
             }
         }, 2);
-        ApplyBlur(fb);
+
+        //ApplyBlur(fb);
     }
 
 private:

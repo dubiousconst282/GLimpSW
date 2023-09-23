@@ -22,6 +22,7 @@
 
 class SwRenderer {
     std::shared_ptr<swr::Framebuffer> _fb;
+    std::shared_ptr<swr::Framebuffer> _prevFb;
     std::unique_ptr<swr::Rasterizer> _rast;
     std::shared_ptr<scene::Model> _scene, _shadowScene;
     std::unique_ptr<renderer::DefaultShader> _shader;
@@ -68,10 +69,12 @@ public:
 
     void InitRasterizer(uint32_t width, uint32_t height) {
         _fb = std::make_shared<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
+        _prevFb = std::make_shared<swr::Framebuffer>(width, height, 0);
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
+        _shader->FrameNo = 0;
     }
     void LoadScene(const std::filesystem::path& path) {
         _scene = std::make_shared<scene::Model>(path.string());
@@ -117,8 +120,9 @@ public:
 
         ImGui::Separator();
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
-        ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
         ImGui::Checkbox("SSAO", &s_EnableSSAO);
+        ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
+        ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
 
         if (s_EnableSSAO) {
             ImGui::SeparatorText("SSAO");
@@ -143,6 +147,9 @@ public:
 
         glm::mat4 projMat = _cam.GetProjMatrix();
         glm::mat4 viewMat = _cam.GetViewMatrix();
+
+        _shader->UpdateJitter(projMat, *_fb, *_prevFb);  // add jitter to `projMat`
+
         glm::mat4 projViewMat = projMat * viewMat;
 
         _shader->ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr;
@@ -197,7 +204,7 @@ public:
         _shader->ProjMat = projViewMat;
 
         if (s_Layer == renderer::DebugLayer::None) {
-            _shader->Compose(*_fb, s_EnableSSAO);
+            _shader->Compose(*_fb, s_EnableSSAO, *_prevFb);
         } else if (s_Layer != renderer::DebugLayer::Overdraw) {
             _shader->ComposeDebug(*_fb, s_Layer);
         }

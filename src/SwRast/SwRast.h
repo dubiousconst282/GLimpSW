@@ -53,6 +53,11 @@ struct Framebuffer {
         uint32_t pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
         return tileId * TileNumPixels + pixelOffset;
     }
+    VInt GetPixelOffset(VInt x, VInt y) const {
+        VInt tileId = (x >> TileShift) + (y >> TileShift) * (int32_t)TileStride;
+        VInt pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
+        return tileId * TileNumPixels + pixelOffset;
+    }
 
     void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) {
         _mm512_mask_store_epi32(&ColorBuffer[offset], mask, color);
@@ -65,19 +70,22 @@ struct Framebuffer {
         return (T*)&AttachmentBuffer[attachmentId * AttachmentStride] + offset;
     }
 
-    VFloat __vectorcall SampleDepth(VFloat x, VFloat y) const {
+    [[gnu::always_inline]] VFloat SampleDepth(VFloat x, VFloat y) const {
         VInt ix = simd::round2i(x * (int32_t)Width);
         VInt iy = simd::round2i(y * (int32_t)Height);
-
         return SampleDepth(ix, iy);
     }
-    VFloat __vectorcall SampleDepth(VInt ix, VInt iy) const {
-        VInt tileId = (ix >> TileShift) + (iy >> TileShift) * (int32_t)TileStride;
-        VInt pixelOffset = (ix & TileMask) + (iy & TileMask) * TileSize;
-        VInt indices = tileId * TileNumPixels + pixelOffset;
-        uint16_t boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
-
+    [[gnu::always_inline]] VFloat SampleDepth(VInt ix, VInt iy) const {
+        // Twos-complement unsigned compare trick to check for both (x >= 0 && x < N) at once.
+        VInt indices = GetPixelOffset(ix, iy);
+        VMask boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
         return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer.get(), 4);
+    }
+    [[gnu::always_inline]] VInt SampleColor(VInt ix, VInt iy, VInt defaultColor = 0) const {
+        // Twos-complement unsigned compare trick to check for both (x >= 0 && x < N) at once.
+        VInt indices = GetPixelOffset(ix, iy);
+        VMask boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
+        return _mm512_mask_i32gather_epi32(defaultColor, boundMask, indices, ColorBuffer.get(), 4);
     }
 
     void GetPixels(uint32_t* dest, uint32_t stride) const;
