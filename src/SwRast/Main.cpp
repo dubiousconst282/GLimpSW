@@ -69,12 +69,10 @@ public:
 
     void InitRasterizer(uint32_t width, uint32_t height) {
         _fb = std::make_shared<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
-        _prevFb = std::make_shared<swr::Framebuffer>(width, height, 0);
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
         _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
-        _shader->FrameNo = 0;
     }
     void LoadScene(const std::filesystem::path& path) {
         _scene = std::make_shared<scene::Model>(path.string());
@@ -148,7 +146,7 @@ public:
         glm::mat4 projMat = _cam.GetProjMatrix();
         glm::mat4 viewMat = _cam.GetViewMatrix();
 
-        _shader->UpdateJitter(projMat, *_fb, *_prevFb);  // add jitter to `projMat`
+        _shader->UpdateJitter(projMat, *_fb);  // add jitter to `projMat`
 
         glm::mat4 projViewMat = projMat * viewMat;
 

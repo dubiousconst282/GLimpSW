@@ -39,6 +39,8 @@ struct DefaultShader {
     uint32_t FrameNo;
     glm::vec2 Jitter, PrevJitter;
     glm::mat4 PrevProjMat;
+    std::unique_ptr<swr::Framebuffer> PrevFrame;
+    swr::AlignedBuffer<uint32_t> ResolvedTAABuffer;
 
     // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
@@ -239,6 +241,7 @@ struct DefaultShader {
             }
 
             finalColor = Tonemap_Unreal(finalColor * Exposure);
+
             VInt packedColor = PackRGBA({ finalColor, 1.0f });
             packedColor.store(&fb.ColorBuffer[tileOffset]);
 
@@ -252,7 +255,7 @@ struct DefaultShader {
                 VInt prevY = round2i(prevNDC.y * fb.Height);
 
                 // Save prevColor to avoid having to recompute worldDepth on the TAA pass
-                VInt prevColor = prevFb.SampleColor(prevX, prevY, packedColor);
+                VInt prevColor = PrevFrame->SampleColor(prevX, prevY, packedColor);
                 prevColor.store(fb.GetAttachmentBuffer<int32_t>(0, tileOffset));
             }
         });
@@ -264,8 +267,6 @@ struct DefaultShader {
         // 
         // TODO: it might be possible to work in tiles rather than on the entire fb to improve cache-ability
         if (EnableTAA && FrameNo > 0) {
-            auto temp = swr::alloc_buffer<uint32_t>(fb.Width * fb.Height);
-
             fb.IterateTiles([&](uint32_t x, uint32_t y) {
                 uint32_t tileOffset = fb.GetPixelOffset(x, y);
                 VInt currColor = VInt::load(&fb.ColorBuffer[tileOffset]);
@@ -283,26 +284,27 @@ struct DefaultShader {
                         maxColor = _mm512_max_epu8(maxColor, color);
                     }
                 }
-
                 prevColor = _mm512_min_epu8(_mm512_max_epu8(prevColor, minColor), maxColor);
 
-                VFloat3 currColorF = VFloat3(UnpackRGBA(currColor));
-                VFloat3 prevColorF = VFloat3(UnpackRGBA(prevColor));
-                VFloat3 resolvedColor = prevColorF + (currColorF - prevColorF) * 0.1f;
-                VInt finalColor = PackRGBA({ resolvedColor, 1.0f });
-                //VInt alpha = 0.1f * (1 << 15);
-                //VInt finalColor = lerp16((prevColor >> 0) & 0x00FF'00FF, (currColor >> 0) & 0x00FF'00FF, alpha) |
-                //                  lerp16((prevColor >> 8) & 0x00FF'00FF, (currColor >> 8) & 0x00FF'00FF, alpha) << 8;
+                //VFloat3 currColorF = VFloat3(UnpackRGBA(currColor));
+                //VFloat3 prevColorF = VFloat3(UnpackRGBA(prevColor));
+                //VFloat3 resolvedColor = prevColorF + (currColorF - prevColorF) * 0.1f;
+                //VInt finalColor = PackRGBA({ resolvedColor, 1.0f });
 
-                finalColor.store(&temp[tileOffset]);
+                // Fixed-point is a smidge faster
+                VInt alpha = _mm512_set1_epi16(0.1f * ((1 << 15) - 1));
+                VInt finalColor = lerp16((prevColor >> 0) & 0x00FF'00FF, (currColor >> 0) & 0x00FF'00FF, alpha) |
+                                  lerp16((prevColor >> 8) & 0x00FF'00FF, (currColor >> 8) & 0x00FF'00FF, alpha) << 8;
+
+                finalColor.store(&ResolvedTAABuffer[tileOffset]);
             });
-            fb.ColorBuffer = std::move(temp);
+            std::swap(fb.ColorBuffer, ResolvedTAABuffer);
         }
         FrameNo++;
         PrevProjMat = ProjMat;
     }
     
-    void UpdateJitter(glm::mat4& projMat, swr::Framebuffer& fb, swr::Framebuffer& prevFb) {
+    void UpdateJitter(glm::mat4& projMat, swr::Framebuffer& fb) {
         if (!EnableTAA) return;
         
         PrevJitter = Jitter;
@@ -310,9 +312,13 @@ struct DefaultShader {
         projMat[2][0] += Jitter.x;
         projMat[2][1] += Jitter.y;
 
-        assert(fb.Width == prevFb.Width && fb.Height == prevFb.Height);
-        std::swap(fb.ColorBuffer, prevFb.ColorBuffer);
-        std::swap(fb.DepthBuffer, prevFb.DepthBuffer);
+        if (PrevFrame == nullptr || fb.Width != PrevFrame->Width || fb.Height != PrevFrame->Height) {
+            PrevFrame = std::make_unique<swr::Framebuffer>(fb.Width, fb.Height);
+            PrevFrame->DepthBuffer = nullptr; // save memory we shouldn't have allocated in the first place.
+            ResolvedTAABuffer = swr::alloc_buffer<uint32_t>(fb.Width * fb.Height);
+            FrameNo = 0;
+        }
+        std::swap(fb.ColorBuffer, PrevFrame->ColorBuffer);
     }
 
     void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
@@ -828,7 +834,7 @@ private:
         }
     }
     static void BlurX32(uint8_t* dst, uint8_t* src, int32_t lineStride) {
-        const int BlurRadius = 2, BlurSamples = BlurRadius * 2 + 1;
+        const int BlurRadius = 1, BlurSamples = BlurRadius * 2 + 1;
         __m512i accum = _mm512_set1_epi16(0);
 
         for (int32_t so = -BlurRadius; so <= BlurRadius; so++) {
