@@ -68,10 +68,15 @@ static swr::StbImage LoadImage(Model& m, std::string_view name) {
 
 static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {
     std::string name = GetTextureName(mat, aiTextureType_BASE_COLOR);
+
     auto cached = m.Textures.find(name);
 
     if (cached != m.Textures.end()) {
         return &cached->second;
+    }
+    if (name.empty()) {
+        auto slot = m.Textures.insert({ name, swr::RgbaTexture2D(4, 4, 1, 1) });
+        return &slot.first->second;
     }
     swr::StbImage baseColorImg = LoadImage(m, name);
 

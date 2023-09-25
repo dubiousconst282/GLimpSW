@@ -169,6 +169,7 @@ inline VFloat rsqrt14(VFloat x) { return _mm512_rsqrt14_ps(x); }
 inline VFloat rcp14(VFloat x) { return _mm512_rcp14_ps(x); }
 
 inline VFloat abs(VFloat x) { return _mm512_abs_ps(x); }
+inline VInt abs(VInt x) { return _mm512_abs_epi32(x); }
 
 // lanewise: cond ? a : b
 inline VFloat csel(VMask cond, VFloat a, VFloat b) { return _mm512_mask_mov_ps(b, cond, a); }

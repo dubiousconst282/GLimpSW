@@ -198,8 +198,6 @@ struct DefaultShader {
                 finalColor = (Fd + Fr) * NoL;
 
                 if (IntensityIBL > 0.0f) {
-                    // TODO: cubemap seams are _very_ noticeable for things like spheres with high roughness
-                    //       http://www.ludicon.com/castano/blog/articles/seamless-cube-map-filtering/
                     VFloat3 R = reflect(0 - V, N);
                     VFloat3 irradiance = IrradianceMap.SampleCube<EnvSampler>(R);
                     VFloat3 radiance = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
