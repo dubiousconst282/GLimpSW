@@ -307,7 +307,90 @@ public:
     }
 };
 
-int main(int argc, char** args) {
+struct FlatShader {
+    static const uint32_t NumCustomAttribs = 2;
+
+    struct Vertex {
+        float PosX, PosY;
+        float TexU, TexV;
+    };
+
+    const swr::RgbaTexture2D* SurfaceTex;
+    glm::mat4 ProjMat;
+
+    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+        swr::VFloat2 pos = data.ReadAttribs<swr::VFloat2>(&Vertex::PosX);
+        vars.Position = swr::simd::TransformVector(ProjMat, { pos.x, pos.y, 0.0f, 1.0f });
+
+        vars.SetAttribs(0, data.ReadAttribs<swr::VFloat2>(&Vertex::TexU));
+    }
+
+    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+        constexpr swr::SamplerDesc SurfaceSampler = {
+            .MagFilter = swr::FilterMode::Linear,
+            .MinFilter = swr::FilterMode::Nearest,
+            .EnableMips = true
+        };
+        swr::VInt color = SurfaceTex->Sample<SurfaceSampler>(vars.GetSmooth(0), vars.GetSmooth(1));
+        fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
+    }
+};
+
+#include <benchmark/benchmark.h>
+
+static void BM_Rast(benchmark::State& state) {
+    int w = 4, h = 4;
+
+    std::vector<FlatShader::Vertex> vertices;
+    std::vector<uint16_t> indices;
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            vertices.push_back({ .PosX = x / (w - 1) * 2.0f - 1.0f,
+                                 .PosY = y / (h - 1) * 2.0f - 1.0f,
+                                 .TexU = x / (float)(w - 1),
+                                 .TexV = 1.0f - y / (float)(h - 1) });
+
+            if (x < w - 1 && y < h - 1) {
+                // A----B
+                // |    |
+                // C----D
+                // A,C,B  B,C,D
+                indices.push_back((uint16_t)((x + 0) + (y + 0) * w));
+                indices.push_back((uint16_t)((x + 0) + (y + 1) * w));
+                indices.push_back((uint16_t)((x + 1) + (y + 0) * w));
+
+                indices.push_back((uint16_t)((x + 1) + (y + 0) * w));
+                indices.push_back((uint16_t)((x + 0) + (y + 1) * w));
+                indices.push_back((uint16_t)((x + 1) + (y + 1) * w));
+            }
+        }
+    }
+    auto fb = std::make_shared<swr::Framebuffer>(2048, 2048);
+    auto tex = swr::texutil::LoadImage("logs/assets/lake_1k.png");
+
+    auto shader = FlatShader();
+    shader.ProjMat = glm::ortho(-1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f) * glm::scale(glm::mat4(1.0f), glm::vec3(0.9f));
+    shader.SurfaceTex = &tex;
+
+    auto vertexData = swr::VertexReader((uint8_t*)vertices.data(), (uint8_t*)indices.data(), indices.size(), swr::VertexReader::U16);
+
+    swr::Rasterizer rast(fb);
+    rast.UseCoarseRast = state.range(0) != 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        fb->Clear(0xFFFFFFFF, 1.0f);
+        state.ResumeTiming();
+        rast.Draw(vertexData, shader);
+    }
+}
+BENCHMARK(BM_Rast)->Arg(0);
+BENCHMARK(BM_Rast)->Arg(1);
+
+BENCHMARK_MAIN();
+
+int main2(int argc, char** args) {
     if (!glfwInit()) return -1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);

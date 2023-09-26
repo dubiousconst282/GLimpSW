@@ -424,7 +424,7 @@ class Rasterizer {
     }
 
     template<ShaderProgram TShader>
-    void DrawBinnedTriangle_Hier(const TShader& shader, const BinnedTriangle& bin) {
+    void DrawBinnedTriangle_Coarse(const TShader& shader, const BinnedTriangle& bin) {
         Framebuffer& fb = *_fb.get();
         const TrianglePacket& tri = *bin.Triangle;
         uint32_t i = bin.TriangleIndex;
@@ -503,6 +503,8 @@ class Rasterizer {
         }
 
         // 4x4 blocks (shading)
+        // We want to defer shader invocations to avoid bloating the rasterizer loop asm (after inlining two of them),
+        // not inlining would also be costly because we're quite register pressured and AVX512 spills seem expansive.
         float area = tri.RcpArea[i];
 
         for (uint32_t bi = 0; bi < numBlocks; bi++) {
@@ -546,6 +548,8 @@ class Rasterizer {
 public:
     Rasterizer(std::shared_ptr<Framebuffer> fb);
 
+    bool UseCoarseRast = false;
+
     template<ShaderProgram TShader>
     void Draw(VertexReader& vertexData, const TShader& shader) {
         ShaderInterface shifc = {
@@ -562,8 +566,8 @@ public:
                 },
             .DrawFn =
                 [&](const BinnedTriangle& bt) {
-                    if (clock() / 2000 % 2)
-                        DrawBinnedTriangle_Hier(shader, bt);
+                    if (UseCoarseRast)
+                        DrawBinnedTriangle_Coarse(shader, bt);
                     else
                         DrawBinnedTriangle(shader, bt);
                 },

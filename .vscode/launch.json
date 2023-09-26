@@ -6,7 +6,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${command:cmake.launchTargetPath}",
-            "args": [],
+            "args": [ "--benchmark_time_unit=ms" ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "console": "internalConsole",

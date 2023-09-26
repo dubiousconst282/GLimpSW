@@ -39,6 +39,8 @@ target_link_libraries(SwRast PRIVATE
 )
 target_include_directories(SwRast PRIVATE ${Stb_INCLUDE_DIR})
 
+find_package(benchmark CONFIG REQUIRED)
+target_link_libraries(SwRast PRIVATE benchmark::benchmark)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     target_compile_options(SwRast PRIVATE "-march=native" "-ffast-math" "-Wno-unused" "-Wsign-conversion")
