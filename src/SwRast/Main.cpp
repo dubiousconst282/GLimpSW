@@ -34,27 +34,31 @@ class SwRenderer {
     std::unique_ptr<ogl::Texture2D> _shadowDebugTex;
     std::unique_ptr<uint32_t[]> _tempPixels;
 
-    glm::vec3 _lightPos, _lightRot;
+    glm::vec3 _lightPos;
     glm::mat4 _shadowProjMat;
 
     std::shared_ptr<swr::Framebuffer> _shadowFb;
     std::unique_ptr<swr::Rasterizer> _shadowRast;
 
     std::vector<std::filesystem::path> _scenePaths;
-    std::string _currSceneName;
+    std::vector<std::filesystem::path> _skyboxPaths;
+    std::string _currSceneName, _currSkyboxName;
 
     renderer::SSAO _ssao;
 
 public:
     SwRenderer() {
-        SearchScenes("assets/", _scenePaths);
-        SearchScenes("logs/assets/", _scenePaths); // git ignored
+        std::vector<std::string_view> modelExts = { ".gltf", ".glb", ".fbx", ".obj" };
+        SearchFiles("assets/", _scenePaths, modelExts);
+        SearchFiles("logs/assets/", _scenePaths, modelExts);  // git ignored
+
+        SearchFiles("assets/skyboxes/", _skyboxPaths, { ".hdr", ".jpg", ".png" });
+        SearchFiles("logs/assets/", _skyboxPaths, { ".hdr" });
+
+        _shader = std::make_unique<renderer::DefaultShader>();
 
         LoadScene("assets/models/Sponza/Sponza.gltf");
-
-        //auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/footprint_court.hdr");
-        auto skyboxTex = swr::texutil::LoadCubemapFromPanoramaHDR("assets/skyboxes/sunflowers_puresky_4k.hdr");
-        _shader = std::make_unique<renderer::DefaultShader>(std::move(skyboxTex));
+        LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
 
         _cam = Camera{ .Position = glm::vec3(-7, 5.5f, 0), .Euler = glm::vec2(-0.88f, -0.32f), .MoveSpeed = 5.0f };
 
@@ -63,7 +67,6 @@ public:
         _shadowFb = std::make_shared<swr::Framebuffer>(1024, 1024);
         _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
 
-        _lightRot = glm::vec3(0.0f, -90.0f, 0.0f);
         _lightPos = glm::vec3(0.589494, 0.684509, 0.428906) * 18.0f;
     }
 
@@ -85,6 +88,12 @@ public:
         }
         _currSceneName = path.filename().string();
     }
+    void LoadSkybox(const std::filesystem::path& path) {
+        auto tex = swr::texutil::LoadCubemapFromPanoramaHDR(path.string());
+        _shader->SetSkybox(std::move(tex));
+
+        _currSkyboxName = path.filename().string();
+    }
 
     void Render() {
         static bool s_EnableShadows = false;
@@ -93,6 +102,9 @@ public:
         static renderer::DebugLayer s_Layer = renderer::DebugLayer::None;
 
         ImGui::Begin("Settings");
+        
+        ImGui::SeparatorText("Environment");
+
         if (ImGui::BeginCombo("Scene", _currSceneName.c_str())) {
             for (auto& path : _scenePaths) {
                 if (ImGui::Selectable(path.filename().string().c_str())) {
@@ -101,32 +113,45 @@ public:
             }
             ImGui::EndCombo();
         }
+        if (ImGui::BeginCombo("Skybox", _currSkyboxName.c_str())) {
+            for (auto& path : _skyboxPaths) {
+                if (ImGui::Selectable(path.filename().string().c_str())) {
+                    LoadSkybox(path);
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::SeparatorText("Rendering");
+
         std::string currRes = std::format("{}x{}", _fb->Width, _fb->Height);
-        if (ImGui::BeginCombo("Res", currRes.c_str())) {
+        if (ImGui::BeginCombo("Resolution", currRes.c_str())) {
             if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1088);
             if (ImGui::Selectable("1280x720")) InitRasterizer(1280, 720);
             if (ImGui::Selectable("854x480")) InitRasterizer(854, 480);
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
             ImGui::EndCombo();
         }
+
         ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0Metallic-Roughness\0Ambient Occlusion\0Emissive Mask\0Overdraw\0");
         ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
-
-        ImGui::Separator();
-        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-
-        ImGui::Separator();
-        ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
-        ImGui::Checkbox("SSAO", &s_EnableSSAO);
-        ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
 
+        ImGui::SeparatorText("Effects");
+        ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
+        ImGui::Checkbox("SSAO", &s_EnableSSAO);
         if (s_EnableSSAO) {
-            ImGui::SeparatorText("SSAO");
+            ImGui::Indent();
             ImGui::InputFloat("Radius", &_ssao.Radius, 0.1f);
             ImGui::InputFloat("Range", &_ssao.MaxRange, 0.1f);
+            ImGui::Unindent();
         }
+        ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
+        ImGui::Checkbox("Blur Skybox", &_shader->BlurSkybox);
+
+        ImGui::SeparatorText("Misc");
+        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 
         ImGui::End();
 
@@ -222,19 +247,18 @@ public:
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
         ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.2fms", STAT_GET_TIME(Frame), 1000.0 / STAT_GET_TIME(Frame), STAT_GET_TIME(Shadow), STAT_GET_TIME(Compose));
-        ImGui::Text("Setup: %.1fms (%.1fK vertices)", STAT_GET_TIME(Setup), STAT_GET_COUNT(VerticesShaded));
-        ImGui::Text("Rasterize: %.2fms", STAT_GET_TIME(Rasterize));
+        ImGui::Text("Setup: %.1fms (%.1fK vertices), Rasterize: %.2fms", STAT_GET_TIME(Setup), STAT_GET_COUNT(VerticesShaded), STAT_GET_TIME(Rasterize));
         ImGui::Text("Triangles: %.1fK (%.1fK clipped, %.1fK bins, %d calls)", STAT_GET_COUNT(TrianglesDrawn), STAT_GET_COUNT(TrianglesClipped), STAT_GET_COUNT(BinsFilled), drawCalls);
         ImGui::End();
         // clang-format on
 
         swr::g_Stats.Reset();
-        DrawTranslationGizmo(_lightPos, _lightRot);
+        DrawTranslationGizmo(_lightPos);
     }
 
     void RenderShadow() {
         //TODO: fix shadow matrix
-        _shadowProjMat = glm::ortho(-12.0f, +12.0f, -12.0f, +12.0f, 0.05f, 40.0f) * glm::lookAt(_lightPos, glm::vec3(0, -1, 0), glm::vec3(0, 1, 0));
+        _shadowProjMat = glm::ortho(-15.0f, +15.0f, -15.0f, +15.0f, 0.05f, 40.0f) * glm::lookAt(_lightPos, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
 
         _shadowFb->ClearDepth(1.0f);
 
@@ -297,7 +321,7 @@ public:
         ImGui::End();
     }
 
-    void DrawTranslationGizmo(glm::vec3& pos, glm::vec3& rot) {
+    void DrawTranslationGizmo(glm::vec3& pos) {
         ImGuizmo::BeginFrame();
 
         ImGuiIO& io = ImGui::GetIO();
@@ -306,28 +330,24 @@ public:
         glm::mat4 viewMat = _cam.GetViewMatrix();
         glm::mat4 projMat = _cam.GetProjMatrix();
         float matrix[16];
-        float scale[3]{ 1.0f, 1.0f, 1.0f };
-        ImGuizmo::RecomposeMatrixFromComponents(&pos.x, &rot.x, scale, matrix);
+        float temp[3]{ 1.0f, 1.0f, 1.0f };
+        ImGuizmo::RecomposeMatrixFromComponents(&pos.x, temp, temp, matrix);
 
         if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
-            ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, &rot.x, scale);
+            ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, temp, temp);
         }
     }
 
-    static void SearchScenes(std::string_view basePath, std::vector<std::filesystem::path>& dest) {
-        const std::string_view kExtensions[] = { ".gltf", ".glb", ".fbx", ".obj" };
-
+    static void SearchFiles(std::string_view basePath, std::vector<std::filesystem::path>& dest, const std::vector<std::string_view>& extensions) {
         for (auto& entry : std::filesystem::recursive_directory_iterator(basePath)) {
             if (!entry.is_regular_file()) continue;
 
-            bool matchesExt = false;
-
-            for (uint32_t i = 0; i < std::size(kExtensions) && !matchesExt; i++) {
-                matchesExt |= entry.path().extension().compare(kExtensions[i]) == 0;
+            for (auto& ext : extensions) {
+                if (entry.path().extension().compare(ext) == 0) {
+                    dest.push_back(entry.path());
+                    break;
+                }
             }
-            if (!matchesExt) continue;
-
-            dest.push_back(entry.path());
         }
     }
 };

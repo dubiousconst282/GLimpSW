@@ -31,9 +31,9 @@ struct DefaultShader {
     };
 
     // Owned
-    swr::HdrTexture2D IrradianceMap, FilteredEnvMap;
-    swr::Texture2D<swr::pixfmt::RG16f> BRDFEnvLut;
-    swr::HdrTexture2D SkyboxTex;
+    std::unique_ptr<swr::HdrTexture2D> SkyboxTex;
+    std::unique_ptr<swr::HdrTexture2D> IrradianceMap, FilteredEnvMap;
+    swr::Texture2D<swr::pixfmt::RG16f> BRDFEnvLut = GenerateBRDFEnvLut();
 
     // TAA
     uint32_t FrameNo;
@@ -54,12 +54,7 @@ struct DefaultShader {
     float IntensityIBL = 0.3f;
     float Exposure = 1.0f;
     bool EnableTAA = true;
-
-    DefaultShader(swr::HdrTexture2D&& envTex)
-        : IrradianceMap(GenerateIrradianceMap(envTex)),
-          FilteredEnvMap(GenerateRadianceMap(envTex)),
-          BRDFEnvLut(GenerateBRDFEnvLut()),
-          SkyboxTex(std::move(envTex)) {} // note member decl order
+    bool BlurSkybox = false;
 
     void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
         VFloat3 pos = data.ReadAttribs<VFloat3>(&scene::Vertex::x);
@@ -168,7 +163,7 @@ struct DefaultShader {
                 VFloat perceptualRoughness = max(G2.w, 0.045f);  // clamp to prevent div by zero
                 VFloat roughness = perceptualRoughness * perceptualRoughness;
 
-                // PBR stuff...
+                // Microfacet BRDF
                 VFloat3 V = normalize(ViewPos - worldPos);
                 VFloat3 L = normalize(LightPos);
                 VFloat3 H = normalize(V + L);
@@ -185,10 +180,10 @@ struct DefaultShader {
                 VFloat3 f0 = (0.16f * reflectance * reflectance) * (1.0f - metalness) + baseColor * metalness;
                 VFloat3 F = F_Schlick(LoH, f0);
 
-                // specular BRDF
+                // specular
                 VFloat3 Fr = D * G * F;
 
-                // diffuse BRDF
+                // diffuse
                 VFloat3 diffuseColor = (1.0f - metalness) * VFloat3(baseColor);
                 VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
@@ -197,10 +192,10 @@ struct DefaultShader {
                 }
                 finalColor = (Fd + Fr) * NoL;
 
-                if (IntensityIBL > 0.0f) {
+                if (IntensityIBL > 0.0f && SkyboxTex != nullptr) {
                     VFloat3 R = reflect(0 - V, N);
-                    VFloat3 irradiance = IrradianceMap.SampleCube<EnvSampler>(R);
-                    VFloat3 radiance = FilteredEnvMap.SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap.MipLevels);
+                    VFloat3 irradiance = IrradianceMap->SampleCube<EnvSampler>(R);
+                    VFloat3 radiance = FilteredEnvMap->SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap->MipLevels);
                     VFloat2 dfg = BRDFEnvLut.Sample<EnvSampler>(NoV, perceptualRoughness);
                     VFloat3 specularColor = f0 * dfg.x + dfg.y;
                     VFloat3 ibl = irradiance * diffuseColor + radiance * specularColor;
@@ -229,9 +224,9 @@ struct DefaultShader {
                 }
             }
 
-            if (any(skyMask)) {
-                VFloat3 skyColor = SkyboxTex.SampleCube<EnvSampler>(worldPos - ViewPos, 1);  // override mip-level to avoid seams
-                //VFloat3 skyColor = FilteredEnvMap.SampleCube<EnvSampler>(worldPos - ViewPos, 1.2f);
+            if (any(skyMask) && SkyboxTex != nullptr) {
+                auto& envTex = BlurSkybox ? FilteredEnvMap : SkyboxTex;
+                VFloat3 skyColor = envTex->SampleCube<EnvSampler>(worldPos - ViewPos, 1);
 
                 finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
                 finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
@@ -317,6 +312,12 @@ struct DefaultShader {
             FrameNo = 0;
         }
         std::swap(fb.ColorBuffer, PrevFrame->ColorBuffer);
+    }
+
+    void SetSkybox(swr::HdrTexture2D&& envCube) {
+        IrradianceMap = std::make_unique<swr::HdrTexture2D>(GenerateIrradianceMap(envCube));
+        FilteredEnvMap = std::make_unique<swr::HdrTexture2D>(GenerateRadianceMap(envCube));
+        SkyboxTex = std::make_unique<swr::HdrTexture2D>(std::move(envCube));
     }
 
     void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
@@ -459,23 +460,17 @@ private:
                 VFloat3 sampleVector = cosf(theta) * N + sinf(theta) * tempVec;
                 VFloat3 envColor = envTex.SampleCube<EnvSampler>(sampleVector, 2);
 
-                // Shitty workaround to reduce artifacts around overly bright spots
-                // TODO: http://graphicrants.blogspot.com/2013/12/tone-mapping.html
-                envColor.x = min(envColor.x, 50.0f);
-                envColor.y = min(envColor.y, 50.0f);
-                envColor.z = min(envColor.z, 50.0f);
-
-                color = color + envColor * cosf(theta) * sinf(theta);
+                color = color + TonemapSample(envColor) * cosf(theta) * sinf(theta);
                 sampleCount++;
             }
         }
-        return color * (pi * 1.0f / sampleCount);
+        return TonemapSampleInv(color * (pi * 1.0f / sampleCount));
     }
 
     // From Karis, 2014
     static VFloat3 PrefilterEnvMap(const swr::HdrTexture2D& envTex, float roughness, VFloat3 R) {
 #ifdef NDEBUG
-        const uint32_t numSamples = 64;
+        const uint32_t numSamples = 128;
 #else
         const uint32_t numSamples = 16;
 #endif
@@ -507,20 +502,15 @@ private:
                 // Solid angle of texel
                 float omegaP = 4.0f * pi / (6 * envTex.Width * envTex.Width);
                 // Mip level is determined by the ratio of our sample's solid angle to a texel's solid angle
-                VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0f) + 1.0f;
+                VFloat mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0f);
 
                 VFloat3 envColor = envTex.SampleCube<EnvSampler>(L, mipLevel);
 
-                // Shitty workaround to reduce artifacts around overly bright spots
-                envColor.x = min(envColor.x, 50.0f);
-                envColor.y = min(envColor.y, 50.0f);
-                envColor.z = min(envColor.z, 50.0f);
-
-                prefilteredColor = prefilteredColor + envColor * NoL;
+                prefilteredColor = prefilteredColor + TonemapSample(envColor) * NoL;
                 totalWeight += NoL;
             }
         }
-        return prefilteredColor / totalWeight;
+        return TonemapSampleInv(prefilteredColor / totalWeight);
     }
 
     static VFloat2 IntegrateBRDF(VFloat NoV, VFloat roughness) {
@@ -549,6 +539,16 @@ private:
             }
         }
         return { r.x * (1.0f / sampleCount), r.y * (1.0f / sampleCount) };
+    }
+
+    // Tonemap importance samples to prevent fireflies - http://graphicrants.blogspot.com/2013/12/tone-mapping.html
+    static VFloat3 TonemapSample(VFloat3 color) {
+        VFloat luma = dot(color, { 0.299f, 0.587f, 0.114f });
+        return color * rcp14(1.0f + luma);
+    }
+    static VFloat3 TonemapSampleInv(VFloat3 color) {
+        VFloat luma = dot(color, { 0.299f, 0.587f, 0.114f });
+        return color * rcp14(1.0f - luma);
     }
 
     static VFloat D_GGX(VFloat NoH, VFloat roughness) {
