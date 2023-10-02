@@ -64,9 +64,6 @@ public:
 
         InitRasterizer(1280, 720);
 
-        _shadowFb = std::make_shared<swr::Framebuffer>(1024, 1024);
-        _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
-
         _lightPos = glm::vec3(0.589494, 0.684509, 0.428906) * 18.0f;
     }
 
@@ -97,8 +94,14 @@ public:
 
     void Render() {
         static bool s_EnableShadows = false;
+        static float s_ShadowRange = 15.0f;
+        static int s_ShadowRes = 1024;
+        static bool s_ShadowFollowCam = false;
+
         static bool s_EnableSSAO = false;
         static bool s_HzbOcclusion = true;
+        static bool s_AnimateLight = false;
+
         static renderer::DebugLayer s_Layer = renderer::DebugLayer::None;
 
         ImGui::Begin("Settings");
@@ -139,12 +142,30 @@ public:
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
 
         ImGui::SeparatorText("Effects");
+
         ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
+        if (s_EnableShadows) {
+            ImGui::Indent();
+            ImGui::InputFloat("Range##Shadow", &s_ShadowRange, 0.5f);
+            if (ImGui::SliderInt("Resolution##Shadow", &s_ShadowRes, 128, 2048)) {
+                s_ShadowRes = (s_ShadowRes + 64) & ~127;
+            }
+            ImGui::Checkbox("Follow Camera", &s_ShadowFollowCam);
+            ImGui::Checkbox("Animate Sun", &s_AnimateLight);
+            ImGui::Unindent();
+
+            if (s_AnimateLight) {
+                static float time;
+                _lightPos = { 7.5, 16.5, sinf(time * 0.3f) * 10 };
+                time += ImGui::GetIO().DeltaTime;
+            }
+        }
+
         ImGui::Checkbox("SSAO", &s_EnableSSAO);
         if (s_EnableSSAO) {
             ImGui::Indent();
             ImGui::InputFloat("Radius", &_ssao.Radius, 0.1f);
-            ImGui::InputFloat("Range", &_ssao.MaxRange, 0.1f);
+            ImGui::InputFloat("Range##SSAO", &_ssao.MaxRange, 0.1f);
             ImGui::Unindent();
         }
         ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
@@ -164,7 +185,7 @@ public:
 
         if (s_EnableShadows && _shadowScene != nullptr) {
             STAT_TIME_BEGIN(Shadow);
-            RenderShadow();
+            RenderShadow(s_ShadowRes, s_ShadowRange, s_ShadowFollowCam);
             STAT_TIME_END(Shadow);
         }
 
@@ -256,9 +277,16 @@ public:
         DrawTranslationGizmo(_lightPos);
     }
 
-    void RenderShadow() {
-        //TODO: fix shadow matrix
-        _shadowProjMat = glm::ortho(-15.0f, +15.0f, -15.0f, +15.0f, 0.05f, 40.0f) * glm::lookAt(_lightPos, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+    void RenderShadow(int size, float range, bool followCam) {
+        if (_shadowFb == nullptr || _shadowFb->Width != size) {
+            _shadowFb = std::make_shared<swr::Framebuffer>(size, size);
+            _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
+        }
+
+        glm::vec3 centerPos = followCam ? glm::vec3(_cam.Position.x, 0, _cam.Position.z) : glm::vec3(0.0f);
+
+        _shadowProjMat = glm::ortho(-range, +range, -range, +range, 0.05f, 40.0f) * 
+                         glm::lookAt(centerPos + _lightPos, centerPos, glm::vec3(0, 1, 0));
 
         _shadowFb->ClearDepth(1.0f);
 
@@ -275,7 +303,8 @@ public:
             }
             return true;
         });
-
+        
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
         if (ImGui::Begin("Shadow Debug")) {
             _shadowDebugTex = std::make_unique<ogl::Texture2D>(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
             auto buf = std::make_unique<uint32_t[]>(_shadowFb->Width * _shadowFb->Height);
@@ -390,6 +419,22 @@ int main(int argc, char** args) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
+            static int winRect[4];
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+
+            if (!glfwGetWindowMonitor(window)) {
+                glfwGetWindowPos(window, &winRect[0], &winRect[1]);
+                glfwGetWindowSize(window, &winRect[2], &winRect[3]);
+
+                const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+                glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, 0);
+            } else {
+                glfwSetWindowMonitor(window, nullptr, winRect[0], winRect[1], winRect[2], winRect[3], 0);
+            }
+            glfwSwapInterval(1);
+        }
 
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
