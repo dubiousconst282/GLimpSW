@@ -32,10 +32,10 @@ struct Camera {
 
     void Update() {
         ImGuiIO& io = ImGui::GetIO();
-        float sensitivity = io.DeltaTime * 0.25f;
+        float sensitivity = 0.008f;
         float speed = io.DeltaTime * MoveSpeed;
         float pitchRange = glm::pi<float>() / 2.01f; // a bit less than 90deg to prevent issues with LookAt()
-        float damping = 1.0f - powf(1e-8f, io.DeltaTime);  // https://www.construct.net/en/blogs/ashleys-blog-2/using-lerp-delta-time-924
+        float blend = 1.0f - powf(0.7f, io.DeltaTime * 60);  // https://gamedev.stackexchange.com/a/149106
         glm::quat destRotation = glm::eulerAngleXY(-Euler.y, -Euler.x);
 
         if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) && !ImGuizmo::IsUsing()) {
@@ -64,14 +64,14 @@ struct Camera {
                 if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
                     ArcDistance = std::clamp(ArcDistance - io.MouseWheel * 0.5f, NearZ, FarZ * 0.8f);
                 }
-                _ViewArcDistance = glm::lerp(_ViewArcDistance, ArcDistance, damping);
+                _ViewArcDistance = glm::lerp(_ViewArcDistance, ArcDistance, blend);
 
                 Position = glm::vec3(0, 0, ArcDistance) * destRotation;
                 // TODO: implement panning for arcball camera
             }
         }
-        _ViewRotation = glm::slerp(_ViewRotation, destRotation, damping);
-        _ViewPosition = glm::lerp(_ViewPosition, Position, damping);
+        _ViewRotation = glm::slerp(_ViewRotation, destRotation, blend);
+        _ViewPosition = glm::lerp(_ViewPosition, Position, blend);
 
         AspectRatio = io.DisplaySize.x / io.DisplaySize.y;
     }

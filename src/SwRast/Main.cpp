@@ -101,6 +101,7 @@ public:
         static bool s_EnableSSAO = false;
         static bool s_HzbOcclusion = true;
         static bool s_AnimateLight = false;
+        static bool s_VSync = true;
 
         static renderer::DebugLayer s_Layer = renderer::DebugLayer::None;
 
@@ -140,6 +141,9 @@ public:
         ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
         ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
+        if (ImGui::Checkbox("VSync", &s_VSync)) {
+            glfwSwapInterval(s_VSync ? 1 : 0);
+        }
 
         ImGui::SeparatorText("Effects");
 
