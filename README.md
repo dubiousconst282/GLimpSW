@@ -3,30 +3,20 @@ Real time Physically Based Rendering on the CPU using AVX512
 
 ---
 
-<table>
-  <tr>
-    <td>
-      <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4528415d-14b4-42fd-90d3-e1e47d2d9c17" alt="Demo - Crytek Sponza" style="height: 100%; object-fit: scale-down;">
-    </td>
-    <td>
-      <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4508d3a1-562e-4cb7-b43c-51a18f57e75b" alt="Demo - Damaged Helmet" style="height: 100%; object-fit: scale-down;">
-    </td>
-  <tr>
-  <tr>
-    <td>
-      <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/491bc38e-db84-408d-aa3f-2f2bf952d108" alt="Demo - Polyhaven Ship Pinnace" style="height: 100%; object-fit: scale-down;">
-    </td>
-    <td>
-      <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/0e39e425-102d-4f69-9802-41b654cd6aea" alt="Demo - Amazon Bistro" style="height: 100%; object-fit: scale-down;">
-    </td>
-  <tr>
-</table>
+<div>
+  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4528415d-14b4-42fd-90d3-e1e47d2d9c17" width="49%" alt="Crytek Sponza">
+  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4508d3a1-562e-4cb7-b43c-51a18f57e75b" width="49%" alt="Damaged Helmet">
+  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/491bc38e-db84-408d-aa3f-2f2bf952d108" width="49%" alt="Polyhaven Ship Pinnace">
+  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/0e39e425-102d-4f69-9802-41b654cd6aea" width="49%" alt="Amazon Bistro">
+</div>
+
+_Sample scenes rendered at 1080p on a 4-core laptop CPU @ ~3.5GHz (i5-11320H)_
 
 ## Features
 - Programmable vertex and pixel shading via concepts and template specialization
   - Deferred rendering
   - PBR + Image Based Lighting (or something close to it)
-  - Shadow Mapping with Poisson sampling
+  - Shadow Mapping with rotated-disk sampling
   - Screen Space Ambient Occlusion at 1/2 resolution (with terrible results)
   - Temporal Anti-Aliasing
   - Hierarchical-Z occlusion
