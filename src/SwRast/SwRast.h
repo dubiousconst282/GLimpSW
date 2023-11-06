@@ -395,6 +395,8 @@ class Rasterizer {
         __builtin_assume(minX % 4 == 0);
         __builtin_assume(minY % 4 == 0);
 
+        // TODO: Investigate how costly these lane accesses actually are, considering each will be on a different cache-line.
+        //       it might be faster to recompute or maybe shuffle after setup to a friendlier layout.
         VInt stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
         VInt stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
 

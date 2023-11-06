@@ -234,6 +234,22 @@ inline VFloat cos(VFloat a) {
     return u;
 }
 
+// Max relative error: sin=3.45707e-06 cos=0.00262925
+inline void sincos(VFloat a, VFloat& rs, VFloat& rc) {
+    VInt q = round2i(a * inv_pi);
+    VFloat d = fma(conv2f(q), -pi, a);
+
+    VFloat s = d * d;
+    VFloat u = -0.1881748176e-3f;
+    u = fma(u, s, +0.8323502727e-2f);
+    u = fma(u, s, -0.1666651368e+0f);
+    u = fma(s * d, u, d);
+
+    VFloat qs = re2f(q << 31);
+    rs = u ^ qs;  // if ((q & 1) != 0) u = -u;
+    rc = sqrt14(1.0f - rs * rs) ^ qs;
+}
+
 // https://github.com/romeric/fastapprox/blob/master/fastapprox/src/fastlog.h
 inline VFloat approx_log2(VFloat x) {
     VFloat y = conv2f(re2i(x));

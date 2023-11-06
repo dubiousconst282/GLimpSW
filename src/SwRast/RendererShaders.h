@@ -188,7 +188,7 @@ struct DefaultShader {
                 VFloat3 Fd = (1.0f - F) * diffuseColor * Fd_Lambert();
 
                 if (ShadowBuffer != nullptr && any(NoL > 0.0f)) {
-                    NoL *= GetShadow(worldPos, NoL);
+                    [[clang::always_inline]] NoL *= GetShadow(worldPos, NoL);
                 }
                 finalColor = (Fd + Fr) * NoL;
 
@@ -353,35 +353,44 @@ struct DefaultShader {
 
 private:
     VFloat GetShadow(VFloat3 worldPos, VFloat NoL) {
-        static const int8_t PoissonDisk[2][16] = {
-            { -9, 85, -101, 2, -21, 36, 40, 86, -53, -69, 17, -87, 43, -8, -51, 70 },
-            { -3, 17, -9, -43, 67, 88, -85, -34, 22, -64, 29, 48, -10, -99, -25, 63 },
+        // I don't even know how I got these values, but the order has some impact on the final result.
+        // Filament's disk is quite noisy even with TAA.
+        static const float PoissonDisk[2][16] = {
+            { -0.03, 0.17, -0.09, -0.43, 0.67, 0.88, -0.85, -0.34, 0.22, -0.64, 0.29, 0.48, -0.1, -0.99, -0.25, 0.63 },
+            { -0.09, 0.85, -1.01, 0.02, -0.21, 0.36, 0.4, 0.86, -0.53, -0.69, 0.17, -0.87, 0.43, -0.08, -0.51, 0.7 },
         };
 
         VFloat4 shadowPos = TransformVector(ShadowProjMat, { worldPos, 1.0f });
-        shadowPos.w = rcp14(shadowPos.w);
+        // ShadowProj is orthographic, so W is always 1.0
+        // shadowPos.w = rcp14(shadowPos.w);
 
         VFloat bias = max((1.0f - NoL) * 0.015f, 0.003f);
         VFloat currentDepth = shadowPos.z * shadowPos.w - bias;
 
         VFloat sx = shadowPos.x * shadowPos.w * 0.5f + 0.5f;
         VFloat sy = shadowPos.y * shadowPos.w * 0.5f + 0.5f;
-        VInt x = round2i(sx * (float)(ShadowBuffer->Width << 6)) + 31;
-        VInt y = round2i(sy * (float)(ShadowBuffer->Height << 6)) + 31;
+        sx *= ShadowBuffer->Width;
+        sy *= ShadowBuffer->Height;
+
+        // aesenc costs 5c/1t, this hash probably takes around ~8-10c on TGL.
+        VInt rng = _mm512_aesenc_epi128(re2i(sx) + (int32_t)FrameNo, _mm512_set1_epi32(0)) ^ 
+                   _mm512_aesenc_epi128(re2i(sy), _mm512_set1_epi32(0));
+
+        VFloat rc, rs;
+        VFloat randomAngle = conv2f(shrl(rng, 8)) * (tau / (1 << 24));
+        sincos(randomAngle, rc, rs);
 
         auto samples = _mm_set1_epi8(0);
-        float weight = 1.0f / 16;
 
-        for (uint32_t i = 0; i < 16; i++) {
-            // If at the 4th iter samples are all 0 or 4, assume this area is not in a shadow edge
-            if (i == 4 && (_mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(0)) || _mm_cmpeq_epu8_mask(samples, _mm_set1_epi8(4)))) {
-                weight = 1.0f / 4;
-                break;
-            }
-            VFloat occlusionDepth = ShadowBuffer->SampleDepth((x + PoissonDisk[0][i]) >> 6, (y + PoissonDisk[1][i]) >> 6);
+        for (uint32_t i = 0; i < 8; i++) {
+            VFloat jx = PoissonDisk[0][i], jy = PoissonDisk[1][i];
+            VFloat rx = jx * rc - jy * rs + sx; // 2x fma
+            VFloat ry = jx * rs + jy * rc + sy;
+
+            VFloat occlusionDepth = ShadowBuffer->SampleDepth(round2i(rx), round2i(ry));
             samples = _mm_mask_add_epi8(samples, occlusionDepth >= currentDepth, samples, _mm_set1_epi8(1));
         }
-        return conv2f(_mm512_cvtepi8_epi32(samples)) * weight;
+        return conv2f(_mm512_cvtepi8_epi32(samples)) * (1.0f / 8);
     }
     static VFloat GetAO(swr::Framebuffer& fb, uint32_t x, uint32_t y) {
         uint8_t* basePtr = fb.GetAttachmentBuffer<uint8_t>(8);
