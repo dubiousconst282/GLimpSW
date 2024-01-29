@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <bit>
 #include <glm/mat4x4.hpp>
 
 namespace swr {
@@ -337,5 +338,22 @@ AlignedBuffer<T> alloc_buffer(size_t count, size_t align = 64) {
     T* ptr = (T*)_mm_malloc(count * sizeof(T), align);
     return AlignedBuffer<T>(ptr);
 }
+
+class BitIter {
+    uint32_t _mask;
+
+public:
+    BitIter(uint32_t mask) : _mask(mask) {}
+
+    BitIter& operator++() {
+        _mask &= (_mask - 1);
+        return *this;
+    }
+    uint32_t operator*() const { return (uint32_t)std::countr_zero(_mask); }
+    friend bool operator!=(const BitIter& a, const BitIter& b) { return a._mask != b._mask; }
+
+    BitIter begin() const { return *this; }
+    BitIter end() const { return BitIter(0); }
+};
 
 }; // namespace swr

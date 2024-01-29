@@ -4,7 +4,6 @@
 #include <execution>
 #include <ranges>
 
-#include "Misc.h"
 #include "SwRast.h"
 
 namespace swr {
