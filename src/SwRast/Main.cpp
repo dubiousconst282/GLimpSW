@@ -130,7 +130,7 @@ public:
 
         std::string currRes = std::format("{}x{}", _fb->Width, _fb->Height);
         if (ImGui::BeginCombo("Resolution", currRes.c_str())) {
-            if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1088);
+            if (ImGui::Selectable("1920x1080")) InitRasterizer(1920, 1080);
             if (ImGui::Selectable("1280x720")) InitRasterizer(1280, 720);
             if (ImGui::Selectable("854x480")) InitRasterizer(854, 480);
             if (ImGui::Selectable("320x240")) InitRasterizer(320, 240);
