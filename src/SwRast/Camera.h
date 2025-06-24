@@ -1,6 +1,8 @@
 #pragma once
 
 #include "SwRast.h"
+
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/euler_angles.hpp>
 
 struct Camera {
@@ -56,8 +58,8 @@ struct Camera {
                 if (ImGui::IsKeyDown(ImGuiKey_S)) mv.z++;
                 if (ImGui::IsKeyDown(ImGuiKey_A)) mv.x--;
                 if (ImGui::IsKeyDown(ImGuiKey_D)) mv.x++;
-                if (ImGui::IsKeyDown(ImGuiKey_Space)) mv.y++;
-                if (ImGui::IsKeyDown(ImGuiKey_LeftShift)) mv.y--;
+                if (ImGui::IsKeyDown(ImGuiKey_Space)) Position.y += speed;
+                if (ImGui::IsKeyDown(ImGuiKey_LeftShift)) Position.y -= speed;
 
                 Position += mv * destRotation * speed;
             } else if (Mode == InputMode::Arcball) {

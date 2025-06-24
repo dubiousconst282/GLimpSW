@@ -17,7 +17,6 @@
 #include "Camera.h"
 
 #include "Scene.h"
-#include "QuickGL.h"
 #include "RendererShaders.h"
 
 class SwRenderer {
@@ -30,8 +29,8 @@ class SwRenderer {
     Camera _cam;
     scene::DepthPyramid _depthPyramid;
 
-    std::unique_ptr<ogl::Texture2D> _frontTex;
-    std::unique_ptr<ogl::Texture2D> _shadowDebugTex;
+    GLuint _frontTex = 0;
+    GLuint _shadowDebugTex = 0;
     std::unique_ptr<uint32_t[]> _tempPixels;
 
     glm::vec3 _lightPos;
@@ -66,12 +65,16 @@ public:
 
         _lightPos = glm::vec3(0.589494, 0.684509, 0.428906) * 18.0f;
     }
+    ~SwRenderer() {
+        if (_frontTex != 0) glDeleteTextures(1, &_frontTex);
+    }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
         _fb = std::make_shared<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
         _rast = std::make_unique<swr::Rasterizer>(_fb);
 
-        _frontTex = std::make_unique<ogl::Texture2D>(_fb->Width, _fb->Height, 1, GL_RGBA8);
+        if (_frontTex != 0) glDeleteTextures(1, &_frontTex);
+        _frontTex = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
     }
     void LoadScene(const std::filesystem::path& path) {
@@ -260,14 +263,12 @@ public:
         STAT_TIME_END(Compose);
 
         _fb->GetPixels(_tempPixels.get(), _fb->Width);
-        _frontTex->SetPixels(_tempPixels.get(), _fb->Width);
+        glTextureSubImage2D(_frontTex, 0, 0, 0, (GLsizei)_fb->Width, (GLsizei)_fb->Height, GL_RGBA, GL_UNSIGNED_BYTE, _tempPixels.get());
 
         STAT_TIME_END(Frame);
 
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
-
-        auto texId = (ImTextureID)(uintptr_t)_frontTex->Handle;
-        drawList->AddImage(texId, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 1), ImVec2(1, 0));
+        drawList->AddImage((ImTextureID)_frontTex, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 1), ImVec2(1, 0));
 
         // clang-format off
         ImGui::Begin("Rasterizer Stats");
@@ -310,7 +311,7 @@ public:
         
         ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
         if (ImGui::Begin("Shadow Debug")) {
-            _shadowDebugTex = std::make_unique<ogl::Texture2D>(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
+            if (_shadowDebugTex == 0) _shadowDebugTex = CreateTexture(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
             auto buf = std::make_unique<uint32_t[]>(_shadowFb->Width * _shadowFb->Height);
 
             for (uint32_t y = 0; y < _shadowFb->Height; y++) {
@@ -322,9 +323,9 @@ public:
                     buf[i] = c * 0x01'01'01 | 0xFF'000000;
                 }
             }
-            _shadowDebugTex->SetPixels(buf.get(), _shadowFb->Width);
+            glTextureSubImage2D(_shadowDebugTex, 0, 0, 0, (GLsizei)_shadowFb->Width, (GLsizei)_shadowFb->Height, GL_RGBA, GL_UNSIGNED_BYTE, buf.get());
 
-            ImGui::Image((ImTextureID)(uintptr_t)_shadowDebugTex->Handle, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
+            ImGui::Image((ImTextureID)_shadowDebugTex, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
         }
         ImGui::End();
     }
@@ -336,7 +337,7 @@ public:
 
             uint32_t w = _fb->Width >> level;
             uint32_t h = _fb->Height >> level;
-            _shadowDebugTex = std::make_unique<ogl::Texture2D>(w, h, 1, GL_RGBA8);
+            if (_shadowDebugTex == 0) _shadowDebugTex = CreateTexture(w, h, 1, GL_RGBA8);
             auto buf = std::make_unique<uint32_t[]>(w * h);
 
             for (uint32_t y = 0; y < h; y++) {
@@ -347,11 +348,26 @@ public:
                     buf[x + y * w] = c * 0x01'01'01 | 0xFF'000000;
                 }
             }
-            _shadowDebugTex->SetPixels(buf.get(), w);
+            glTextureSubImage2D(_shadowDebugTex, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, buf.get());
 
-            ImGui::Image((ImTextureID)(uintptr_t)_shadowDebugTex->Handle, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
+            float s = 1.0f / (1 << level);
+            ImGui::Image((ImTextureID)_shadowDebugTex, ImGui::GetContentRegionAvail(), ImVec2(0, s), ImVec2(s, 0));
         }
         ImGui::End();
+    }
+
+    static GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
+        GLuint handle;
+        glCreateTextures(GL_TEXTURE_2D, 1, &handle);
+
+        glTextureStorage2D(handle, (GLsizei)mipLevels, fmt, (GLsizei)width, (GLsizei)height);
+
+        glTextureParameteri(handle, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri(handle, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        glTextureParameteri(handle, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTextureParameteri(handle, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        return handle;
     }
 
     void DrawTranslationGizmo(glm::vec3& pos) {

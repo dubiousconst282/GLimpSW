@@ -1,4 +1,3 @@
-
 #include <array>
 #include <chrono>
 #include <execution>
@@ -7,6 +6,11 @@
 #include "SwRast.h"
 
 namespace swr {
+
+static void ParallelDispatch(uint32_t numInvocs, auto fn) {
+    auto range = std::ranges::iota_view(0u, numInvocs);
+    std::for_each(std::execution::par_unseq, range.begin(), range.end(), fn);
+}
 
 Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
     const float maxViewSize = 2048.0f;
@@ -43,9 +47,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         STAT_TIME_BEGIN(Rasterize);
 
-        auto binRange = std::ranges::iota_view(0u, batch.NumBins);
-
-        std::for_each(std::execution::par_unseq, binRange.begin(), binRange.end(), [&](uint32_t bid) {
+        ParallelDispatch(batch.NumBins, [&](uint32_t bid) {
             std::vector<uint16_t>& bin = batch.Bins[bid];
             if (bin.size() == 0) return;
 
@@ -217,9 +219,7 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
 void Framebuffer::IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor) {
     downscaleFactor *= 4;
 
-    auto range = std::ranges::iota_view(0u, Height / downscaleFactor);
-
-    std::for_each(std::execution::par_unseq, range.begin(), range.end(), [&](uint32_t y) {
+    ParallelDispatch(Height / downscaleFactor, [&](uint32_t y) {
         for (uint32_t x = 0; x < Width; x += downscaleFactor) {
             visitor(x, y * downscaleFactor);
         }

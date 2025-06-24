@@ -1,9 +1,11 @@
 #pragma once
 
+#include "SIMD.h"
+
 #include <concepts>
 #include <functional>
-
-#include "SIMD.h"
+#include <string_view>
+#include <cstring>
 
 namespace swr {
 
@@ -149,7 +151,7 @@ struct StbImage {
 
     uint32_t Width, Height;
     PixelType Type;
-    std::unique_ptr<uint8_t[], decltype(&std::free)> Data = { nullptr, &std::free };
+    std::unique_ptr<uint8_t[], void(*)(void*)> Data = { nullptr, &free };
 
     static StbImage Load(std::string_view path, PixelType type = PixelType::RGBA_U8);
 };
@@ -368,7 +370,7 @@ struct Texture2D {
         assert(layer < NumLayers);
 
         for (uint32_t y = 0; y < Height; y++) {
-            std::memcpy(&Data[(layer << LayerShift) + (y << RowShift)], (uint32_t*)pixels + y * stride, Width * 4);
+            memcpy(&Data[(layer << LayerShift) + (y << RowShift)], (uint32_t*)pixels + y * stride, Width * 4);
         }
     }
 

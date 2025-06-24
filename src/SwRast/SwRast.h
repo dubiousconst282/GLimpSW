@@ -100,6 +100,7 @@ private:
         for (uint32_t i = 0; i < count; i += 16) {
             _mm512_stream_si512((uint32_t*)ptr + i, _mm512_set1_epi32((int32_t)value));
         }
+        _mm_sfence();
     }
 };
 

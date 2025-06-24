@@ -1,4 +1,5 @@
 #include "SwRast.h"
+#include <cstring>
 
 namespace swr {
 
@@ -46,7 +47,7 @@ void Clipper::ClipAgainstPlane(Plane plane, uint32_t numAttribs) {
             }
         }
     }
-    std::memcpy(Indices, tempIndices, 24); //small constant size copy likely to perform better than var
+    memcpy(Indices, tempIndices, 24); // small constant size copy can be inlined
     Count = j;
     assert(Count < 24);
 }

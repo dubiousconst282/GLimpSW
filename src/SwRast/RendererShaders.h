@@ -15,7 +15,7 @@ enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, Occlusion, 
 // https://google.github.io/filament/Filament.html
 // https://bruop.github.io/ibl/
 struct DefaultShader {
-    static const uint32_t NumCustomAttribs = 8, NumFbAttachments = 9;
+    static constexpr uint32_t NumCustomAttribs = 8, NumFbAttachments = 9;
 
     static constexpr swr::SamplerDesc SurfaceSampler = {
         .Wrap = swr::WrapMode::Repeat,
@@ -128,7 +128,7 @@ struct DefaultShader {
         VInt G1 = (baseColor & 0xFFFFFF) | round2i(metalness * 255.0f) << 24;
         fb.WriteTile(vars.TileOffset, vars.TileMask, G1, vars.Depth);
 
-        VInt G2 = SignedOctEncode(N, roughness) | (hasEmissive ? 2 : 0);
+        VInt G2 = SignedOctEncode(N) | round2i(roughness * 63.0) << 1 | (hasEmissive ? 1 : 0);
         _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), vars.TileMask, G2);
     }
 
@@ -153,14 +153,13 @@ struct DefaultShader {
                 // Unpack G-Buffer
                 VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
                 VInt G2r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
-                VMask emissiveMask = (G2r & 2) != 0;
-                VFloat4 G2 = SignedOctDecode(G2r);
+                VMask emissiveMask = (G2r & 1) != 0;
+                VFloat3 N = SignedOctDecode(G2r);
 
                 VFloat3 baseColor = SrgbToLinear(VFloat3(G1));
-                VFloat3 N = VFloat3(G2);
                 VFloat metalness = G1.w;
 
-                VFloat perceptualRoughness = max(G2.w, 0.045f);  // clamp to prevent div by zero
+                VFloat perceptualRoughness = max(conv2f(G2r >> 1 & 63) / 63.0f, 0.045f);  // clamp to prevent div by zero
                 VFloat roughness = perceptualRoughness * perceptualRoughness;
 
                 // Microfacet BRDF
@@ -330,18 +329,18 @@ struct DefaultShader {
 
             VFloat4 G1 = UnpackRGBA(VInt::load(&fb.ColorBuffer[tileOffset]));
             VInt G2r = VInt::load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
-            VFloat4 G2 = SignedOctDecode(G2r);
+            VFloat3 G2 = SignedOctDecode(G2r);
 
             if (layer == DebugLayer::BaseColor) {
                 finalColor = VFloat3(G1);
             } else if (layer == DebugLayer::Normals) {
                 finalColor = VFloat3(G2) * 0.5f + 0.5f;
             } else if (layer == DebugLayer::MetallicRoughness) {
-                finalColor = { G1.w, G2.w, 0.0f };
+                finalColor = { G1.w, conv2f(G2r >> 1 & 63) / 63.0f, 0.0f };
             } else if (layer == DebugLayer::Occlusion) {
                 finalColor = GetAO(fb, x, y);
             } else if (layer == DebugLayer::EmissiveMask) {
-                finalColor.x = csel((G2r & 2) != 0, VFloat(1.0f), 0);
+                finalColor.x = csel((G2r & 1) != 0, VFloat(1.0f), 0);
             }
 
             uint32_t backgroundRGB = (x / 4 + y / 4) % 2 ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
@@ -630,9 +629,9 @@ private:
     //    return 0.662002687 * S1 + 0.684122060 * S2 - 0.323583601 * S3 - 0.0225411470 * x;
     //}
 
-    // Encode normal using signed octahedron + arbitrary extra into 10:10:1 + 10 bits (bit at index 1 is unused)
+    // Encode normal to signed octahedron + arbitrary extra into 12:12:1. Lower 7 bits are unused.
     // https://johnwhite3d.blogspot.com/2017/10/signed-octahedron-normal-encoding.html
-    static VInt SignedOctEncode(VFloat3 n, VFloat w) {
+    static VInt SignedOctEncode(VFloat3 n) {
         VFloat m = rcp14(abs(n.x) + abs(n.y) + abs(n.z)) * 0.5f;
         n = n * m;
 
@@ -640,19 +639,17 @@ private:
         VFloat nx = n.x + ny;
         ny = ny - n.x;
 
-        return round2i(nx * 1023.0f) << 22 | round2i(ny * 1023.0f) << 12 | round2i(w * 1023.0f) << 2 | shrl(re2i(n.z), 31);
+        return round2i(nx * 4095.0f) << 19 | round2i(ny * 4095.0f) << 7 | (re2i(n.z) & (1 << 31));
     }
-    static VFloat4 SignedOctDecode(VInt p) {
-        float scale = 1.0f / 1023.0f;
-        VFloat px = conv2f((p >> 22) & 1023) * scale;
-        VFloat py = conv2f((p >> 12) & 1023) * scale;
-        VFloat pw = conv2f((p >> 2) & 1023) * scale;
+    static VFloat3 SignedOctDecode(VInt p) {
+        VFloat px = conv2f((p >> 19) & 4095) / 4095.0f;
+        VFloat py = conv2f((p >> 7) & 4095) / 4095.0f;
 
         VFloat nx = px - py;
         VFloat ny = px + py - 1.0f;
-        VFloat nz = (1.0 - abs(nx) - abs(ny)) ^ re2f(p << 31);
+        VFloat nz = (1.0 - abs(nx) - abs(ny)) ^ re2f(p & (1 << 31));
 
-        return { normalize({ nx, ny, nz }), pw };
+        return normalize({ nx, ny, nz });
 
         // OutN.z = n.z * 2.0 - 1.0;  // n.z ? 1 : -1
         // OutN.z = OutN.z * (1.0 - abs(OutN.x) - abs(OutN.y));
@@ -669,7 +666,7 @@ private:
     friend struct SSAO;
 };
 struct DepthOnlyShader {
-    static const uint32_t NumCustomAttribs = 0;
+    static constexpr uint32_t NumCustomAttribs = 0;
 
     glm::mat4 ProjMat;
 
@@ -683,7 +680,7 @@ struct DepthOnlyShader {
     }
 };
 struct OverdrawShader {
-    static const uint32_t NumCustomAttribs = 0;
+    static constexpr uint32_t NumCustomAttribs = 0;
 
     glm::mat4 ProjMat;
 

@@ -16,7 +16,7 @@ StbImage StbImage::Load(std::string_view path, PixelType type) {
                                                    nullptr;
 
     if (pixels == nullptr) {
-        throw std::exception("Failed to load image");
+        throw std::runtime_error("Failed to load image");
     }
     return {
         .Width = (uint32_t)width,

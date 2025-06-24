@@ -9,8 +9,17 @@
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
             "visualizerFile": "${workspaceFolder}/src/DebugDisplay.natvis"
-        }
+        },
+        {
+            "name": "(cppdbg) Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${command:cmake.launchTargetPath}",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "internalConsoleOptions": "openOnSessionStart"
+        },
     ]
 }

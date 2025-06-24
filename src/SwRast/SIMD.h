@@ -4,13 +4,14 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <bit>
 #include <glm/mat4x4.hpp>
 
 namespace swr {
 
 struct VInt {
-    static const uint32_t Length = sizeof(__m512i) / sizeof(int32_t);
+    static constexpr uint32_t Length = sizeof(__m512i) / sizeof(int32_t);
 
     __m512i reg;
 
@@ -33,7 +34,7 @@ struct VInt {
     static inline VInt ramp() { return _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 };
 struct VFloat {
-    static const uint32_t Length = sizeof(__m512) / sizeof(float);
+    static constexpr uint32_t Length = sizeof(__m512) / sizeof(float);
 
     __m512 reg;
 

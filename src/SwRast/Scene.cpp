@@ -2,6 +2,7 @@
 
 #include <unordered_map>
 #include <filesystem>
+#include <cfloat>
 
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
@@ -114,8 +115,8 @@ Node ConvertNode(const Model& model, aiNode* node) {
     //FIXME: apply transform on node AABBs
     Node cn = {
         .Transform = glm::transpose(*(glm::mat4*)&node->mTransformation),
-        .BoundMin = glm::vec3(INFINITY),
-        .BoundMax = glm::vec3(-INFINITY),
+        .BoundMin = glm::vec3(FLT_MAX),
+        .BoundMax = glm::vec3(-FLT_MAX),
     };
 
     for (uint32_t i = 0; i < node->mNumMeshes; i++) {
@@ -150,7 +151,7 @@ Model::Model(std::string_view path) {
     const aiScene* scene = imp.ReadFile(path.data(), processFlags);
 
     if (!scene || !scene->HasMeshes()) {
-        throw std::exception("Could not import scene");
+        throw std::runtime_error("Could not import scene");
     }
 
     BasePath = std::filesystem::path(path).parent_path().string();
@@ -187,8 +188,8 @@ Model::Model(std::string_view path) {
             .VertexOffset = vertexPos,
             .IndexOffset = indexPos,
             .Material = &Materials[mesh->mMaterialIndex],
-            .BoundMin = glm::vec3(INFINITY),
-            .BoundMax = glm::vec3(-INFINITY),
+            .BoundMin = glm::vec3(FLT_MAX),
+            .BoundMax = glm::vec3(-FLT_MAX),
         });
 
         for (uint32_t j = 0; j < mesh->mNumVertices; j++) {
@@ -240,7 +241,7 @@ float DepthPyramid::GetDepth(float u, float v, float lod) const {
 bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const {
     if (!_storage) return true;
 
-    glm::vec3 rectMin = glm::vec3(INFINITY), rectMax = glm::vec3(-INFINITY);
+    glm::vec3 rectMin = glm::vec3(FLT_MAX), rectMax = glm::vec3(-FLT_MAX);
 
     uint8_t combinedOut = 63;
     uint8_t partialOut = 0;

@@ -28,10 +28,9 @@ _Sample scenes rendered at 1080p on a 4-core laptop CPU @ ~3.5GHz (i5-11320H)_
 _Most of the effects aren't quite correct nor very well tuned, since this is a toy project and my focus was more on performance and simplicity than final quality._
 
 ## Building
-The project uses CMake and vcpkg for project and dependency management. Clang or GCC must be used for building, as MSVC builds were initially about 2x slower, and there's now some `__builtin_*` stuff being used. Debug builds are also too slow for most of anything, so release/optimized builds are preferred except for heavy debugging.
+The project uses CMake and CPM for project and dependency management. Clang or GCC must be used for building, as MSVC builds were initially about 2x slower, and some `__builtin_*` intrinsics are now being used. Debug builds are also too slow for most of anything, so release/optimized builds are preferred except for heavy debugging.
 
-- Ensure `VCPKG_ROOT` environment variable is set to vcpkg root directory. (and pray that CMake picks it up properly on the first try.)
-- Open project on VS or VSC or wherever, or build through CLI:
+Open project on VS or VSC or wherever, or build through CLI:
 
 ```
 cmake -S ./src/SwRast -B ./build/ -G Ninja -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang++.exe" -DCMAKE_C_COMPILER="C:/Program Files/LLVM/bin/clang.exe"
@@ -74,8 +73,6 @@ Below are the [benchmark](https://github.com/dubiousconst282/GLimpSW/commit/d089
 | Linear      | 4.12 ms | 4.30 ms | 11.7 ms | 17.8 ms |
 | Tiled 4x4   | 4.49 ms | 4.94 ms | 13.7 ms | 15.6 ms |
 | Z-Order     | 4.55 ms | 5.96 ms | 11.0 ms | 12.3 ms |
-
-(By the way, for the Z-order encoding function, it may be slightly faster to use the Galois field instructions instead of [SIMD LUTs](https://github.com/dubiousconst282/GLimpSW/blob/6f0c6b32e6e681469628e5d6d2a4d844b696be9c/src/SwRast/Texture.h#L274-L293), see [this post](https://news.ycombinator.com/item?id=37630391).)
 
 ### Coarse Rasterization
 The basic rasterizer always traverses over fixed size tiles (in this case, 4x4 pixels) to test whether any pixels are covered or not, before doing the depth test and invoking the shader. A [coarse rasterizer](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/) first rasterizes bigger tiles and collect masks about which fragments are partially or fully covered, so it can skip through tiles of the bounding box that are outside the triangle much quicker.
