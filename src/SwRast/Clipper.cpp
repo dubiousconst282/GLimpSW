@@ -39,11 +39,11 @@ void Clipper::ClipAgainstPlane(Plane plane, uint32_t numAttribs) {
 
             assert(numAttribs <= sizeof(va.Attribs) / 4);
 
-            for (uint32_t ai = 0; ai < numAttribs; ai += VFloat::Length) {
-                VFloat a = VFloat::load(&va.Attribs[ai]);
-                VFloat b = VFloat::load(&vb.Attribs[ai]);
-                VFloat r = simd::lerp(a, b, t);
-                r.store(&dest.Attribs[ai]);
+            for (uint32_t ai = 0; ai < numAttribs; ai += simd::vec_width) {
+                v_float a = simd::load(&va.Attribs[ai]);
+                v_float b = simd::load(&vb.Attribs[ai]);
+                v_float r = simd::lerp(a, b, t);
+                simd::store(r, &dest.Attribs[ai]);
             }
         }
     }
@@ -57,16 +57,16 @@ Clipper::ClipCodes Clipper::ComputeClipCodes(const TrianglePacket& tri) {
     auto combinedOut = _mm_set1_epi8(~0);  // non-zero if all vertices are out
 
     for (uint32_t i = 0; i < 3; i++) {
-        const VFloat4& pos = tri.Vertices[i].Position;
+        const v_float4& pos = tri.Vertices[i].Position;
         auto outcode = _mm_set1_epi8(0);
 
-        const auto MaskN = [&](VFloat x, Clipper::Plane p) {
-            VMask m = x < -pos.w;
+        const auto MaskN = [&](v_float x, Clipper::Plane p) {
+            v_mask m = simd::movemask(x < -pos.w);
             auto c = _mm_maskz_mov_epi8(m, _mm_set1_epi8(1 << (int)p));
             outcode = _mm_or_si128(outcode, c);
         };
-        const auto MaskP = [&](VFloat x, Clipper::Plane p) {
-            VMask m = x > pos.w;
+        const auto MaskP = [&](v_float x, Clipper::Plane p) {
+            v_mask m = simd::movemask(x > pos.w);
             auto c = _mm_maskz_mov_epi8(m, _mm_set1_epi8(1 << (int)p));
             outcode = _mm_or_si128(outcode, c);
         };
@@ -81,12 +81,12 @@ Clipper::ClipCodes Clipper::ComputeClipCodes(const TrianglePacket& tri) {
         combinedOut = _mm_and_si128(combinedOut, outcode);
     }
 
-    VMask acceptMask = _mm_cmpeq_epi8_mask(partialOut, _mm_set1_epi8(0));
-    VMask rejectMask = _mm_cmpneq_epi8_mask(combinedOut, _mm_set1_epi8(0));
+    v_mask acceptMask = _mm_cmpeq_epi8_mask(partialOut, _mm_set1_epi8(0));
+    v_mask rejectMask = _mm_cmpneq_epi8_mask(combinedOut, _mm_set1_epi8(0));
 
     ClipCodes codes = {
-        .AcceptMask = (VMask)(acceptMask & ~rejectMask),
-        .NonTrivialMask = (VMask)(~acceptMask & ~rejectMask),
+        .AcceptMask = (v_mask)(acceptMask & ~rejectMask),
+        .NonTrivialMask = (v_mask)(~acceptMask & ~rejectMask),
     };
     _mm_storeu_si128((__m128i*)codes.OutCodes, partialOut);
     return codes;
@@ -94,7 +94,7 @@ Clipper::ClipCodes Clipper::ComputeClipCodes(const TrianglePacket& tri) {
 
 void Clipper::LoadTriangle(TrianglePacket& srcTri, uint32_t srcTriIdx, uint32_t numAttribs) {
     for (uint32_t vi = 0; vi < 3; vi++) {
-        VFloat* src = &srcTri.Vertices[vi].Position.x;
+        v_float* src = &srcTri.Vertices[vi].Position.x;
         float* dest = Vertices[vi].Attribs;
 
         for (uint32_t ai = 0; ai < numAttribs; ai++) {
@@ -108,7 +108,7 @@ void Clipper::StoreTriangle(TrianglePacket& destTri, uint32_t destTriIdx, uint32
     uint32_t srcIdx[3]{ 0, srcTriFanIdx + 1, srcTriFanIdx + 2 };
 
     for (uint32_t vi = 0; vi < 3; vi++) {
-        VFloat* dest = &destTri.Vertices[vi].Position.x;
+        v_float* dest = &destTri.Vertices[vi].Position.x;
         float* src = Vertices[Indices[srcIdx[vi]]].Attribs;
 
         for (uint32_t ai = 0; ai < numAttribs; ai++) {

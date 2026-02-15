@@ -55,8 +55,8 @@ static void Transpose16x3(__m512i v[3]) {
     //   2  5  8 11 14 17 20 23 26 29 32 35 38 41 44 47
 }
 
-VInt VertexReader::ReadIndices(size_t offset) {
-    VInt indices;
+v_int VertexReader::ReadIndices(size_t offset) {
+    v_int indices;
 
     switch (IndexFormat) {
         case U32: indices = _mm512_loadu_epi32(&IndexBuffer[offset * 4]); break;
@@ -65,17 +65,17 @@ VInt VertexReader::ReadIndices(size_t offset) {
         default: assert(!"Unknown index buffer format");
     }
     // Mask-out reads beyond buffer size to zero to prevent rasterizer from rendering garbage
-    if (offset + VInt::Length > Count) {
-        indices = _mm512_maskz_mov_epi32(_mm512_cmplt_epi32_mask(VInt::ramp(), VInt(Count - offset)), indices);
+    if (offset + simd::vec_width > Count) {
+        indices = (offset + simd::lane_idx) < (int)Count ? indices : 0;
     }
     return indices;
 }
 
-void VertexReader::ReadTriangleIndices(size_t offset, VInt indices[3]) {
+void VertexReader::ReadTriangleIndices(size_t offset, v_int indices[3]) {
     for (uint32_t i = 0; i < 3; i++) {
         indices[i] = ReadIndices(offset + i * 16);
     }
-    Transpose16x3(&indices->reg);
+    Transpose16x3((__m512i*)indices);
 }
 
 }; //namespace swr

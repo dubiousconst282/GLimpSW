@@ -64,7 +64,7 @@ static swr::StbImage LoadImage(Model& m, std::string_view name) {
     if (name.empty() || !std::filesystem::exists(fullPath)) {
         return { };
     }
-    return swr::StbImage::Load(fullPath.string());
+    return swr::StbImage::Load(fullPath.string().c_str());
 }
 
 static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {

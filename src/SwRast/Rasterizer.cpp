@@ -31,7 +31,7 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
 
         STAT_TIME_BEGIN(Setup);
 
-        for (; pos < count && !batch.IsFull(); pos += VFloat::Length) {
+        for (; pos < count && !batch.IsFull(); pos += simd::vec_width) {
             TrianglePacket& tri = batch.Alloc();
 
             // Read vertices and assemble triangles
@@ -56,8 +56,8 @@ void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
                 .Y = (bid / batch.BinsPerRow) * TriangleBatch::BinSize,
             };
             for (uint16_t triangleId : bin) {
-                bt.Triangle = &batch.Triangles[triangleId / VFloat::Length];
-                bt.TriangleIndex = triangleId % VFloat::Length;
+                bt.Triangle = &batch.Triangles[triangleId / simd::vec_width];
+                bt.TriangleIndex = triangleId % simd::vec_width;
                 shader.DrawFn(bt);
             }
             bin.clear();
@@ -89,15 +89,15 @@ void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs)
             uint32_t usedMask = cc.AcceptMask | (cc.NonTrivialMask & (~1u << i));
             uint32_t freeIdx = (uint32_t)std::countr_one(usedMask);
 
-            if (freeIdx < VFloat::Length) {
+            if (freeIdx < simd::vec_width) {
                 _clipper.StoreTriangle(tri, freeIdx, j, numAttribs);
                 cc.AcceptMask |= 1u << freeIdx;
             } else {
-                if (addedTriangles % VFloat::Length == 0) {
+                if (addedTriangles % simd::vec_width == 0) {
                     TrianglePacket& newTri = batch.Alloc();
-                    assert(&newTri == (&tri + i / VFloat::Length + 1));
+                    assert(&newTri == (&tri + i / simd::vec_width + 1));
                 }
-                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % VFloat::Length, j, numAttribs);
+                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % simd::vec_width, j, numAttribs);
                 addedTriangles++;
             }
         }
@@ -113,18 +113,18 @@ void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs)
         BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
     }
 
-    for (uint32_t i = 0; i < addedTriangles; i += VFloat::Length) {
-        uint16_t mask = (1u << std::min(VFloat::Length, addedTriangles - i)) - 1;
-        BinTriangles(batch, *(&tri + i / VFloat::Length + 1), mask, numCustomAttribs);
+    for (uint32_t i = 0; i < addedTriangles; i += simd::vec_width) {
+        uint16_t mask = (1u << std::min(simd::vec_width, addedTriangles - i)) - 1;
+        BinTriangles(batch, *(&tri + i / simd::vec_width + 1), mask, numCustomAttribs);
     }
 }
 
-void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask mask, uint32_t numAttribs) {
+void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, v_mask mask, uint32_t numAttribs) {
     int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
     tris.Setup(width, height, numAttribs);
 
-    mask &= tris.RcpArea > 0.0f;  // backface culling (skip triangles with negative area)
-    mask &= tris.RcpArea < 1.0f;  // skip triangles with zero area
+    // Cull backfacing triangles or with zero area
+    mask &= simd::movemask(tris.RcpArea > 0.0f && tris.RcpArea < 1.0f);
 
     for (uint32_t i : BitIter(mask)) {
         const uint32_t binShift = TriangleBatch::BinSizeLog2;
@@ -144,7 +144,7 @@ void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask 
     STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
 }
 
-static std::array<VInt, 3> LoadFixedPos(const TrianglePacket& tri, uint32_t axis, float scale) {
+static std::array<v_int, 3> LoadFixedPos(const TrianglePacket& tri, uint32_t axis, float scale) {
     return {
         simd::round2i(*(&tri.Vertices[0].Position.x + axis) * scale),
         simd::round2i(*(&tri.Vertices[1].Position.x + axis) * scale),
@@ -152,25 +152,23 @@ static std::array<VInt, 3> LoadFixedPos(const TrianglePacket& tri, uint32_t axis
     };
 };
 
-static VInt ComputeMinBB(VInt a, VInt b, VInt c, int32_t vpSize) {
-    VInt r = simd::min(simd::min(a, b), c);
+static v_int ComputeMinBB(v_int a, v_int b, v_int c, int32_t vpSize) {
+    v_int r = simd::min(simd::min(a, b), c);
     r = (r + 15) >> 4;                                        // round up to int
     r = r & ~(int32_t)Framebuffer::TileMask;                  // align min bb coords to tile boundary
     r = simd::min(simd::max(r + vpSize, 0), vpSize * 2 - 4);  // translate to 0,0 origin and clamp to vp size
     return r;
 }
-static VInt ComputeMaxBB(VInt a, VInt b, VInt c, int32_t vpSize) {
-    VInt r = simd::max(simd::max(a, b), c);
+static v_int ComputeMaxBB(v_int a, v_int b, v_int c, int32_t vpSize) {
+    v_int r = simd::max(simd::max(a, b), c);
     r = (r + 15) >> 4;                                        // round up to int
     r = simd::min(simd::max(r + vpSize, 0), vpSize * 2 - 4);  // translate to 0,0 origin and clamp to vp size
     return r;
 }
 
-static VInt ComputeEdge(VInt a, VInt x, VInt b, VInt y) {
-    VInt w = a * x + b * y;
-    // Add top-left rule bias (I don't even know if this is doing anything tbh)
-    //  w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1
-    w += simd::csel(a > 0 | (a == 0 & b > 0), 0, VInt(-1));
+static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
+    v_int w = a * x + b * y;
+    w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1; // Top-left rule bias
     return w >> 4;
 }
 
@@ -181,7 +179,7 @@ static VInt ComputeEdge(VInt a, VInt x, VInt b, VInt y) {
 void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttribs) {
     // Perspective division
     for (uint32_t i = 0; i < 3; i++) {
-        VFloat4& pos = Vertices[i].Position;
+        v_float4& pos = Vertices[i].Position;
         pos = simd::PerspectiveDiv(pos);
     }
 
@@ -210,7 +208,7 @@ void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttrib
     for (uint32_t i = 0; i <= numAttribs; i++) {
         int32_t j = i < numAttribs ? (int32_t)i : VaryingBuffer::AttribZ;
 
-        VFloat v0 = Vertices[0].Attribs[j];
+        v_float v0 = Vertices[0].Attribs[j];
         Vertices[1].Attribs[j] -= v0;
         Vertices[2].Attribs[j] -= v0;
     }

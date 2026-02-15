@@ -4,7 +4,6 @@
 
 #include <concepts>
 #include <functional>
-#include <string_view>
 #include <cstring>
 
 namespace swr {
@@ -17,88 +16,124 @@ concept IsAnyOf = (std::same_as<T, U> || ...);
 // Represents a SIMD pixel packet in storage form, where the unpacked form consists of floats.
 // NOTE: Packed size is currently restricted to 32-bits as that's the only element size texture sampling supports gathering.
 template<typename T>
-concept Texel = requires(const T& s, const T::UnpackedTy& u) {
-    IsAnyOf<typename T::UnpackedTy, VInt, VFloat, VFloat2, VFloat3, VFloat4>;
-    IsAnyOf<typename T::LerpedTy, VInt, typename T::UnpackedTy>;
-    { s.Unpack() } -> std::same_as<typename T::UnpackedTy>;
-    { T::Pack(u) } -> std::same_as<T>;
+concept Texel = requires(const T& s, const T::UnpackedTy& u, v_int p) {
+    IsAnyOf<typename T::UnpackedTy, v_int, v_float, v_float2, v_float3, v_float4>;
+    IsAnyOf<typename T::LerpedTy, v_int, typename T::UnpackedTy>;
+    { T::Unpack(p) } -> std::same_as<typename T::UnpackedTy>;
+    { T::Pack(u) } -> std::same_as<v_int>;
 };
 
 // RGBA x 8-bit unorm
 struct RGBA8u {
-    using UnpackedTy = VFloat4;
-    using LerpedTy = VInt;
+    using UnpackedTy = v_float4;
+    using LerpedTy = v_int;
 
-    VInt Packed;
+    static v_float4 Unpack(v_int packed) {
+        const float scale = 1.0f / 255;
+        return {
+            simd::conv2f((packed >> 0) & 255) * scale,
+            simd::conv2f((packed >> 8) & 255) * scale,
+            simd::conv2f((packed >> 16) & 255) * scale,
+            simd::conv2f((packed >> 24) & 255) * scale,
+        };
+    }
+    static v_int Pack(const v_float4& value) {
+        auto ri = simd::round2i(value.x * 255.0f);
+        auto gi = simd::round2i(value.y * 255.0f);
+        auto bi = simd::round2i(value.z * 255.0f);
+        auto ai = simd::round2i(value.w * 255.0f);
 
-    VFloat4 Unpack() const { return simd::UnpackRGBA(Packed); }
-    static RGBA8u Pack(const VFloat4& value) { return { simd::PackRGBA(value) }; }
+        auto rg = _mm512_packs_epi32(ri, gi);
+        auto ba = _mm512_packs_epi32(bi, ai);
+        auto cb = _mm512_packus_epi16(rg, ba);
+
+        const auto shuffMask = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        return _mm512_shuffle_epi8(cb, _mm512_broadcast_i32x4(shuffMask));
+    }
+};
+
+// RGB x 10-bit unorm + unused x 2-bit
+struct RGB10u {
+    using UnpackedTy = v_float3;
+    using LerpedTy = UnpackedTy;
+
+    static v_float3 Unpack(v_int packed) {
+        const float scale = 1.0f / 1023;
+        return {
+            simd::conv2f(packed >> 22 & 1023) * scale,
+            simd::conv2f(packed >> 12 & 1023) * scale,
+            simd::conv2f(packed >> 2 & 1023) * scale,
+        };
+    }
+    static v_int Pack(const v_float3& value) {
+        v_int ri = simd::round2i(value.x * 1023.0f);
+        v_int gi = simd::round2i(value.y * 1023.0f);
+        v_int bi = simd::round2i(value.z * 1023.0f);
+
+        ri = simd::min(simd::max(ri, 0), 1023);
+        gi = simd::min(simd::max(gi, 0), 1023);
+        bi = simd::min(simd::max(bi, 0), 1023);
+
+        return ri << 22 | gi << 12 | bi << 2;
+    }
 };
 
 // R x 32-bit float
 struct R32f {
-    using UnpackedTy = VFloat;
+    using UnpackedTy = v_float;
     using LerpedTy = UnpackedTy;
 
-    VFloat Packed;
-
-    VFloat Unpack() const { return Packed; }
-    static R32f Pack(const VFloat& value) { return { value }; }
+    static v_float Unpack(v_int packed) { return simd::re2f(packed); }
+    static v_int Pack(const v_float& value) { return simd::re2i(value); }
 };
 
 // RG x 16-bit float
 struct RG16f {
-    using UnpackedTy = VFloat2;
+    using UnpackedTy = v_float2;
     using LerpedTy = UnpackedTy;
 
-    VInt Packed;
-
-    UnpackedTy Unpack() const {
+    static v_float2 Unpack(v_int packed) {
         return {
-            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(Packed)),
-            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(Packed >> 16)),
+            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed)),
+            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed >> 16)),
         };
     }
-    static RG16f Pack(const UnpackedTy& value) {
-        VInt r = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        VInt g = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        return { r | (g << 16) };
+    static v_int Pack(const v_float2& value) {
+        v_int r = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        v_int g = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        return r | (g << 16);
     }
 };
 
 // RG x 11-bit float, B x 10-bit float
 struct R11G11B10f {
-    using UnpackedTy = VFloat3;
+    using UnpackedTy = v_float3;
     using LerpedTy = UnpackedTy;
 
-    VInt Packed;
-
-    UnpackedTy Unpack() const {
+    static v_float3 Unpack(v_int packed) {
         return {
-            UnpackF11(Packed >> 21),
-            UnpackF11(Packed >> 10),
-            UnpackF10(Packed >> 0),
+            UnpackF11(packed >> 21),
+            UnpackF11(packed >> 10),
+            UnpackF10(packed >> 0),
         };
     }
-    static R11G11B10f Pack(const UnpackedTy& value) {
-        return {
+    static v_int Pack(const v_float3& value) {
+        return
             PackF11(value.x) << 21 |
             PackF11(value.y) << 10 |
-            PackF10(value.z),
-        };
+            PackF10(value.z);
     }
-
 private:
     // https://learn.microsoft.com/en-us/windows/win32/direct3d11/floating-point-rules#11-bit-and-10-bit-floating-point-rules
     // Note that these don't follow denorm/NaN/Inf rules. Only clamping is applied.
     // This code was based on clang's output for the scalar version, as it doesn't seem to optimize the SIMD version well.
-    static VInt PackF11(VFloat x) {
+    static v_int PackF11(v_float x) {
         x = simd::max(x, 1.0f / (1 << 15));
         x = simd::min(x, 130048.0f); // UnpackF11(2047)
 
         return (simd::re2i(x) >> 17 & 0x3FFF) - 0x1C00;
     }
-    static VInt PackF10(VFloat x) {
+    static v_int PackF10(v_float x) {
         x = simd::max(x, 1.0f / (1 << 15));
         x = simd::min(x, 129024.0f);  // UnpackF10(1023)
 
@@ -106,7 +141,7 @@ private:
     }
 
     // 5-bit exp, 6-bit mantissa
-    static VFloat UnpackF11(VInt x) {
+    static v_float UnpackF11(v_int x) {
         // int exp = (x >> 6) & 0x1F;
         // int frc = x & 0x3F;
         // return (exp - 15 + 127) << 23 | frc << (23 - 6);
@@ -115,7 +150,7 @@ private:
         return simd::re2f((x & 0x0FFE0000) + 0x38000000);
     }
     // 5-bit exp, 5-bit mantissa
-    static VFloat UnpackF10(VInt x) {
+    static v_float UnpackF10(v_int x) {
         x = x << 18;
         return simd::re2f((x & 0x0FFC0000) + 0x38000000);
     }
@@ -153,73 +188,72 @@ struct StbImage {
     PixelType Type;
     std::unique_ptr<uint8_t[], void(*)(void*)> Data = { nullptr, &free };
 
-    static StbImage Load(std::string_view path, PixelType type = PixelType::RGBA_U8);
+    static StbImage Load(const char* path, PixelType type = PixelType::RGBA_U8);
 };
 
 namespace texutil {
 
-RgbaTexture2D LoadImage(std::string_view path, uint32_t mipLevels = 8);
+RgbaTexture2D LoadImage(const char* path, uint32_t mipLevels = 8);
 
-HdrTexture2D LoadImageHDR(std::string_view path, uint32_t mipLevels = 8);
+HdrTexture2D LoadImageHDR(const char* path, uint32_t mipLevels = 8);
 
 // Loads a equirectangular panorama into a cubemap.
-HdrTexture2D LoadCubemapFromPanoramaHDR(std::string_view path, uint32_t mipLevels = 8);
+HdrTexture2D LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
 
 // Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
-inline void IterateTiles(uint32_t width, uint32_t height, std::function<void(uint32_t, uint32_t, VFloat, VFloat)> visitor) {
+inline void IterateTiles(uint32_t width, uint32_t height, std::function<void(uint32_t, uint32_t, v_float, v_float)> visitor) {
     assert(width % 4 == 0 && height % 4 == 0);
 
     for (int32_t y = 0; y < height; y += 4) {
         for (int32_t x = 0; x < width; x += 4) {
-            VFloat u = simd::conv2f(x + FragPixelOffsetsX) + 0.5f;
-            VFloat v = simd::conv2f(y + FragPixelOffsetsY) + 0.5f;
+            v_float u = simd::conv2f(x + simd::FragPixelOffsetsX) + 0.5f;
+            v_float v = simd::conv2f(y + simd::FragPixelOffsetsY) + 0.5f;
             visitor((uint32_t)x, (uint32_t)y, u * (1.0f / width), v * (1.0f / height));
         }
     }
 }
 
 // Calculates mip-level for a 4x4 fragment using the partial derivatives of the given scaled UVs.
-inline VInt CalcMipLevel(VFloat scaledU, VFloat scaledV) {
-    VFloat dxu = simd::dFdx(scaledU), dyu = simd::dFdy(scaledU);
-    VFloat dxv = simd::dFdx(scaledV), dyv = simd::dFdy(scaledV);
+inline v_int CalcMipLevel(v_float scaledU, v_float scaledV) {
+    v_float dxu = simd::dFdx(scaledU), dyu = simd::dFdy(scaledU);
+    v_float dxv = simd::dFdx(scaledV), dyv = simd::dFdy(scaledV);
 
-    VFloat maxDeltaSq = simd::max(simd::fma(dxu, dxu, dxv * dxv), simd::fma(dyu, dyu, dyv * dyv));
+    v_float maxDeltaSq = simd::max(simd::fma(dxu, dxu, dxv * dxv), simd::fma(dyu, dyu, dyv * dyv));
     return simd::ilog2(maxDeltaSq) >> 1;
     // return simd::approx_log2(maxDeltaSq) * 0.5f;
 }
 
 // Projects the given direction vector (may be unnormalized) to cubemap face UV and layer.
 // This produces slightly different results from other graphics APIs, UVs are not flipped depending on faces.
-inline void ProjectCubemap(VFloat3 dir, VFloat& u, VFloat& v, VInt& faceIdx) {
+inline void ProjectCubemap(v_float3 dir, v_float& u, v_float& v, v_int& faceIdx) {
     // https://gamedev.stackexchange.com/a/183463
     // https://en.wikipedia.org/wiki/Cube_mapping#Memory_addressing
     // Find axis with max magnitude
-    VFloat w = dir.x;
+    v_float w = dir.x;
 
-    VMask wy = simd::abs(dir.y) > simd::abs(w);
-    w = simd::csel(wy, dir.y, w);
+    v_int wy = simd::abs(dir.y) > simd::abs(w);
+    w = wy ? dir.y : w;
 
-    VMask wz = simd::abs(dir.z) > simd::abs(w);
-    w = simd::csel(wz, dir.z, w);
+    v_int wz = simd::abs(dir.z) > simd::abs(w);
+    w = wz ? dir.z : w;
 
-    VMask wx = wy | wz;  // negated
+    v_int wx = wy | wz;  // negated
     wy &= ~wz;
 
-    // faceIdx = wz ? 4 : (wy ? 2 : 0)
-    faceIdx = simd::csel(wz, 4, simd::csel(wy, VInt(2), 0));
+    faceIdx = wz ? 4 : (wy ? 2 : 0);
     // faceIdx += w < 0 ? 1 : 0
     faceIdx += simd::shrl(simd::re2i(w), 31);
 
     // uv = { x: zy,  y: xz,  z: xy }[w]
     w = simd::rcp14(simd::abs(w)) * 0.5f;
-    u = simd::csel(wx, dir.x, dir.z) * w + 0.5f;
-    v = simd::csel(wy, dir.z, dir.y) * w + 0.5f;
+    u = (wx ? dir.x : dir.z) * w + 0.5f;
+    v = (wy ? dir.z : dir.y) * w + 0.5f;
 }
 
 // Unprojects the given cubemap face index and UVs to a normalized direction vector.
-inline VFloat3 UnprojectCubemap(VFloat u, VFloat v, VInt faceIdx) {
-    VFloat w = 1.0f | simd::re2f(faceIdx << 31);  //(faceIdx & 1) ? -1.0 : +1.0
-    VInt axis = faceIdx >> 1;
+inline v_float3 UnprojectCubemap(v_float u, v_float v, v_int faceIdx) {
+    v_float w = simd::re2f((faceIdx << 31) | 0x3F800000);  //(faceIdx & 1) ? -1.0 : +1.0
+    v_int axis = faceIdx >> 1;
 
     u = u * 2.0f - 1.0f;
     v = v * 2.0f - 1.0f;
@@ -230,16 +264,16 @@ inline VFloat3 UnprojectCubemap(VFloat u, VFloat v, VInt faceIdx) {
     // 3:  u, -1,  v
     // 4:  u,  v,  1
     // 5:  u,  v, -1
-    VFloat3 unnormDir = {
-        simd::csel(axis == 0, w, u),
-        simd::csel(axis == 1, w, v),
-        simd::csel(axis == 2, w, simd::csel(axis == 0, u, v)),
+    v_float3 unnormDir = {
+        axis == 0 ? w : u,
+        axis == 1 ? w : v,
+        axis == 2 ? w : (axis == 0 ? u : v),
     };
     return unnormDir * simd::rsqrt14(u * u + v * v + 1.0f);
 }
 
 // Lookups the adjacent cube face and UVs to the nearest edge.
-inline void GetAdjacentCubeFace(VInt& faceIdx, VInt& u, VInt& v, VInt scaleU, VInt scaleV) {
+inline void GetAdjacentCubeFace(v_int& faceIdx, v_int& u, v_int& v, v_int scaleU, v_int scaleV) {
     static const uint8_t AdjFaceLUT[4][8] = {
         { 0x1b, 0x0b, 0x25, 0x05, 0x23, 0x03 },  //
         { 0x0a, 0x1a, 0x04, 0x24, 0x02, 0x22 },  //
@@ -253,22 +287,22 @@ inline void GetAdjacentCubeFace(VInt& faceIdx, VInt& u, VInt& v, VInt scaleU, VI
     // if (data & (1 << 4)) u = 1 - u;
     // if (data & (1 << 5)) v = 1 - v;
 
-    VInt cu = (scaleU >> 1) - u, cv = (scaleV >> 1) - v;
-    VInt quadIdx = simd::csel(simd::abs(cu) > simd::abs(cv), simd::shrl(cu, 31) + 2, simd::shrl(cv, 31));
-    VInt tableIdx = quadIdx * 8 + faceIdx;
+    v_int cu = (scaleU >> 1) - u, cv = (scaleV >> 1) - v;
+    v_int quadIdx = simd::abs(cu) > simd::abs(cv) ? simd::shrl(cu, 31) + 2 : simd::shrl(cv, 31);
+    v_int tableIdx = quadIdx * 8 + faceIdx;
 
-    VInt data = _mm512_permutexvar_epi8(tableIdx, _mm512_broadcast_i32x8(_mm256_loadu_epi8(AdjFaceLUT)));
+    v_int data = _mm512_permutexvar_epi8(tableIdx, _mm512_broadcast_i32x8(_mm256_loadu_epi8(AdjFaceLUT)));
 
     faceIdx = data & 7;
 
-    VMask swap = (data >> 3 & 1) != 0;
-    VMask invU = (data >> 4 & 1) != 0;
-    VMask invV = (data >> 5 & 1) != 0;
+    v_int swap = (data >> 3 & 1) != 0;
+    v_int invU = (data >> 4 & 1) != 0;
+    v_int invV = (data >> 5 & 1) != 0;
 
-    VInt su = simd::csel(swap, v, u);
-    VInt sv = simd::csel(swap, u, v);
-    u = simd::csel(invU, scaleU - su, su);
-    v = simd::csel(invV, scaleV - sv, sv);
+    v_int su = swap ? v : u;
+    v_int sv = swap ? u : v;
+    u = invU ? scaleU - su : su;
+    v = invV ? scaleV - sv : sv;
 }
 
 // Texture swizzling doesn't improve performance by much, the functions below are keept for reference.
@@ -276,7 +310,7 @@ inline void GetAdjacentCubeFace(VInt& faceIdx, VInt& u, VInt& v, VInt scaleU, VI
 // 32-bit Z-curve/morton encode. Takes ~8.5 cycles per 16 coord pairs on TigerLake, according to llvm-mca.
 // - https://lemire.me/blog/2018/01/09/how-fast-can-you-bit-interleave-32-bit-integers-simd-edition/
 // - https://github.com/KWillets/simd_interleave/blob/master/simd.c
-inline VInt Interleave(VInt x, VInt y) {
+inline v_int Interleave(v_int x, v_int y) {
     const __m512i m0 = _mm512_broadcast_i32x4(_mm_set_epi8(85, 84, 81, 80, 69, 68, 65, 64, 21, 20, 17, 16, 5, 4, 1, 0));
     const __m512i m1 = _mm512_slli_epi64(m0, 1);
     const __m512i bm = _mm512_set_epi8(125, 61, 124, 60, 121, 57, 120, 56, 117, 53, 116, 52, 113, 49, 112, 48, 109, 45, 108, 44, 105, 41,
@@ -293,9 +327,9 @@ inline VInt Interleave(VInt x, VInt y) {
 
     return _mm512_permutex2var_epi8(lo, bm, hi);
 }
-inline VInt GetTiledOffset(VInt ix, VInt iy, VInt rowShift) {
-    VInt tileId = (ix >> 2) + ((iy >> 2) << (rowShift - 2));
-    VInt pixelOffset = (ix & 3) + (iy & 3) * 4;
+inline v_int GetTiledOffset(v_int ix, v_int iy, v_int rowShift) {
+    v_int tileId = (ix >> 2) + ((iy >> 2) << (rowShift - 2));
+    v_int pixelOffset = (ix & 3) + (iy & 3) * 4;
     return tileId * 16 + pixelOffset;
 }
 
@@ -314,8 +348,6 @@ struct SamplerDesc {
 
 template<pixfmt::Texel Texel>
 struct Texture2D {
-    static_assert(sizeof(Texel) == sizeof(VInt));
-
     static const int LerpFracBits = 8;  // Number of fractional bits in pixel coords for bilinear interpolation
     static const int LerpFracMask = (1 << LerpFracBits) - 1;
 
@@ -336,7 +368,7 @@ struct Texture2D {
         MipLevels = 0;
         uint32_t layerSize = 0;
 
-        for (; MipLevels < std::min(mipLevels, VInt::Length); MipLevels++) {
+        for (; MipLevels < std::min(mipLevels, simd::vec_width); MipLevels++) {
             uint32_t i = MipLevels;
             if ((Width >> i) < 4 || (Height >> i) < 4) break;
 
@@ -375,7 +407,7 @@ struct Texture2D {
     }
 
     // Writes a 4x4 tile of texels to the texture buffer. Coords are in pixel space.
-    void WriteTile(Texel value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
+    void WriteTile(v_int value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
         assert(x + 3 < Width && y + 3 < Height);
         assert(x % 4 == 0 && y % 4 == 0);
         assert(layer < NumLayers && mipLevel < MipLevels);
@@ -383,11 +415,10 @@ struct Texture2D {
         uint32_t* dst = &Data[(layer << LayerShift) + (uint32_t)_mipOffsets[mipLevel]];
         uint32_t stride = RowShift - mipLevel;
 
-        __m512i packed = value.Packed;
-        _mm_storeu_epi32(&dst[x + ((y + 0) << stride)], _mm512_extracti32x4_epi32(packed, 0));
-        _mm_storeu_epi32(&dst[x + ((y + 1) << stride)], _mm512_extracti32x4_epi32(packed, 1));
-        _mm_storeu_epi32(&dst[x + ((y + 2) << stride)], _mm512_extracti32x4_epi32(packed, 2));
-        _mm_storeu_epi32(&dst[x + ((y + 3) << stride)], _mm512_extracti32x4_epi32(packed, 3));
+        _mm_storeu_epi32(&dst[x + ((y + 0) << stride)], _mm512_extracti32x4_epi32(value, 0));
+        _mm_storeu_epi32(&dst[x + ((y + 1) << stride)], _mm512_extracti32x4_epi32(value, 1));
+        _mm_storeu_epi32(&dst[x + ((y + 2) << stride)], _mm512_extracti32x4_epi32(value, 2));
+        _mm_storeu_epi32(&dst[x + ((y + 3) << stride)], _mm512_extracti32x4_epi32(value, 3));
     }
 
     void GenerateMips() {
@@ -398,15 +429,13 @@ struct Texture2D {
         }
     }
 
-    // Sample() functions are almost always called from very register-pressured places, and so
-    // there will be massive spills across the call boundaries if they're not inlined...
-    // Not sure if it's a good idea to always_inline everything (instr cache clobbering and such) but let's do it for now...
+    // We're forcing always_inline everywhere because it helps avoid register spills across call boundaries.
 
     template<SamplerDesc SD, bool CalcMipFromUVDerivs_ = true, bool IsCubeSample_ = false>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy Sample(VFloat u, VFloat v, VInt layer = 0, VInt mipLevel = 0) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy Sample(v_float u, v_float v, v_int layer = 0, v_int mipLevel = 0) const {
         // Scale and round UVs 
-        VFloat su = u * _scaleLerpU, sv = v * _scaleLerpV;
-        VInt ix = simd::round2i(su), iy = simd::round2i(sv);
+        v_float su = u * _scaleLerpU, sv = v * _scaleLerpV;
+        v_int ix = simd::round2i(su), iy = simd::round2i(sv);
 
         // Wrap
         if constexpr (SD.Wrap == WrapMode::ClampToEdge || IsCubeSample_) {
@@ -427,8 +456,8 @@ struct Texture2D {
         mipLevel = SD.EnableMips ? simd::min(simd::max(mipLevel, 0), (int32_t)MipLevels - 1) : 0;
         
         // Calculate offsets and mip position
-        VInt stride = (int32_t)RowShift;
-        VInt offset = layer << LayerShift;
+        v_int stride = (int32_t)RowShift;
+        v_int offset = layer << LayerShift;
 
         if (simd::any(mipLevel > 0)) {
             ix = ix >> mipLevel;
@@ -441,19 +470,19 @@ struct Texture2D {
         if (filter == FilterMode::Nearest) [[likely]] {
             ix = ix >> LerpFracBits;
             iy = iy >> LerpFracBits;
-            Texel res = GatherTexels<Texel>(offset + ix + (iy << stride));
+            v_int res = GatherRawTexels(offset + ix + (iy << stride));
 
-            if constexpr (std::is_same<typename Texel::LerpedTy, VInt>()) {
-                return res.Packed;
+            if constexpr (std::is_same<typename Texel::LerpedTy, v_int>()) {
+                return res;
             } else {
-                return res.Unpack();
+                return Texel::Unpack(res);
             }
         }
         if constexpr (IsCubeSample_) {
             //    x < 1 || x >= N
             // =  (x-1) >= (N-1)     given twos-complement + unsigned cmp
-            VMask edgeU = _mm512_cmpge_epu32_mask((ix >> LerpFracBits) - 1, (_maskU >> mipLevel) - 1);
-            VMask edgeV = _mm512_cmpge_epu32_mask((iy >> LerpFracBits) - 1, (_maskV >> mipLevel) - 1);
+            v_mask edgeU = _mm512_cmpge_epu32_mask((ix >> LerpFracBits) - 1, (_maskU >> mipLevel) - 1);
+            v_mask edgeV = _mm512_cmpge_epu32_mask((iy >> LerpFracBits) - 1, (_maskV >> mipLevel) - 1);
 
             if (simd::any(edgeU | edgeV)) [[unlikely]] {
                 return SampleLinearNearCubeEdge(ix, iy, offset, stride, mipLevel, layer);
@@ -463,19 +492,19 @@ struct Texture2D {
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleCube(const VFloat3& dir, VFloat mipLevel = -1.0f) const {
-        VFloat u, v;
-        VInt faceIdx;
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleCube(const v_float3& dir, v_float mipLevel = -1.0f) const {
+        v_float u, v;
+        v_int faceIdx;
         texutil::ProjectCubemap(dir, u, v, faceIdx);
 
         int tmp = mipLevel[0];  // __builtin_constant_p() only works with variables - https://github.com/llvm/llvm-project/issues/65741
         if (__builtin_constant_p(tmp) && tmp < 0) {
             return Sample<SD, true, true>(u, v, faceIdx);
         }
-        VInt baseMip = simd::trunc2i(mipLevel);
+        v_int baseMip = simd::trunc2i(mipLevel);
         auto baseSample = Sample<SD, false, true>(u, v, faceIdx, baseMip);
 
-        VFloat mipFrac = mipLevel - simd::conv2f(baseMip);
+        v_float mipFrac = mipLevel - simd::conv2f(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
             auto lowerSample = Sample<SD, false, true>(u, v, faceIdx, baseMip + 1);
             return baseSample + (lowerSample - baseSample) * mipFrac;
@@ -484,60 +513,58 @@ struct Texture2D {
     }
 
 private:
-    VInt _mipOffsets;
+    v_int _mipOffsets;
     float _scaleU, _scaleV, _scaleLerpU, _scaleLerpV;
     int32_t _maskU, _maskV, _maskLerpU, _maskLerpV;
 
     // Interpolates texels overlapping the specified pixel coords (in N.LerpFracBits fixed-point). No bounds check.
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleLinear(VInt ixf, VInt iyf, VInt offset, VInt stride, VInt mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleLinear(v_int ixf, v_int iyf, v_int offset, v_int stride, v_int mipLevel) const {
         ixf = simd::max(ixf - (LerpFracMask / 2), 0);
         iyf = simd::max(iyf - (LerpFracMask / 2), 0);
 
-        VInt ix = ixf >> LerpFracBits;
-        VInt iy = iyf >> LerpFracBits;
+        v_int ix = ixf >> LerpFracBits;
+        v_int iy = iyf >> LerpFracBits;
 
-        VInt indices00 = offset + ix + (iy << stride);
-        VInt indices10 = indices00 + simd::csel(((ix + 1) << mipLevel) < (int32_t)Width, VInt(1), 0);
-        VInt rowOffset = simd::csel(((iy + 1) << mipLevel) < (int32_t)Height, VInt(1) << stride, 0);
+        v_int indices00 = offset + ix + (iy << stride);
+        v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)Height ? v_int(1) << stride : 0);
+        v_int clampX = ((ix + 1) << mipLevel) >= (int32_t)Width;
+
+        v_int data00 = GatherRawTexels(indices00);
+        v_int data10 = GatherRawTexels(indices00 + (clampX ? 0 : 1));
+        v_int data01 = GatherRawTexels(indices01);
+        v_int data11 = GatherRawTexels(indices01 + (clampX ? 0 : 1));
 
         if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {
             // 15-bit fraction for mulhrs
-            VInt fx = (ixf & LerpFracMask) << (15 - LerpFracBits);
-            VInt fy = (iyf & LerpFracMask) << (15 - LerpFracBits);
+            v_int fx = (ixf & LerpFracMask) << (15 - LerpFracBits);
+            v_int fy = (iyf & LerpFracMask) << (15 - LerpFracBits);
             fx = (fx << 16) | fx;
             fy = (fy << 16) | fy;
 
             // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
-            // Row 1
-            VInt colors00 = GatherTexels<VInt>(indices00);
-            VInt colors10 = GatherTexels<VInt>(indices10);
-            VInt rbRow1 = simd::lerp16((colors00 >> 0) & 0x00FF00FF, (colors10 >> 0) & 0x00FF00FF, fx);
-            VInt gaRow1 = simd::lerp16((colors00 >> 8) & 0x00FF00FF, (colors10 >> 8) & 0x00FF00FF, fx);
-
-            // Row 2
-            VInt colors01 = GatherTexels<VInt>(indices00 + rowOffset);
-            VInt colors11 = GatherTexels<VInt>(indices10 + rowOffset);
-            VInt rbRow2 = simd::lerp16((colors01 >> 0) & 0x00FF00FF, (colors11 >> 0) & 0x00FF00FF, fx);
-            VInt gaRow2 = simd::lerp16((colors01 >> 8) & 0x00FF00FF, (colors11 >> 8) & 0x00FF00FF, fx);
+            v_int rbRow1 = simd::lerp16((data00 >> 0) & 0x00FF00FF, (data10 >> 0) & 0x00FF00FF, fx);
+            v_int gaRow1 = simd::lerp16((data00 >> 8) & 0x00FF00FF, (data10 >> 8) & 0x00FF00FF, fx);
+            v_int rbRow2 = simd::lerp16((data01 >> 0) & 0x00FF00FF, (data11 >> 0) & 0x00FF00FF, fx);
+            v_int gaRow2 = simd::lerp16((data01 >> 8) & 0x00FF00FF, (data11 >> 8) & 0x00FF00FF, fx);
 
             // Columns
-            VInt rbCol = simd::lerp16(rbRow1, rbRow2, fy);
-            VInt gaCol = simd::lerp16(gaRow1, gaRow2, fy);
+            v_int rbCol = simd::lerp16(rbRow1, rbRow2, fy);
+            v_int gaCol = simd::lerp16(gaRow1, gaRow2, fy);
 
             return rbCol | (gaCol << 8);
         } else {
             using R = Texel::UnpackedTy;
 
             const float fracScale = 1.0f / (LerpFracMask + 1);
-            VFloat fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
-            VFloat fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
+            v_float fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
+            v_float fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
 
-            R colors00 = GatherTexels<Texel>(indices00).Unpack();
-            R colors10 = GatherTexels<Texel>(indices10).Unpack();
+            R colors00 = Texel::Unpack(data00);
+            R colors10 = Texel::Unpack(data10);
             R rowA = colors00 + (colors10 - colors00) * fx;
 
-            R colors01 = GatherTexels<Texel>(indices00 + rowOffset).Unpack();
-            R colors11 = GatherTexels<Texel>(indices10 + rowOffset).Unpack();
+            R colors01 = Texel::Unpack(data01);
+            R colors11 = Texel::Unpack(data11);
             R rowB = colors01 + (colors11 - colors01) * fx;
 
             return rowA + (rowB - rowA) * fy;
@@ -545,18 +572,18 @@ private:
     }
 
     // Interpolates texels overlapping the specified pixel coords near cubemap face edge (in N.LerpFracBits fixed-point). No bounds check.
-    [[gnu::pure, gnu::noinline]] Texel::LerpedTy SampleLinearNearCubeEdge(VInt ixf, VInt iyf, VInt offset, VInt stride, VInt mipLevel, VInt faceIdx) const {
+    [[gnu::pure, gnu::noinline]] Texel::LerpedTy SampleLinearNearCubeEdge(v_int ixf, v_int iyf, v_int offset, v_int stride, v_int mipLevel, v_int faceIdx) const {
         using R = Texel::UnpackedTy;
         
         ixf = ixf - (LerpFracMask / 2);
         iyf = iyf - (LerpFracMask / 2);
 
-        VInt ix = ixf >> LerpFracBits;
-        VInt iy = iyf >> LerpFracBits;
+        v_int ix = ixf >> LerpFracBits;
+        v_int iy = iyf >> LerpFracBits;
 
         const float fracScale = 1.0f / (LerpFracMask + 1);
-        VFloat fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
-        VFloat fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
+        v_float fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
+        v_float fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
 
         R colors00 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 0, iy + 0);
         R colors10 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 1, iy + 0);
@@ -569,29 +596,27 @@ private:
         return rowA + (rowB - rowA) * fy;
     }
 
-    template<typename T>
-    T GatherTexels(VInt indices) const {
-        VInt v = VInt::gather<4>(Data.get(), indices);
-        return std::bit_cast<T>(v);
+    v_int GatherRawTexels(v_int indices) const {
+        return simd::gather((const int32_t*)Data.get(), indices);
     }
-    Texel::UnpackedTy GatherTexels(int32_t offset, uint32_t stride, VInt ix, VInt iy) const {
-        return GatherTexels<Texel>(offset + ix + (iy << stride)).Unpack();
+    Texel::UnpackedTy GatherTexels(int32_t offset, uint32_t stride, v_int ix, v_int iy) const {
+        return Texel::Unpack(GatherRawTexels(offset + ix + (iy << stride)));
     }
-    Texel::UnpackedTy GatherTexelsNearCubeEdge(VInt offset, VInt stride, VInt mipLevel, VInt faceIdx, VInt ix, VInt iy) const {
-        VInt scaleU = _maskU >> mipLevel, scaleV = _maskV >> mipLevel;
-        VMask fallMask = (ix & scaleU) != ix | (iy & scaleV) != iy;
+    Texel::UnpackedTy GatherTexelsNearCubeEdge(v_int offset, v_int stride, v_int mipLevel, v_int faceIdx, v_int ix, v_int iy) const {
+        v_int scaleU = _maskU >> mipLevel, scaleV = _maskV >> mipLevel;
+        v_int fallMask = (ix & scaleU) != ix || (iy & scaleV) != iy;
 
         if (simd::any(fallMask)) {
-            VInt adjFace = faceIdx, adjX = ix, adjY = iy;
+            v_int adjFace = faceIdx, adjX = ix, adjY = iy;
             texutil::GetAdjacentCubeFace(adjFace, adjX, adjY, scaleU, scaleV);
 
-            ix = simd::csel(fallMask, adjX, ix);
-            iy = simd::csel(fallMask, adjY, iy);
+            ix = fallMask ? adjX : ix;
+            iy = fallMask ? adjY : iy;
             ix = simd::min(simd::max(ix, 0), scaleU);
             iy = simd::min(simd::max(iy, 0), scaleV);
-            offset += simd::csel(fallMask, (adjFace - faceIdx) << LayerShift, 0);
+            offset += fallMask ? ((adjFace - faceIdx) << LayerShift) : 0;
         }
-        return GatherTexels<Texel>(offset + ix + (iy << stride)).Unpack();
+        return Texel::Unpack(GatherRawTexels(offset + ix + (iy << stride)));
     }
 
     void GenerateMip(uint32_t level, uint32_t layer) {
@@ -601,8 +626,8 @@ private:
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
-                VInt ix = ((int32_t)x + FragPixelOffsetsX) << 1;
-                VInt iy = ((int32_t)y + FragPixelOffsetsY) << 1;
+                v_int ix = ((int32_t)x + simd::FragPixelOffsetsX) << 1;
+                v_int iy = ((int32_t)y + simd::FragPixelOffsetsY) << 1;
 
                 // This will never go out of bounds if texture size is POT and >4x4.
                 // Storage is padded by +16*4 bytes so nothing bad should happen if we do.

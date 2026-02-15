@@ -10,14 +10,9 @@
 
 namespace swr {
 
-// Pixel offsets within a 4x4 tile/fragment
-//   X: [0,1,2,3, 0,1,2,3, ...]
-//   Y: [0,0,0,0, 1,1,1,1, ...]
-inline const VInt FragPixelOffsetsX = VInt::ramp() & 3, FragPixelOffsetsY = VInt::ramp() >> 2;
-
 struct Framebuffer {
-    //Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
-    static const uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
+    // Data is stored in tiles of 4x4 so that rasterizer writes are cheap.
+    static constexpr uint32_t TileSize = 4, TileShift = 2, TileMask = TileSize - 1, TileNumPixels = TileSize * TileSize;
 
     uint32_t Width, Height, TileStride;
     uint32_t AttachmentStride, NumAttachments;
@@ -53,13 +48,13 @@ struct Framebuffer {
         uint32_t pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
         return tileId * TileNumPixels + pixelOffset;
     }
-    VInt GetPixelOffset(VInt x, VInt y) const {
-        VInt tileId = (x >> TileShift) + (y >> TileShift) * (int32_t)TileStride;
-        VInt pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
+    v_int GetPixelOffset(v_int x, v_int y) const {
+        v_int tileId = (x >> TileShift) + (y >> TileShift) * (int32_t)TileStride;
+        v_int pixelOffset = (x & TileMask) + (y & TileMask) * TileSize;
         return tileId * TileNumPixels + pixelOffset;
     }
 
-    void WriteTile(uint32_t offset, uint16_t mask, VInt color, VFloat depth) {
+    void WriteTile(uint32_t offset, uint16_t mask, v_int color, v_float depth) {
         _mm512_mask_store_epi32(&ColorBuffer[offset], mask, color);
         _mm512_mask_store_ps(&DepthBuffer[offset], mask, depth);
     }
@@ -70,26 +65,26 @@ struct Framebuffer {
         return (T*)&AttachmentBuffer[attachmentId * AttachmentStride] + offset;
     }
 
-    [[gnu::always_inline]] VFloat SampleDepth(VFloat x, VFloat y) const {
-        VInt ix = simd::round2i(x * (int32_t)Width);
-        VInt iy = simd::round2i(y * (int32_t)Height);
+    [[gnu::always_inline]] v_float SampleDepth(v_float x, v_float y) const {
+        v_int ix = simd::round2i(x * (int32_t)Width);
+        v_int iy = simd::round2i(y * (int32_t)Height);
         return SampleDepth(ix, iy);
     }
-    [[gnu::always_inline]] VFloat SampleDepth(VInt ix, VInt iy) const {
+    [[gnu::always_inline]] v_float SampleDepth(v_int ix, v_int iy) const {
         // Twos-complement unsigned compare trick to check for both (x >= 0 && x < N) at once.
-        VInt indices = GetPixelOffset(ix, iy);
-        VMask boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
+        v_int indices = GetPixelOffset(ix, iy);
+        v_mask boundMask = _mm512_cmplt_epu32_mask(ix, v_int((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, v_int((int32_t)Height));
         return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer.get(), 4);
     }
-    [[gnu::always_inline]] VInt SampleColor(VInt ix, VInt iy, VInt defaultColor = 0) const {
+    [[gnu::always_inline]] v_int SampleColor(v_int ix, v_int iy, v_int defaultColor = 0) const {
         // Twos-complement unsigned compare trick to check for both (x >= 0 && x < N) at once.
-        VInt indices = GetPixelOffset(ix, iy);
-        VMask boundMask = _mm512_cmplt_epu32_mask(ix, VInt((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, VInt((int32_t)Height));
+        v_int indices = GetPixelOffset(ix, iy);
+        v_mask boundMask = _mm512_cmplt_epu32_mask(ix, v_int((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, v_int((int32_t)Height));
         return _mm512_mask_i32gather_epi32(defaultColor, boundMask, indices, ColorBuffer.get(), 4);
     }
 
     void GetPixels(uint32_t* dest, uint32_t stride) const;
-    void SaveImage(std::string_view filename) const;
+    void SaveImage(const char* filename) const;
 
 private:
     void FillBuffer(void* ptr, uint32_t value) {
@@ -112,7 +107,7 @@ struct VertexReader {
     uint32_t Count;
 
     IndexFormat IndexFormat;
-    VInt _Indices = 0;    // Vertex indices to be read next
+    v_int _Indices = 0;    // Vertex indices to be read next
 
     // Note that the index buffer should be over-allocated by at least 256 extra bytes, as the rasterizer 
     // may read beyond `count` due to vector alignment.
@@ -133,25 +128,25 @@ struct VertexReader {
         return 0;
     }
 
-    VInt ReadIndices(size_t offset);
+    v_int ReadIndices(size_t offset);
     
     // Reads and de-interleaves indices for 3x16 vertices.
-    void ReadTriangleIndices(size_t offset, VInt indices[3]);
+    void ReadTriangleIndices(size_t offset, v_int indices[3]);
 
-    VFloat ReadAttribF(int offset, int stride) const {
-        return VFloat::gather((float*)&VertexBuffer[offset], _Indices * stride);
+    v_float ReadAttribF(int offset, int stride) const {
+        return simd::gather<1>((float*)&VertexBuffer[offset], _Indices * stride);
     }
-    VInt ReadAttribS32(int offset, int stride) const {
-        return VInt::gather((int32_t*)&VertexBuffer[offset], _Indices * stride);
+    v_int ReadAttribS32(int offset, int stride) const {
+        return simd::gather<1>((int32_t*)&VertexBuffer[offset], _Indices * stride);
     }
 
-    // Reads a vector of float or normalized integer attributes. `T` should be a struct containing only `VFloat` fields.
+    // Reads a vector of float or normalized integer attributes. `T` should be a struct containing only `v_float` fields.
     template<typename T, typename V, typename A>
     T ReadAttribs(A V::*vertexMember) const {
-        static_assert(sizeof(T) % sizeof(VFloat) == 0);
+        static_assert(sizeof(T) % sizeof(v_float) == 0);
 
-        const uint32_t count = sizeof(T) / sizeof(VFloat);
-        VFloat dest[count];
+        const uint32_t count = sizeof(T) / sizeof(v_float);
+        v_float dest[count];
 
         size_t offset = (size_t)&(((V*)0)->*vertexMember);
 
@@ -164,7 +159,7 @@ struct VertexReader {
             } else {
                 // Normalized integer.
                 // Since this is generally used with small types, do a single 32-bit gather and unpack bits manually
-                VInt data = ReadAttribS32(offset + i * 4, sizeof(V));
+                v_int data = ReadAttribS32(offset + i * 4, sizeof(V));
                 uint32_t elemSize = sizeof(A) * 8;
                 bool sign = elemSize != 32 && std::is_signed<A>();
 
@@ -176,18 +171,18 @@ struct VertexReader {
         return *(T*)&dest;
     }
 
-    static VFloat UnpackUNorm(VInt data, uint32_t bitPos, uint32_t bitCount) {
+    static v_float UnpackUNorm(v_int data, uint32_t bitPos, uint32_t bitCount) {
         assert(bitCount != 32);
 
         int32_t mask = (1 << bitCount) - 1;
-        VInt attr = (data >> bitPos) & mask;
+        v_int attr = (data >> bitPos) & mask;
         return simd::conv2f(attr) * (1.0f / mask);
     }
-    static VFloat UnpackSNorm(VInt data, uint32_t bitPos, uint32_t bitCount) {
+    static v_float UnpackSNorm(v_int data, uint32_t bitPos, uint32_t bitCount) {
         assert(bitCount != 32);
 
         int32_t scale = (1 << bitCount) / 2 - 1;
-        VInt attr = (data << (32 - bitCount - bitPos)) >> (32 - bitCount);
+        v_int attr = (data << (32 - bitCount - bitPos)) >> (32 - bitCount);
         return simd::conv2f(attr) * (1.0f / scale);
     }
 };
@@ -195,24 +190,24 @@ struct VertexReader {
 struct ShadedVertexPacket {
     static const uint32_t MaxAttribs = 12;
 
-    VFloat4 Position;
-    VFloat Attribs[MaxAttribs];
+    v_float4 Position;
+    v_float Attribs[MaxAttribs];
 
     template<typename T>
     void SetAttribs(uint32_t attrId, const T& values) {
-        static_assert(sizeof(T) % sizeof(VFloat) == 0);
-        assert(attrId + sizeof(T) / sizeof(VFloat) <= MaxAttribs);
+        static_assert(sizeof(T) % sizeof(v_float) == 0);
+        assert(attrId + sizeof(T) / sizeof(v_float) <= MaxAttribs);
 
         *(T*)&Attribs[attrId] = values;
     }
 };
 
 struct TrianglePacket {
-    VInt MinX, MinY, MaxX, MaxY;
-    VInt Weight0, Weight1, Weight2;
-    VInt A01, A12, A20;
-    VInt B01, B12, B20;
-    VFloat RcpArea;
+    v_int MinX, MinY, MaxX, MaxY;
+    v_int Weight0, Weight1, Weight2;
+    v_int A01, A12, A20;
+    v_int B01, B12, B20;
+    v_float RcpArea;
 
     ShadedVertexPacket Vertices[3];
 
@@ -225,37 +220,37 @@ struct VaryingBuffer {
 
     const float* Attribs;
     uint32_t TileOffset;
-    VMask TileMask;
+    v_mask TileMask;
 
-    VFloat W1, W2;
-    VFloat Depth;
+    v_float W1, W2;
+    v_float Depth;
 
     // Interpolates vertex attributes using the current barycentric weights.
-    VFloat GetSmooth(int32_t attrId) const {
-        VFloat v0 = GetFlat(attrId, 0);
-        VFloat v1 = GetFlat(attrId, 1);
-        VFloat v2 = GetFlat(attrId, 2);
+    v_float GetSmooth(int32_t attrId) const {
+        v_float v0 = GetFlat(attrId, 0);
+        v_float v1 = GetFlat(attrId, 1);
+        v_float v2 = GetFlat(attrId, 2);
         //return v0 * W0 + v1 * W1 + v2 * W2;
         //return v0 + (v1 - v0) * W1 + (v2 - v0) * W2;
         return simd::fma(v1, W1, simd::fma(v2, W2, v0));
     }
     // Returns the value of the specified vertex attribute, without interpolation.
     // If `vertexId != 0`, returns `attr[vertexId] - attr[0]`.
-    VFloat GetFlat(int32_t attrId, uint32_t vertexId = 0) const {
+    v_float GetFlat(int32_t attrId, uint32_t vertexId = 0) const {
         assert(attrId >= -4 && attrId < (int32_t)ShadedVertexPacket::MaxAttribs);
         assert(vertexId >= 0 && vertexId < 3);
 
-        int32_t idx = attrId * (int32_t)VFloat::Length + (int32_t)(vertexId * (sizeof(ShadedVertexPacket) / 4));
+        int32_t idx = attrId * (int32_t)simd::vec_width + (int32_t)(vertexId * (sizeof(ShadedVertexPacket) / 4));
         return Attribs[idx];
     }
 
-    // Interpolates a vector of vertex attributes. `T` should be a struct containing only `VFloat` fields.
+    // Interpolates a vector of vertex attributes. `T` should be a struct containing only `v_float` fields.
     template<typename T>
     T GetSmooth(int32_t attrId) const {
-        static_assert(sizeof(T) % sizeof(VFloat) == 0);
+        static_assert(sizeof(T) % sizeof(v_float) == 0);
 
-        const uint32_t count = sizeof(T) / sizeof(VFloat);
-        VFloat dest[count];
+        const uint32_t count = sizeof(T) / sizeof(v_float);
+        v_float dest[count];
 
         for (uint32_t i = 0; i < count; i++) {
             dest[i] = GetSmooth(attrId + (int32_t)i);
@@ -265,10 +260,10 @@ struct VaryingBuffer {
 
     void ApplyPerspectiveCorrection() {
         // https://stackoverflow.com/a/24460895
-        VFloat v0 = GetFlat(AttribW, 0);
-        VFloat v1 = GetFlat(AttribW, 1);
-        VFloat v2 = GetFlat(AttribW, 2);
-        VFloat vp = simd::rcp14(simd::fma(v1 - v0, W1, simd::fma(v2 - v0, W2, v0)));
+        v_float v0 = GetFlat(AttribW, 0);
+        v_float v1 = GetFlat(AttribW, 1);
+        v_float v2 = GetFlat(AttribW, 2);
+        v_float vp = simd::rcp14(simd::fma(v1 - v0, W1, simd::fma(v2 - v0, W2, v0)));
 
         W1 *= vp * v1;
         W2 *= vp * v2;
@@ -285,11 +280,11 @@ struct Clipper {
         Far = 5,     // Z+
     };
     struct Vertex {
-        float Attribs[(ShadedVertexPacket::MaxAttribs + 4 + VFloat::Length - 1) & ~(VFloat::Length - 1)];
+        float Attribs[(ShadedVertexPacket::MaxAttribs + 4 + simd::vec_width - 1) & ~(simd::vec_width - 1)];
     };
     struct ClipCodes {
-        VMask AcceptMask;       // Triangles that are in-bounds and can be immediately rasterized.
-        VMask NonTrivialMask;   // Triangles that need to be clipped.
+        v_mask AcceptMask;       // Triangles that are in-bounds and can be immediately rasterized.
+        v_mask NonTrivialMask;   // Triangles that need to be clipped.
         uint8_t OutCodes[16];   // Planes that need to be clipped against (per-triangle).
     };
 
@@ -316,7 +311,7 @@ concept ShaderProgram =
     };
 
 struct TriangleBatch {
-    static const uint32_t MaxSize = 4096 / VFloat::Length;
+    static const uint32_t MaxSize = 4096 / simd::vec_width;
     static const uint32_t BinSizeLog2 = 7, BinSize = 1 << BinSizeLog2;
 
     std::unique_ptr<std::vector<uint16_t>[]> Bins;
@@ -342,7 +337,7 @@ struct TriangleBatch {
     void AddBin(uint32_t x, uint32_t y, TrianglePacket& tri, uint32_t index) {
         assert((&tri - Triangles) < MaxSize);
 
-        uint32_t id = (&tri - Triangles) * VFloat::Length + index;
+        uint32_t id = (&tri - Triangles) * simd::vec_width + index;
         Bins[x + y * BinsPerRow].push_back(id);
     }
     bool IsFull() { return Count >= MaxSize - 24; } //Reserve 24*vec triangles for clipping
@@ -367,7 +362,7 @@ class Rasterizer {
     void Draw(VertexReader& vertexData, const ShaderInterface& shader);
 
     void SetupTriangles(TriangleBatch& batch, uint32_t numAttribs);
-    void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, VMask mask, uint32_t numAttribs);
+    void BinTriangles(TriangleBatch& batch, TrianglePacket& tris, v_mask mask, uint32_t numAttribs);
 
     template<ShaderProgram TShader>
     void DrawBinnedTriangle(const TShader& shader, const BinnedTriangle& bin) {
@@ -380,7 +375,7 @@ class Rasterizer {
         uint32_t maxX = std::min((uint32_t)tri.MaxX[i], bin.X + TriangleBatch::BinSize - 4);
         uint32_t maxY = std::min((uint32_t)tri.MaxY[i], bin.Y + TriangleBatch::BinSize - 4);
 
-        VInt tileOffsX = FragPixelOffsetsX, tileOffsY = FragPixelOffsetsY;
+        v_int tileOffsX = simd::FragPixelOffsetsX, tileOffsY = simd::FragPixelOffsetsY;
 
         if (minX < bin.X) {
             tileOffsX += (int32_t)(bin.X - minX);
@@ -398,13 +393,13 @@ class Rasterizer {
 
         // TODO: Investigate how costly these lane accesses actually are, considering each will be on a different cache-line.
         //       it might be faster to recompute or maybe shuffle after setup to a friendlier layout.
-        VInt stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
-        VInt stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
+        v_int stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
+        v_int stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
 
         // Barycentric coordinates at start of row
-        VInt rowW0 = tri.Weight0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
-        VInt rowW1 = tri.Weight1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
-        VInt rowW2 = tri.Weight2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
+        v_int rowW0 = tri.Weight0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
+        v_int rowW1 = tri.Weight1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
+        v_int rowW2 = tri.Weight2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
 
         stepX0 *= 4, stepX1 *= 4, stepX2 *= 4;
         stepY0 *= 4, stepY1 *= 4, stepY2 *= 4;
@@ -412,24 +407,24 @@ class Rasterizer {
         float area = tri.RcpArea[i];
 
         for (uint32_t y = minY; y <= maxY; y += 4) {
-            VInt w0 = rowW0, w1 = rowW1, w2 = rowW2;
+            v_int w0 = rowW0, w1 = rowW1, w2 = rowW2;
 
             for (uint32_t x = minX; x <= maxX; x += 4) {
-                VMask tileMask = (w0 | w1 | w2) >= 0;
+                v_mask tileMask = simd::movemask((w0 | w1 | w2) >= 0);
 
-                if (simd::any(tileMask)) [[unlikely]] {
+                if (tileMask != 0) [[unlikely]] {
                     VaryingBuffer vars = {
                         .Attribs = (float*)&tri.Vertices->Attribs + i,
                         .TileOffset = fb.GetPixelOffset(x, y),
                         .W1 = simd::conv2f(w1) * area,
                         .W2 = simd::conv2f(w2) * area,
                     };
-                    VFloat oldDepth = VFloat::load(&fb.DepthBuffer[vars.TileOffset]);
-                    VFloat newDepth = vars.GetSmooth(VaryingBuffer::AttribZ);
+                    v_float oldDepth = simd::load(&fb.DepthBuffer[vars.TileOffset]);
+                    v_float newDepth = vars.GetSmooth(VaryingBuffer::AttribZ);
 
-                    tileMask &= newDepth < oldDepth;
+                    tileMask &= simd::movemask(newDepth < oldDepth);
 
-                    if (simd::any(tileMask)) {
+                    if (tileMask != 0) {
                         vars.Depth = newDepth;
                         vars.TileMask = tileMask;
 
@@ -450,14 +445,14 @@ public:
         ShaderInterface shifc = {
             .ReadVtxFn =
                 [&](size_t offset, ShadedVertexPacket vertices[3]) {
-                    VInt indices[3];
+                    v_int indices[3];
                     vertexData.ReadTriangleIndices(offset, indices);
 
                     for (uint32_t vi = 0; vi < 3; vi++) {
                         vertexData._Indices = indices[vi];
                         shader.ShadeVertices(vertexData, vertices[vi]);
                     }
-                    STAT_INCREMENT(VerticesShaded, VInt::Length * 3);
+                    STAT_INCREMENT(VerticesShaded, simd::vec_width * 3);
                 },
             .DrawFn = [&](const BinnedTriangle& bt) { DrawBinnedTriangle(shader, bt); },
             .NumCustomAttribs = shader.NumCustomAttribs,

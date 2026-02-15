@@ -16,7 +16,6 @@ target_link_libraries(SwRast PRIVATE
     glad
     assimp
     glm::glm
-    nanobench
 )
 target_include_directories(SwRast PRIVATE ${stb_SOURCE_DIR})
 
