@@ -1,9 +1,9 @@
-#include <array>
 #include <chrono>
 #include <execution>
 #include <ranges>
 
 #include "SwRast.h"
+#include "ProfilerStats.h"
 
 namespace swr {
 
@@ -11,146 +11,62 @@ static void ParallelDispatch(uint32_t numInvocs, auto fn) {
     auto range = std::ranges::iota_view(0u, numInvocs);
     std::for_each(std::execution::par_unseq, range.begin(), range.end(), fn);
 }
-
-Rasterizer::Rasterizer(std::shared_ptr<Framebuffer> fb) {
-    const float maxViewSize = 2048.0f;
-    _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb->Width;
-    _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb->Height;
-
-    _batch = std::make_unique<TriangleBatch>(fb->Width, fb->Height);
-
-    _fb = std::move(fb);
-}
-
-void Rasterizer::Draw(VertexReader& vertexData, const ShaderInterface& shader) {
-    uint32_t pos = 0;
-    uint32_t count = vertexData.Count / 3;
-
-    while (pos < count) {
-        TriangleBatch& batch = *_batch;
-
-        STAT_TIME_BEGIN(Setup);
-
-        for (; pos < count && !batch.IsFull(); pos += simd::vec_width) {
-            TrianglePacket& tri = batch.Alloc();
-
-            // Read vertices and assemble triangles
-            shader.ReadVtxFn(pos * 3, tri.Vertices);
-
-            // Clip, setup, and bin
-            SetupTriangles(batch, shader.NumCustomAttribs);
-        }
-
-        STAT_TIME_END(Setup);
-
-        if (batch.Count == 0) continue;
-
-        STAT_TIME_BEGIN(Rasterize);
-
-        ParallelDispatch(batch.NumBins, [&](uint32_t bid) {
-            std::vector<uint16_t>& bin = batch.Bins[bid];
-            if (bin.size() == 0) return;
-
-            BinnedTriangle bt = {
-                .X = (bid % batch.BinsPerRow) * TriangleBatch::BinSize,
-                .Y = (bid / batch.BinsPerRow) * TriangleBatch::BinSize,
-            };
-            for (uint16_t triangleId : bin) {
-                bt.Triangle = &batch.Triangles[triangleId / simd::vec_width];
-                bt.TriangleIndex = triangleId % simd::vec_width;
-                shader.DrawFn(bt);
-            }
-            bin.clear();
-        });
-        batch.Count = 0;
-
-        STAT_TIME_END(Rasterize);
-    }
-}
-
-void Rasterizer::SetupTriangles(TriangleBatch& batch, uint32_t numCustomAttribs) {
-    TrianglePacket& tri = batch.PeekLast();
-    Clipper::ClipCodes cc = _clipper.ComputeClipCodes(tri);
-    uint32_t addedTriangles = 0;
-    uint32_t numAttribs = numCustomAttribs + 4;
-
-    // Clip non-trivial triangles
-    for (uint32_t i : BitIter(cc.NonTrivialMask)) {
-        _clipper.LoadTriangle(tri, i, numAttribs);
-
-        for (uint32_t j : BitIter(cc.OutCodes[i])) {
-            _clipper.ClipAgainstPlane((Clipper::Plane)j, numAttribs);
-        }
-
-        if (_clipper.Count < 2) continue;
-
-        // Triangulate result polygon
-        for (uint32_t j = 0; j < _clipper.Count - 2; j++) {
-            uint32_t usedMask = cc.AcceptMask | (cc.NonTrivialMask & (~1u << i));
-            uint32_t freeIdx = (uint32_t)std::countr_one(usedMask);
-
-            if (freeIdx < simd::vec_width) {
-                _clipper.StoreTriangle(tri, freeIdx, j, numAttribs);
-                cc.AcceptMask |= 1u << freeIdx;
-            } else {
-                if (addedTriangles % simd::vec_width == 0) {
-                    TrianglePacket& newTri = batch.Alloc();
-                    assert(&newTri == (&tri + i / simd::vec_width + 1));
-                }
-                _clipper.StoreTriangle(batch.PeekLast(), addedTriangles % simd::vec_width, j, numAttribs);
-                addedTriangles++;
-            }
-        }
-        STAT_INCREMENT(TrianglesClipped, 1);
-    }
-
-    if (cc.AcceptMask == 0 && addedTriangles == 0) {
-        batch.Count--;  // free unused triangle
-        return;
-    }
-
-    if (cc.AcceptMask != 0) {
-        BinTriangles(batch, tri, cc.AcceptMask, numCustomAttribs);
-    }
-
-    for (uint32_t i = 0; i < addedTriangles; i += simd::vec_width) {
-        uint16_t mask = (1u << std::min(simd::vec_width, addedTriangles - i)) - 1;
-        BinTriangles(batch, *(&tri + i / simd::vec_width + 1), mask, numCustomAttribs);
-    }
-}
-
-void Rasterizer::BinTriangles(TriangleBatch& batch, TrianglePacket& tris, v_mask mask, uint32_t numAttribs) {
-    int32_t width = (int32_t)_fb->Width, height = (int32_t)_fb->Height;
-    tris.Setup(width, height, numAttribs);
-
-    // Cull backfacing triangles or with zero area
-    mask &= simd::movemask(tris.RcpArea > 0.0f && tris.RcpArea < 1.0f);
-
-    for (uint32_t i : BitIter(mask)) {
-        const uint32_t binShift = TriangleBatch::BinSizeLog2;
-
-        uint32_t minX = (uint32_t)tris.MinX[i] >> binShift;
-        uint32_t minY = (uint32_t)tris.MinY[i] >> binShift;
-        uint32_t maxX = (uint32_t)tris.MaxX[i] >> binShift;
-        uint32_t maxY = (uint32_t)tris.MaxY[i] >> binShift;
-
-        for (uint32_t y = minY; y <= maxY; y++) {
-            for (uint32_t x = minX; x <= maxX; x++) {
-                batch.AddBin(x, y, tris, i);
-                STAT_INCREMENT(BinsFilled, 1);
-            }
-        }
-    }
-    STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
-}
-
-static std::array<v_int, 3> LoadFixedPos(const TrianglePacket& tri, uint32_t axis, float scale) {
+static v_float4 GatherPos(const ShadedMeshlet& mesh, v_int idx) {
     return {
-        simd::round2i(*(&tri.Vertices[0].Position.x + axis) * scale),
-        simd::round2i(*(&tri.Vertices[1].Position.x + axis) * scale),
-        simd::round2i(*(&tri.Vertices[2].Position.x + axis) * scale),
+        simd::gather(mesh.Attribs[0], idx),
+        simd::gather(mesh.Attribs[1], idx),
+        simd::gather(mesh.Attribs[2], idx),
+        simd::gather(mesh.Attribs[3], idx),
     };
-};
+}
+
+void Rasterizer::DrawMeshletsImpl(uint32_t count, const ShaderDispatcher& shader) {
+    STAT_TIME_BEGIN(Rasterize);
+
+    for (uint32_t meshIdx = 0; meshIdx < count; meshIdx++) {
+        ShadedMeshlet mesh;
+        shader.MeshFn(meshIdx, mesh);
+        if (mesh.PrimCount == 0) continue;
+
+        for (uint32_t primIdx = 0; primIdx < mesh.PrimCount; primIdx += simd::vec_width) {
+            v_int i0 = _mm512_cvtepu8_epi32(_mm_loadu_epi32(&mesh.Indices[0][primIdx]));
+            v_int i1 = _mm512_cvtepu8_epi32(_mm_loadu_epi32(&mesh.Indices[1][primIdx]));
+            v_int i2 = _mm512_cvtepu8_epi32(_mm_loadu_epi32(&mesh.Indices[2][primIdx]));
+            v_float4 v0 = GatherPos(mesh, i0);
+            v_float4 v1 = GatherPos(mesh, i1);
+            v_float4 v2 = GatherPos(mesh, i2);
+            Clipper::ClipCodes cc = _clipper.ComputeClipCodes(v0, v1, v2);
+
+            if (primIdx + simd::vec_width >= mesh.PrimCount) {
+                v_mask trailMask = (1u << (mesh.PrimCount % simd::vec_width)) - 1;
+                cc.AcceptMask &= trailMask;
+            }
+
+            if (cc.AcceptMask != 0) {
+                v0 = simd::PerspectiveDiv(v0);
+                v1 = simd::PerspectiveDiv(v1);
+                v2 = simd::PerspectiveDiv(v2);
+
+                TrianglePacket tris;
+                tris.Setup(v0, v1, v2, glm::ivec2(_fb.Width, _fb.Height) / 2);
+
+                uint16_t mask = cc.AcceptMask;
+
+                // Cull backfacing triangles or with zero area
+                mask &= simd::movemask(tris.RcpArea > 0.0f && tris.RcpArea < 1.0f);
+
+                for (uint32_t i : BitIter(mask)) {
+                    shader.DrawFn(tris, mesh, i, primIdx + i, meshIdx);
+                }
+                STAT_INCREMENT(TrianglesDrawn, (uint32_t)std::popcount(mask));
+            }
+            if (cc.NonTrivialMask != 0) {
+                STAT_INCREMENT(TrianglesClipped, (uint32_t)std::popcount(cc.NonTrivialMask));
+            }
+        }
+    }
+    STAT_TIME_END(Rasterize);
+}
 
 static v_int ComputeMinBB(v_int a, v_int b, v_int c, int32_t vpSize) {
     v_int r = simd::min(simd::min(a, b), c);
@@ -176,42 +92,118 @@ static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
 // This is missing handling on a few subtleties listed in the article:
 //  - Overflow: work-able region is only 2048x2048, but could be extended to 8192x8192
 //  - Top-left bias: vertex attributes will be interpolated with some slight shift
-void TrianglePacket::Setup(int32_t vpWidth, int32_t vpHeight, uint32_t numAttribs) {
-    // Perspective division
-    for (uint32_t i = 0; i < 3; i++) {
-        v_float4& pos = Vertices[i].Position;
-        pos = simd::PerspectiveDiv(pos);
-    }
+void TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize) {
+    glm::vec2 fixScale = vpHalfSize * 16;
 
-    vpWidth /= 2, vpHeight /= 2;
+    Z0 = { v0.z, v0.w };
+    Z1 = { v1.z, v1.w };
+    Z2 = { v2.z, v2.w };
 
-    auto [x0, x1, x2] = LoadFixedPos(*this, 0, vpWidth * 16.0f);
-    MinX = ComputeMinBB(x0, x1, x2, vpWidth);
-    MaxX = ComputeMaxBB(x0, x1, x2, vpWidth);
+    v_int x0 = simd::round2i(v0.x * fixScale.x);
+    v_int x1 = simd::round2i(v1.x * fixScale.x);
+    v_int x2 = simd::round2i(v2.x * fixScale.x);
+    MinX = ComputeMinBB(x0, x1, x2, vpHalfSize.x);
+    MaxX = ComputeMaxBB(x0, x1, x2, vpHalfSize.x);
 
-    auto [y0, y1, y2] = LoadFixedPos(*this, 1, vpHeight * 16.0f);
-    MinY = ComputeMinBB(y0, y1, y2, vpHeight);
-    MaxY = ComputeMaxBB(y0, y1, y2, vpHeight);
+    v_int y0 = simd::round2i(v0.y * fixScale.y);
+    v_int y1 = simd::round2i(v1.y * fixScale.y);
+    v_int y2 = simd::round2i(v2.y * fixScale.y);
+    MinY = ComputeMinBB(y0, y1, y2, vpHalfSize.y);
+    MaxY = ComputeMaxBB(y0, y1, y2, vpHalfSize.y);
 
     A01 = y0 - y1, B01 = x1 - x0;
     A12 = y1 - y2, B12 = x2 - x1;
     A20 = y2 - y0, B20 = x0 - x2;
 
-    auto minX = (MinX - vpWidth) << 4, minY = (MinY - vpHeight) << 4;
-    Weight0 = ComputeEdge(A12, minX - x1, B12, minY - y1);
-    Weight1 = ComputeEdge(A20, minX - x2, B20, minY - y2);
-    Weight2 = ComputeEdge(A01, minX - x0, B01, minY - y0);
+    v_int minX = (MinX - vpHalfSize.x) << 4, minY = (MinY - vpHalfSize.y) << 4;
+    W0 = ComputeEdge(A12, minX - x1, B12, minY - y1);
+    W1 = ComputeEdge(A20, minX - x2, B20, minY - y2);
+    W2 = ComputeEdge(A01, minX - x0, B01, minY - y0);
 
     RcpArea = 16.0f / simd::conv2f(B01 * A20 - B20 * A01);
+}
 
-    // Prepare attributes for interpolation
-    for (uint32_t i = 0; i <= numAttribs; i++) {
-        int32_t j = i < numAttribs ? (int32_t)i : VaryingBuffer::AttribZ;
+Clipper::ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2) {
+    using v_byte = uint8_t [[clang::ext_vector_type(16)]];
+    using v_bool = bool [[clang::ext_vector_type(16)]];
 
-        v_float v0 = Vertices[0].Attribs[j];
-        Vertices[1].Attribs[j] -= v0;
-        Vertices[2].Attribs[j] -= v0;
+    v_byte partialOut = 0;     // non-zero if at least one vertex is out
+    v_byte combinedOut = 255;  // non-zero if all vertices are out
+    float bx = GuardBandPlaneDistXY[0], by = GuardBandPlaneDistXY[1];
+
+    #pragma unroll
+    for (uint32_t i = 0; i < 3; i++) {
+        v_float4 pos = i == 0 ? v0 : (i == 1 ? v1 : v2);
+        v_byte outcode = 0;
+
+        outcode |= __builtin_convertvector(pos.x < -pos.w * bx, v_byte) ? v_byte(1 << (int)Plane::Left) : 0;
+        outcode |= __builtin_convertvector(pos.x > +pos.w * bx, v_byte) ? v_byte(1 << (int)Plane::Right) : 0;
+        outcode |= __builtin_convertvector(pos.y < -pos.w * by, v_byte) ? v_byte(1 << (int)Plane::Bottom) : 0;
+        outcode |= __builtin_convertvector(pos.y > +pos.w * by, v_byte) ? v_byte(1 << (int)Plane::Top) : 0;
+        outcode |= __builtin_convertvector(pos.z < -pos.w, v_byte) ? v_byte(1 << (int)Plane::Near) : 0;
+        outcode |= __builtin_convertvector(pos.z > +pos.w, v_byte) ? v_byte(1 << (int)Plane::Far) : 0;
+
+        partialOut |= outcode;
+        combinedOut &= outcode;
     }
+    v_mask acceptMask = _mm_cmpeq_epi8_mask(partialOut, _mm_set1_epi8(0));
+    v_mask rejectMask = _mm_cmpneq_epi8_mask(combinedOut, _mm_set1_epi8(0));
+
+    ClipCodes codes = {
+        .AcceptMask = (v_mask)(acceptMask & ~rejectMask),
+        .NonTrivialMask = (v_mask)(~acceptMask & ~rejectMask),
+    };
+    _mm_storeu_si128((__m128i*)codes.OutCodes, partialOut);
+    return codes;
+}
+
+// dot(vtx.XYZ, plane.Norm) + vtx.W * dist
+static float GetIntersectDist(const Clipper::Vertex& vtx, Clipper::Plane plane, float dist) {
+    float a = vtx.Attribs[(uint32_t)plane / 2];
+    if ((uint32_t)plane % 2) a = -a;
+
+    return a + vtx.Attribs[3] * dist;
+}
+
+// https://www.cubic.org/docs/3dclip.htm
+void Clipper::ClipAgainstPlane(Plane plane, uint32_t numAttribs) {
+    if (Count < 3) return;  // triangle has been fully clipped away
+
+    float planeDist = plane < Plane::Near ? GuardBandPlaneDistXY[(uint32_t)plane / 2] : 1.0f;
+    uint8_t tempIndices[24];
+    uint32_t j = 0;
+
+    for (uint32_t i = 0; i < Count; i++) {
+        Vertex& va = Vertices[Indices[i]];
+        Vertex& vb = Vertices[Indices[(i + 1) % Count]];
+
+        float da = GetIntersectDist(va, plane, planeDist);
+        float db = GetIntersectDist(vb, plane, planeDist);
+
+        if (da >= 0) {
+            tempIndices[j++] = Indices[i];
+        }
+
+        // Calculate intersection if distance signs differ
+        if ((da >= 0) != (db >= 0)) {
+            tempIndices[j++] = FreeVtx;
+            Vertex& dest = Vertices[FreeVtx++];
+
+            float t = da / (da - db);
+
+            assert(numAttribs <= sizeof(va.Attribs) / 4);
+
+            for (uint32_t ai = 0; ai < numAttribs; ai += simd::vec_width) {
+                v_float a = simd::load(&va.Attribs[ai]);
+                v_float b = simd::load(&vb.Attribs[ai]);
+                v_float r = simd::lerp(a, b, t);
+                simd::store(r, &dest.Attribs[ai]);
+            }
+        }
+    }
+    memcpy(Indices, tempIndices, 24);  // small constant size copy can be inlined
+    Count = j;
+    assert(Count < 24);
 }
 
 void Framebuffer::IterateTiles(std::function<void(uint32_t, uint32_t)> visitor, uint32_t downscaleFactor) {

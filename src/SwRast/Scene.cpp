@@ -1,28 +1,13 @@
 #include "Scene.h"
 
-#include <unordered_map>
 #include <filesystem>
-#include <cfloat>
+#include <glm/packing.hpp>
 
-#include <assimp/scene.h>
-#include <assimp/Importer.hpp>
-#include <assimp/postprocess.h>
+#define CGLTF_IMPLEMENTATION
+#include <cgltf.h>
+#include <meshoptimizer.h>
 
 namespace scene {
-
-static void PackNorm(int8_t* dst, float* src) {
-    for (uint32_t i = 0; i < 3; i++) {
-        dst[i] = (int8_t)std::round(src[i] * 127.0f);
-    }
-}
-static std::string GetTextureName(const aiMaterial* mat, aiTextureType type) {
-    if (mat->GetTextureCount(type) <= 0) {
-        return "";
-    }
-    aiString path;
-    mat->GetTexture(type, 0, &path);
-    return std::string(path.data, path.length);
-}
 
 static void CombineNormalMR(swr::StbImage& normalMap, const swr::StbImage& mrMap) {
     uint32_t count = normalMap.Width * normalMap.Height * 4;
@@ -30,7 +15,6 @@ static void CombineNormalMR(swr::StbImage& normalMap, const swr::StbImage& mrMap
     uint8_t* mrPixels = mrMap.Data.get();
 
     for (uint32_t i = 0; i < count; i += 4) {
-        // Re-normalize to get rid of JPEG artifacts
         glm::vec3 N = glm::vec3(pixels[i + 0], pixels[i + 1], pixels[i + 2]);
         N = glm::normalize(N / 127.0f - 1.0f) * 127.0f + 127.0f;
 
@@ -58,36 +42,24 @@ static void InsertEmissiveMask(swr::StbImage& baseMap, const swr::StbImage& emis
     }
 }
 
-static swr::StbImage LoadImage(Model& m, std::string_view name) {
-    auto fullPath = std::filesystem::path(m.BasePath) / name;
+static swr::StbImage LoadImage(Model& m, const cgltf_texture_view& view) {
+    if (!view.texture || !view.texture->image) return {};
 
-    if (name.empty() || !std::filesystem::exists(fullPath)) {
-        return { };
-    }
-    return swr::StbImage::Load(fullPath.string().c_str());
+    auto fullPath = std::filesystem::path(m.BasePath) / view.texture->image->uri;
+    if (!std::filesystem::exists(fullPath)) return { };
+
+    return swr::StbImage::Load(fullPath.string().data());
 }
 
-static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {
-    std::string name = GetTextureName(mat, aiTextureType_BASE_COLOR);
-
-    auto cached = m.Textures.find(name);
-
-    if (cached != m.Textures.end()) {
-        return &cached->second;
-    }
-    if (name.empty()) {
-        auto slot = m.Textures.insert({ name, swr::RgbaTexture2D(4, 4, 1, 1) });
-        return &slot.first->second;
-    }
-    swr::StbImage baseColorImg = LoadImage(m, name);
+static swr::RgbaTexture2D LoadTextures(Model& m, const cgltf_material* mat) {
+    swr::StbImage baseColorImg = LoadImage(m, mat->pbr_metallic_roughness.base_color_texture);
 
     if (!baseColorImg.Width) {
-        auto slot = m.Textures.insert({ name, swr::RgbaTexture2D(4, 4, 1, 1) });
-        return &slot.first->second;
+        return swr::RgbaTexture2D(4, 4, 1, 1);
     }
-    swr::StbImage normalImg = LoadImage(m, GetTextureName(mat, aiTextureType_NORMALS));
-    swr::StbImage metalRoughImg = LoadImage(m, GetTextureName(mat, aiTextureType_DIFFUSE_ROUGHNESS));
-    swr::StbImage emissiveImg = LoadImage(m, GetTextureName(mat, aiTextureType_EMISSIVE));
+    swr::StbImage normalImg = LoadImage(m, mat->normal_texture);
+    swr::StbImage metalRoughImg = LoadImage(m, mat->pbr_metallic_roughness.metallic_roughness_texture);
+    swr::StbImage emissiveImg = LoadImage(m, mat->emissive_texture);
 
     bool hasNormals = normalImg.Width == baseColorImg.Width && normalImg.Height == baseColorImg.Height;
     bool hasEmissive = emissiveImg.Width == baseColorImg.Width && emissiveImg.Height == baseColorImg.Height;
@@ -105,126 +77,178 @@ static swr::RgbaTexture2D* LoadTextures(Model& m, const aiMaterial* mat) {
     }
     tex.SetPixels(baseColorImg.Data.get(), baseColorImg.Width, 0);
     tex.GenerateMips();
-
-    auto slot = m.Textures.insert({ name, std::move(tex) });
-    return &slot.first->second;
+    return tex;
 }
 
-Node ConvertNode(const Model& model, aiNode* node) {
-    //TODO: figure out wtf is going on with empty nodes
-    //FIXME: apply transform on node AABBs
-    Node cn = {
-        .Transform = glm::transpose(*(glm::mat4*)&node->mTransformation),
-        .BoundMin = glm::vec3(FLT_MAX),
-        .BoundMax = glm::vec3(-FLT_MAX),
+static uint32_t PackRGB10(const glm::vec3& value) {
+    int ri = (int)(value.x * 1023.0f + 0.5f);
+    int gi = (int)(value.y * 1023.0f + 0.5f);
+    int bi = (int)(value.z * 1023.0f + 0.5f);
+
+    ri = glm::min(glm::max(ri, 0), 1023);
+    gi = glm::min(glm::max(gi, 0), 1023);
+    bi = glm::min(glm::max(bi, 0), 1023);
+
+    return (uint32_t)(ri << 22 | gi << 12 | bi << 2);
+}
+
+Model::Model(const std::string& path) {
+    cgltf_options gltfOptions = {};
+    cgltf_data* gltf = NULL;
+    cgltf_result parseResult = cgltf_parse_file(&gltfOptions, path.c_str(), &gltf);
+    if (parseResult != cgltf_result_success) {
+        throw std::runtime_error("Failed to parse GLTF");
+    }
+
+    parseResult = cgltf_load_buffers(&gltfOptions, gltf, path.c_str());
+
+    if (parseResult != cgltf_result_success) {
+        throw std::runtime_error("Failed to load associated GLTF data");
+    }
+    BasePath = path.substr(0, path.find_last_of("/\\"));
+
+    Textures.reserve(gltf->materials_count);
+
+    for (uint32_t i = 0; i < gltf->materials_count; i++) {
+        cgltf_material* mat = &gltf->materials[i];
+        Textures.emplace_back(LoadTextures(*this, mat));
+
+        Materials.push_back({
+            .Texture = &Textures[i],
+        });
+    }
+
+    std::vector<uint32_t> indices;
+    std::vector<glm::vec3> positions;
+    std::vector<glm::vec3> normals;
+    std::vector<glm::vec3> tangents;
+
+    std::vector<glm::uvec2> primMeshletRanges;
+
+    for (uint32_t meshIdx = 0; meshIdx < gltf->meshes_count; meshIdx++) {
+        cgltf_mesh* mesh = &gltf->meshes[meshIdx];
+        uint32_t startMeshletOffset = Meshlets.size();
+
+        for (uint32_t primIdx = 0; primIdx < mesh->primitives_count; primIdx++) {
+            cgltf_primitive* prim = &mesh->primitives[primIdx];
+
+            indices.resize(prim->indices->count);
+            cgltf_accessor_unpack_indices(prim->indices, indices.data(), 4, prim->indices->count);
+
+            const cgltf_accessor* positionsAcc = cgltf_find_accessor(prim, cgltf_attribute_type_position, 0);
+            positions.resize(positionsAcc->count);
+            cgltf_accessor_unpack_floats(positionsAcc, &positions[0].x, positionsAcc->count * 3);
+
+            const float cone_weight = 0.25f;
+
+            size_t maxMeshlets = meshopt_buildMeshletsBound(indices.size(), swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims);
+            std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
+            std::vector<uint32_t> meshletVertices(indices.size());
+            std::vector<uint8_t> meshletTriangles(indices.size());
+
+            size_t numMeshlets = meshopt_buildMeshlets(meshlets.data(), meshletVertices.data(), meshletTriangles.data(), indices.data(),
+                                                       indices.size(), &positions[0].x, positions.size(), sizeof(glm::vec3),
+                                                       swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims, cone_weight);
+
+            const cgltf_accessor* texcoordAcc = cgltf_find_accessor(prim, cgltf_attribute_type_texcoord, 0);
+            const cgltf_accessor* normalAcc = cgltf_find_accessor(prim, cgltf_attribute_type_normal, 0);
+            const cgltf_accessor* tangentAcc = cgltf_find_accessor(prim, cgltf_attribute_type_tangent, 0);
+
+            for (uint32_t meshIdx = 0; meshIdx < numMeshlets; meshIdx++) {
+                meshopt_Meshlet& m = meshlets[meshIdx];
+                meshopt_optimizeMeshlet(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count,
+                                        m.vertex_count);
+
+                meshopt_Bounds bounds =
+                    meshopt_computeMeshletBounds(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count,
+                                                 &positions[m.vertex_offset].x, m.vertex_count, sizeof(glm::vec3));
+
+                Meshlet& om = this->Meshlets.emplace_back();
+                om.BoundSphere = glm::vec4(bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius);
+                om.ConeApex = { bounds.cone_apex[0], bounds.cone_apex[1], bounds.cone_apex[2] };
+                om.ConeAxis = { bounds.cone_axis[0], bounds.cone_axis[1], bounds.cone_axis[2] };
+                om.ConeCutoff = bounds.cone_cutoff;
+
+                om.NumVertices = m.vertex_count;
+                om.NumTriangles = m.triangle_count;
+                om.MaterialId = cgltf_material_index(gltf, prim->material);
+
+                for (uint32_t i = 0; i < m.vertex_count; i++) {
+                    uint32_t vertIdx = meshletVertices[m.vertex_offset + i];
+
+                    glm::vec3 pos = positions[vertIdx];
+                    om.Positions[0][i] = pos.x;
+                    om.Positions[1][i] = pos.y;
+                    om.Positions[2][i] = pos.z;
+
+                    if (texcoordAcc) {
+                        glm::vec2 texcoord;
+                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &texcoord.x, 2);
+                        om.TexCoords[i] = glm::packHalf2x16(texcoord);
+                    }
+                    if (normalAcc && tangentAcc) {
+                        glm::vec3 normal;
+                        glm::vec4 tangent;
+                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &normal.x, 3);
+                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &tangent.x, 4);
+                        om.Normals[i] = PackRGB10(normal * 0.5f + 0.5f);
+                        om.Tangents[i] = PackRGB10(tangent * 0.5f + 0.5f) | (tangent.w < 0 ? 1 : 0);
+                    }
+                }
+                for (uint32_t i = 0; i < m.triangle_count; i++) {
+                    uint32_t j = m.triangle_offset + i * 3;
+                    om.Indices[0][i] = meshletTriangles[j + 0];
+                    om.Indices[1][i] = meshletTriangles[j + 1];
+                    om.Indices[2][i] = meshletTriangles[j + 2];
+                }
+            }
+        }
+        primMeshletRanges.push_back(glm::uvec2(startMeshletOffset, Meshlets.size()));
+    }
+
+    auto recurseNode = [&](auto& recurseNode, cgltf_node* srcNode, const glm::mat4& parentTransform) -> Node {
+        uint32_t nodeIdx = cgltf_node_index(gltf, srcNode);
+        Node node = { };
+
+        glm::mat4 localTransform;
+        cgltf_node_transform_local(srcNode, &localTransform[0][0]);
+        node.GlobalTransform = parentTransform * localTransform;
+
+        if (srcNode->mesh) {
+            glm::uvec2 range = primMeshletRanges[cgltf_mesh_index(gltf, srcNode->mesh)];
+            node.MeshletOffset = range.x;
+            node.MeshletCount = range.y - range.x;
+
+            for (uint32_t i = range.x; i < range.y; i++) {
+                Meshlet& m = Meshlets[i];
+                for (uint32_t j = 0; j < m.NumVertices; j++) {
+                    glm::vec3 p = { m.Positions[0][j], m.Positions[1][j], m.Positions[2][j] };
+                    node.BoundMin = glm::min(node.BoundMin, p);
+                    node.BoundMax = glm::max(node.BoundMax, p);
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < srcNode->children_count; i++) {
+            Node child = recurseNode(recurseNode, srcNode->children[i], node.GlobalTransform);
+            node.Children.emplace_back(std::move(child));
+        }
+        return node;
     };
 
-    for (uint32_t i = 0; i < node->mNumMeshes; i++) {
-        cn.Meshes.push_back(node->mMeshes[i]);
+    auto& scene = gltf->scenes[0];
+    RootNode = { };
 
-        const Mesh& mesh = model.Meshes[node->mMeshes[i]];
-        cn.BoundMin = glm::min(cn.BoundMin, mesh.BoundMin);
-        cn.BoundMax = glm::max(cn.BoundMax, mesh.BoundMax);
+    for (uint32_t i = 0; i < scene.nodes_count; i++) {
+        Node child = recurseNode(recurseNode, scene.nodes[i], RootNode.GlobalTransform);
+        RootNode.BoundMin = glm::min(RootNode.BoundMin, child.BoundMin);
+        RootNode.BoundMax = glm::max(RootNode.BoundMax, child.BoundMax);
+        RootNode.Children.emplace_back(std::move(child));
     }
-    for (uint32_t i = 0; i < node->mNumChildren; i++) {
-        Node childNode = ConvertNode(model, node->mChildren[i]);
-
-        cn.BoundMin = glm::min(cn.BoundMin, childNode.BoundMin);
-        cn.BoundMax = glm::max(cn.BoundMax, childNode.BoundMax);
-
-        cn.Children.emplace_back(std::move(childNode));
-    }
-    return cn;
-}
-
-Model::Model(std::string_view path) {
-    const auto processFlags = aiProcess_Triangulate | aiProcess_GenNormals | aiProcess_CalcTangentSpace | 
-                              aiProcess_JoinIdenticalVertices | aiProcess_FlipUVs | aiProcess_SplitLargeMeshes |
-                              aiProcess_OptimizeGraph;// | aiProcess_OptimizeMeshes;
-
-    Assimp::Importer imp;
-
-    if (sizeof(Index) < 4) {
-        imp.SetPropertyInteger(AI_CONFIG_PP_SLM_VERTEX_LIMIT, (1 << (sizeof(Index) * 8)) - 1);
-    }
-
-    const aiScene* scene = imp.ReadFile(path.data(), processFlags);
-
-    if (!scene || !scene->HasMeshes()) {
-        throw std::runtime_error("Could not import scene");
-    }
-
-    BasePath = std::filesystem::path(path).parent_path().string();
-
-    for (int i = 0; i < scene->mNumMaterials; i++) {
-        aiMaterial* mat = scene->mMaterials[i];
-
-        Materials.push_back(Material{
-            .Texture = LoadTextures(*this, mat),
-        });
-    }
-
-    uint32_t numVertices = 0;
-    uint32_t numIndices = 0;
-
-    for (uint32_t i = 0; i < scene->mNumMeshes; i++) {
-        auto mesh = scene->mMeshes[i];
-        numVertices += mesh->mNumVertices;
-
-        for (int j = 0; j < mesh->mNumFaces; j++) {
-            numIndices += mesh->mFaces[j].mNumIndices;
-        }
-    }
-
-    VertexBuffer = std::make_unique<Vertex[]>(numVertices);
-    IndexBuffer = std::make_unique<Index[]>(numIndices);
-
-    uint32_t vertexPos = 0, indexPos = 0;
-
-    for (uint32_t i = 0; i < scene->mNumMeshes; i++) {
-        aiMesh* mesh = scene->mMeshes[i];
-
-        Mesh& impMesh = Meshes.emplace_back(Mesh{
-            .VertexOffset = vertexPos,
-            .IndexOffset = indexPos,
-            .Material = &Materials[mesh->mMaterialIndex],
-            .BoundMin = glm::vec3(FLT_MAX),
-            .BoundMax = glm::vec3(-FLT_MAX),
-        });
-
-        for (uint32_t j = 0; j < mesh->mNumVertices; j++) {
-            Vertex& v = VertexBuffer[vertexPos++];
-
-            glm::vec3 pos = *(glm::vec3*)&mesh->mVertices[j];
-            *(glm::vec3*)&v.x = pos;
-
-            if (mesh->HasTextureCoords(0)) {
-                *(glm::vec2*)&v.u = *(glm::vec2*)&mesh->mTextureCoords[0][j];
-            }
-            if (mesh->HasNormals() && mesh->HasTangentsAndBitangents()) {
-                PackNorm(&v.nx, &mesh->mNormals[j].x);
-                PackNorm(&v.tx, &mesh->mTangents[j].x);
-            }
-
-            impMesh.BoundMin = glm::min(impMesh.BoundMin, pos);
-            impMesh.BoundMax = glm::max(impMesh.BoundMax, pos);
-        }
-
-        for (uint32_t j = 0; j < mesh->mNumFaces; j++) {
-            aiFace& face = mesh->mFaces[j];
-
-            for (uint32_t k = 0; k < face.mNumIndices; k++) {
-                IndexBuffer[indexPos++] = (Index)face.mIndices[k];
-            }
-        }
-        impMesh.IndexCount = indexPos - impMesh.IndexOffset;
-    }
-
-    RootNode = ConvertNode(*this, scene->mRootNode);
 }
 
 float DepthPyramid::GetDepth(float u, float v, float lod) const {
-    uint32_t level = std::clamp((uint32_t)lod, 0u, _levels - 1);
+    uint32_t level = glm::clamp((uint32_t)lod, 0u, _levels - 1);
 
     int32_t w = (int32_t)(_width >> level);
     int32_t h = (int32_t)(_height >> level);
@@ -232,12 +256,13 @@ float DepthPyramid::GetDepth(float u, float v, float lod) const {
     int32_t y = (int32_t)(v * h);
 
     const auto Sample = [&](int32_t xo, int32_t yo) {
-        int32_t i = std::clamp(x + xo, 0, w - 1) + std::clamp(y + yo, 0, h - 1) * w;
+        int32_t i = glm::clamp(x + xo, 0, w - 1) + glm::clamp(y + yo, 0, h - 1) * w;
         return _storage[_offsets[level] + (uint32_t)i];
     };
-    return std::max({ Sample(0, 0), Sample(1, 0), Sample(0, 1), Sample(1, 1) });
+    return glm::max(glm::max(Sample(0, 0), Sample(1, 0)),
+                    glm::max(Sample(0, 1), Sample(1, 1)));
 }
-
+/*
 bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const {
     if (!_storage) return true;
 
@@ -292,7 +317,7 @@ bool DepthPyramid::IsVisible(const Mesh& mesh, const glm::mat4& transform) const
     //                                        rectMin.z <= screenDepth ? 0x8000FF00 : 0x80FFFFFF);
 
     return rectMin.z <= screenDepth;
-}
+}*/
 
 void DepthPyramid::Update(const swr::Framebuffer& fb, const glm::mat4& viewProj) {
     EnsureStorage(fb.Width, fb.Height);

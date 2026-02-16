@@ -48,6 +48,7 @@ struct DefaultShader {
     // Uniform: Forward
     glm::mat4 ProjMat;
     glm::mat3 ModelMat;
+    const scene::Meshlet* Meshlets;
     const swr::RgbaTexture2D* MaterialTex;  // See `scene::Material` for what's on this texture.
 
     // Uniform: Compose pass
@@ -60,21 +61,30 @@ struct DefaultShader {
     bool EnableTAA = true;
     bool BlurSkybox = false;
 
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        v_float3 pos = data.ReadAttribs<v_float3>(&scene::Vertex::x);
-        vars.Position = TransformVector(ProjMat, { pos, 1.0f });
+    void ShadeMeshlet(uint32_t index, swr::ShadedMeshlet& output) const {
+        auto& mesh = Meshlets[index];
 
-        vars.SetAttribs(0, data.ReadAttribs<v_float2>(&scene::Vertex::u));
+        output.PrimCount = 0;
+        if (glm::dot(glm::normalize(mesh.ConeApex - ViewPos), mesh.ConeAxis) >= mesh.ConeCutoff) return;
 
-        v_float3 norm = data.ReadAttribs<v_float3>(&scene::Vertex::nx);
-        vars.SetAttribs(2, TransformNormal(ModelMat, norm));
-
-        v_float3 tang = data.ReadAttribs<v_float3>(&scene::Vertex::tx);
-        vars.SetAttribs(5, TransformNormal(ModelMat, tang));
+        for (uint32_t i = 0; i < mesh.NumVertices; i += vec_width) {
+            v_float3 worldPos = { load(&mesh.Positions[0][i]), load(&mesh.Positions[1][i]), load(&mesh.Positions[2][i]) };
+            v_float4 clipPos = TransformVector(ProjMat, { worldPos, 1.0f });
+            output.SetAttrib(0, i, clipPos);
+        }
+        output.PrimCount = mesh.NumTriangles;
+        memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
     }
 
     void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
-        vars.ApplyPerspectiveCorrection();
+       // vars.ApplyPerspectiveCorrection();
+
+        if (true) {
+            v_int baseColor = swr::pixfmt::RGBA8u::Pack({ vars.W1, vars.W2, vars.W0, 0 });
+          //  baseColor=round2i(vars.Depth*255.0f)*0x010101;
+            fb.WriteTile(vars.TileOffset, vars.TileMask, baseColor, vars.Depth);
+            return;
+        }
 
         v_float u = vars.GetSmooth(0);
         v_float v = vars.GetSmooth(1);
@@ -673,10 +683,10 @@ struct DepthOnlyShader {
 
     glm::mat4 ProjMat;
 
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
-        vars.Position = TransformVector(ProjMat, pos);
-    }
+    // void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+    //     v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
+    //     vars.Position = TransformVector(ProjMat, pos);
+    // }
 
     void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
         _mm512_mask_storeu_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
@@ -687,10 +697,10 @@ struct OverdrawShader {
 
     glm::mat4 ProjMat;
 
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
-        vars.Position = TransformVector(ProjMat, pos);
-    }
+    // void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+    //     v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
+    //     vars.Position = TransformVector(ProjMat, pos);
+    // }
 
     void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
         v_int color = load(&fb.ColorBuffer[vars.TileOffset]);
@@ -704,12 +714,12 @@ struct TexCacheHeatmapShader {
     glm::mat4 ProjMat;
     const swr::RgbaTexture2D* MaterialTex;
 
-    void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-        v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
-        vars.Position = TransformVector(ProjMat, pos);
+    // void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
+    //     v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
+    //     vars.Position = TransformVector(ProjMat, pos);
 
-        vars.SetAttribs(0, data.ReadAttribs<v_float2>(&scene::Vertex::u));
-    }
+    //     vars.SetAttribs(0, data.ReadAttribs<v_float2>(&scene::Vertex::u));
+    // }
 
     void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
         vars.ApplyPerspectiveCorrection();
@@ -746,14 +756,14 @@ struct TexCacheHeatmapShader {
         };
         static const uint32_t kNumColors = std::size(kPalette);
 
-        fb.IterateTiles([&] [[clang::noinline]] (uint32_t x, uint32_t y) {
+        fb.IterateTiles([&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             v_float elapsed = conv2f(load(&fb.ColorBuffer[tileOffset]));
 
             elapsed = (elapsed - 10) / 300;
 
             v_int index = max(min(round2i(elapsed * kNumColors), kNumColors - 1), 0);
-            v_int color = gather<4>((const int32_t*)kPalette, index);
+            v_int color = gather((const int32_t*)kPalette, index);
             store(color, &fb.ColorBuffer[tileOffset]);
         });
     }
@@ -824,7 +834,7 @@ struct SSAO {
             // v_float3 N = normalize(cross(posDx, posDy));
 
             // Using textured normals is better than reconstructing from blocky derivatives, particularly around edges.
-            v_int G2r = gather<4>(fb.GetAttachmentBuffer<int32_t>(0), fb.GetPixelOffset(iu, iv));
+            v_int G2r = gather(fb.GetAttachmentBuffer<int32_t>(0), fb.GetPixelOffset(iu, iv));
             v_float3 N = v_float3(DefaultShader::SignedOctDecode(G2r));
 
             XorShiftStep(rng);

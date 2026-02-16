@@ -1,6 +1,5 @@
-#include <iostream>
-#include <chrono>
 #include <vector>
+#include <format>
 #include <filesystem>
 
 #include "SwRast.h"
@@ -18,12 +17,13 @@
 
 #include "Scene.h"
 #include "RendererShaders.h"
+#include "ProfilerStats.h"
 
 class SwRenderer {
-    std::shared_ptr<swr::Framebuffer> _fb;
-    std::shared_ptr<swr::Framebuffer> _prevFb;
+    std::unique_ptr<swr::Framebuffer> _fb;
+    std::unique_ptr<swr::Framebuffer> _prevFb;
     std::unique_ptr<swr::Rasterizer> _rast;
-    std::shared_ptr<scene::Model> _scene, _shadowScene;
+    std::unique_ptr<scene::Model> _scene, _shadowScene;
     std::unique_ptr<renderer::DefaultShader> _shader;
 
     Camera _cam;
@@ -36,7 +36,7 @@ class SwRenderer {
     glm::vec3 _lightPos;
     glm::mat4 _shadowProjMat;
 
-    std::shared_ptr<swr::Framebuffer> _shadowFb;
+    std::unique_ptr<swr::Framebuffer> _shadowFb;
     std::unique_ptr<swr::Rasterizer> _shadowRast;
 
     std::vector<std::filesystem::path> _scenePaths;
@@ -70,21 +70,21 @@ public:
     }
 
     void InitRasterizer(uint32_t width, uint32_t height) {
-        _fb = std::make_shared<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
-        _rast = std::make_unique<swr::Rasterizer>(_fb);
+        _fb = std::make_unique<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
+        _rast = std::make_unique<swr::Rasterizer>(*_fb);
 
         if (_frontTex != 0) glDeleteTextures(1, &_frontTex);
         _frontTex = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
         _tempPixels = std::make_unique<uint32_t[]>(_fb->Width * _fb->Height);
     }
     void LoadScene(const std::filesystem::path& path) {
-        _scene = std::make_shared<scene::Model>(path.string());
+        _scene = std::make_unique<scene::Model>(path.string());
 
         if (path.filename().compare("Sponza.gltf") == 0) {
             auto shadowModelPath = path;
-            _shadowScene = std::make_shared<scene::Model>(shadowModelPath.replace_filename("Sponza_LowPoly.gltf").string());
+            _shadowScene = std::make_unique<scene::Model>(shadowModelPath.replace_filename("Sponza_LowPoly.gltf").string());
         } else {
-            _shadowScene = _scene;
+            _shadowScene = nullptr;
         }
         _currSceneName = path.filename().string();
     }
@@ -106,7 +106,7 @@ public:
         static bool s_AnimateLight = false;
         static bool s_VSync = true;
 
-        static renderer::DebugLayer s_Layer = renderer::DebugLayer::None;
+        static renderer::DebugLayer s_Layer = renderer::DebugLayer::BaseColor;
 
         ImGui::Begin("Settings");
         
@@ -190,7 +190,7 @@ public:
 
         STAT_TIME_BEGIN(Frame);
 
-        if (s_EnableShadows && _shadowScene != nullptr) {
+        if (s_EnableShadows) {
             STAT_TIME_BEGIN(Shadow);
             RenderShadow(s_ShadowRes, s_ShadowRange, s_ShadowFollowCam);
             STAT_TIME_END(Shadow);
@@ -218,27 +218,16 @@ public:
         uint32_t drawCalls = 0;
 
         _scene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
-            for (uint32_t meshId : node.Meshes) {
-                scene::Mesh& mesh = _scene->Meshes[meshId];
+            _shader->ProjMat = projViewMat * modelMat;
+            _shader->ModelMat = modelMat;
+            _shader->Meshlets = &_scene->Meshlets[node.MeshletOffset];
 
-                if (s_HzbOcclusion && !_depthPyramid.IsVisible(mesh, modelMat)) continue;
-
-                _shader->ProjMat = projViewMat * modelMat;
-                _shader->ModelMat = modelMat;
-                _shader->MaterialTex = mesh.Material->Texture;
-
-                swr::VertexReader data(
-                    (uint8_t*)&_scene->VertexBuffer[mesh.VertexOffset], 
-                    (uint8_t*)&_scene->IndexBuffer[mesh.IndexOffset],
-                    mesh.IndexCount, swr::VertexReader::U16);
-
-                if (s_Layer == renderer::DebugLayer::Overdraw) {
-                    _rast->Draw(data, renderer::OverdrawShader{ .ProjMat = _shader->ProjMat });
-                } else {
-                    _rast->Draw(data, *_shader);
-                }
-                drawCalls++;
+            if (s_Layer == renderer::DebugLayer::Overdraw) {
+                // _rast->DrawMeshlets(renderer::OverdrawShader{ .ProjMat = _shader->ProjMat });
+            } else {
+                _rast->DrawMeshlets(node.MeshletCount, *_shader);
             }
+            drawCalls += node.MeshletCount;
             return true;
         });
 
@@ -284,8 +273,8 @@ public:
 
     void RenderShadow(int size, float range, bool followCam) {
         if (_shadowFb == nullptr || _shadowFb->Width != size) {
-            _shadowFb = std::make_shared<swr::Framebuffer>(size, size);
-            _shadowRast = std::make_unique<swr::Rasterizer>(_shadowFb);
+            _shadowFb = std::make_unique<swr::Framebuffer>(size, size);
+            _shadowRast = std::make_unique<swr::Rasterizer>(*_shadowFb);
         }
 
         glm::vec3 centerPos = followCam ? glm::vec3(_cam.Position.x, 0, _cam.Position.z) : glm::vec3(0.0f);
@@ -295,20 +284,16 @@ public:
 
         _shadowFb->ClearDepth(1.0f);
 
-        _shadowScene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
-            for (uint32_t meshId : node.Meshes) {
-                scene::Mesh& mesh = _shadowScene->Meshes[meshId];
+        auto activeScene = _shadowScene ? _shadowScene.get() : _scene.get();
+        // activeScene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
+        //     for (uint32_t meshId : node.Meshes) {
+        //         scene::Mesh& mesh = activeScene->Meshes[meshId];
 
-                swr::VertexReader data(
-                    (uint8_t*)&_shadowScene->VertexBuffer[mesh.VertexOffset],
-                    (uint8_t*)&_shadowScene->IndexBuffer[mesh.IndexOffset],
-                    mesh.IndexCount, swr::VertexReader::U16);
+        //         _shadowRast->DrawMeshlets(100, renderer::DepthOnlyShader{ .ProjMat = _shadowProjMat * modelMat });
+        //     }
+        //     return true;
+        // });
 
-                _shadowRast->Draw(data, renderer::DepthOnlyShader{ .ProjMat = _shadowProjMat * modelMat });
-            }
-            return true;
-        });
-        
         ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
         if (ImGui::Begin("Shadow Debug")) {
             if (_shadowDebugTex == 0) _shadowDebugTex = CreateTexture(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);

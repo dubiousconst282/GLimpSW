@@ -4,7 +4,7 @@ project(SwRast)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 20)
 
 # Setup CPM
 include("deps/CPM.cmake")
@@ -17,12 +17,19 @@ CPMAddPackage("gh:glfw/glfw#3.4")
 CPMAddPackage("gh:g-truc/glm#1.0.1")
 CPMAddPackage("gh:nothings/stb#master")
 
+CPMAddPackage("gh:jkuhlmann/cgltf#v1.15")
+CPMAddPackage("gh:zeux/meshoptimizer#v1.0")
+
+CPMAddPackage("gh:martinus/nanobench#v4.3.11")
+
 # Glad
 add_library(glad STATIC deps/glad/src/glad.c)
 target_include_directories(glad PUBLIC deps/glad/include/)
 
 # ImGui
 CPMAddPackage("gh:ocornut/imgui#v1.91.9b")
+CPMAddPackage("gh:CedricGuillemet/ImGuizmo#master")
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
@@ -32,37 +39,18 @@ add_library(imgui STATIC
     
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    
+    ${ImGuizmo_SOURCE_DIR}/ImGuizmo.cpp
 )
 target_include_directories(imgui PUBLIC 
     ${imgui_SOURCE_DIR} 
     ${imgui_SOURCE_DIR}/backends
+    ${ImGuizmo_SOURCE_DIR}
 )
 target_compile_definitions(imgui PUBLIC -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 target_link_libraries(imgui PRIVATE glfw)
 
-# ImGuizmo
-CPMAddPackage("gh:CedricGuillemet/ImGuizmo#master")
-add_library(ImGuizmo STATIC
-    ${ImGuizmo_SOURCE_DIR}/ImGuizmo.cpp
-)
-target_include_directories(ImGuizmo PUBLIC 
-    ${ImGuizmo_SOURCE_DIR}
-)
-target_link_libraries(ImGuizmo PUBLIC imgui)
-
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-# Assimp
-CPMAddPackage(
-    NAME assimp
-    GIT_REPOSITORY "https://github.com/assimp/assimp"
-    GIT_TAG "v6.0.2"
-    OPTIONS
-        "ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT FALSE"
-        "ASSIMP_BUILD_TESTS FALSE"
-        "ASSIMP_NO_EXPORT TRUE"
-        "ASSIMP_BUILD_GLTF_IMPORTER TRUE"
-        "ASSIMP_BUILD_OBJ_IMPORTER TRUE"
-)
 
 # Projects
 add_subdirectory("src/SwRast/")

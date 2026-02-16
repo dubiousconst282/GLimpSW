@@ -3,21 +3,19 @@ add_executable(SwRast
     Scene.cpp
     
     Rasterizer.cpp
-    VertexReader.cpp
-    Clipper.cpp
     ImageHelpers.cpp
 )
 target_compile_options(SwRast PRIVATE "-march=native" "-ffast-math" "-Wno-unused" "-Wsign-conversion")
+target_compile_definitions(SwRast PRIVATE GLM_FORCE_XYZW_ONLY)
 
 target_link_libraries(SwRast PRIVATE
     imgui
-    ImGuizmo
     glfw
     glad
-    assimp
     glm::glm
+    meshoptimizer
 )
-target_include_directories(SwRast PRIVATE ${stb_SOURCE_DIR})
+target_include_directories(SwRast PRIVATE ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
 
 # std::execution::par_unseq
 if(CMAKE_HOST_LINUX)

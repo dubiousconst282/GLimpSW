@@ -123,10 +123,4 @@ void Framebuffer::GetPixels(uint32_t* __restrict dest, uint32_t stride) const {
     }
 }
 
-void Framebuffer::SaveImage(const char* filename) const {
-    auto pixels = std::make_unique<uint32_t[]>(Width * Height);
-    GetPixels(pixels.get(), Width);
-    stbi_write_png(filename, (int)Width, (int)Height, 4, pixels.get(), (int)Width * 4);
-}
-
 };  // namespace swr
