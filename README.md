@@ -61,10 +61,51 @@ For RGBA8 textures, bilinear interpolation is done in 16-bit fixed-point using `
 
 A micro-optimization for sampling multiple textures of the same size is to pack them into a single layered texture, which can be implemented essentially for free with a single offset. If sample() calls are even partially inlined, the compiler can [eliminate](https://en.wikipedia.org/wiki/Common_subexpression_elimination) duplicated UV setup for all of those calls (wrapping, scaling, rounding, and mip selection), since it can more easily prove that all layers have the same size. This is currently done for the BaseColor + NormalMap/MetallicRoughness + Emission textures, saving about 3-5% from rasterization time.
 
-Seamless cubemaps are relatively important as they will otherwise cause quite noticeable artifacts on high-roughness materials and pre-filtered environment maps. The current impl adjusts UVs and offsets near face edges to the nearest adjacent face when they are sampled using a [LUT](https://github.com/dubiousconst282/GLimpSW/blob/c1660c5bba70219798215898c8f744a1517be773/src/SwRast/Texture.h#L241-L246). An [easier and likely faster way](https://github.com/google/filament/blob/main/libs/ibl/src/Cubemap.cpp#L94) would be to pre-bake adjacent texels on the same face (or maybe some dummy memory location to avoid non-pow2 strides), so the sampling function could remain mostly unchanged. (But I just don't want to think about cubemaps again any time soon.)
+Seamless cubemaps are relatively important as they will otherwise cause quite noticeable artifacts on high-roughness materials and pre-filtered environment maps. The current impl adjusts UVs and offsets near face edges to the nearest adjacent face when they are sampled using a [LUT](https://github.com/dubiousconst282/GLimpSW/blob/c1660c5bba70219798215898c8f744a1517be773/src/SwRast/Texture.h#L241-L246). An [easier and likely faster way](https://github.com/google/filament/blob/main/libs/ibl/src/Cubemap.cpp#L94) would be to pre-bake adjacent texels on the same face (or maybe some dummy memory location to avoid non-pow2 strides), so the sampling function could remain mostly unchanged. Alternatively, octahedron maps may prove to be far simpler to implement.
+
+### Memory Gather Throughput
+Current consumer-level x86 CPUs do not implement coalescing logic for AVX gathers, instead always scalarizing to 1uop per lane. There is also a small overhead compared to scalar loads, so there must be enough computation involved to make up for it.
+
+For bilinear texture filtering, 4 gather instructions are needed to fetch the pixels neighboring each sample (P00, P10, P01, P11). Since we index textures linearly (`x + y * stride`), the two pixels neighboring across the X axis can be fetched at once for ~half the cost using 64-bit gather instructions, combined with 2-input permutes for unpacking. This improves raw throughput by ~1.3x on benchmarks, but again the effect is relatively subtle on real workloads.
+
+```cpp
+    v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), tex.Data.get(), 4);
+    v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), tex.Data.get(), 4);
+    v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), tex.Data.get(), 4);
+    v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), tex.Data.get(), 4);
+
+    v_int data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 0, row0_hi);
+    v_int data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 1, row0_hi);
+    v_int data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 0, row1_hi);
+    v_int data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 1, row1_hi);
+```
+
+[TexBench64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
+|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark
+|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------
+|                1.05 |      955,441,466.75 |    0.2% |            5.38 |            2.61 |  2.063 |           0.19 |    0.0% |      1.58 | `Gather32`
+|                0.77 |    1,293,362,045.65 |    0.1% |            5.94 |            1.92 |  3.087 |           0.19 |    0.0% |      1.60 | `Gather64`
+
+When the "Gather Data Sampling" vulnerability mitigation is enabled on TigerLake and older Intel CPUs, gather throughput is reduced by over 3x, which slows down the renderer noticeably. On Linux, it can be disabled by booting with kernel parameter `mitigations=off` or `gather_data_sampling=off`.
+
+default
+|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark
+|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------
+|              121.69 |        8,217,937.67 |    1.3% |        1,230.00 |          302.42 |  4.067 |          66.00 |    1.5% |      1.64 | `Load_Scalar_32`
+|               18.70 |       53,467,269.08 |    0.7% |          171.00 |           46.36 |  3.688 |          10.00 |    0.0% |      1.67 | `Load_AVX2`
+|               18.69 |       53,495,847.79 |    0.3% |           97.00 |           46.46 |  2.088 |           6.00 |    0.0% |      1.65 | `Load_AVX512`
+|              410.49 |        2,436,102.25 |    0.6% |          294.00 |        1,018.32 |  0.289 |           6.00 |    0.0% |      1.64 | `Gather32_AVX512`
+
+mitigations=off
+|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark
+|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------
+|              120.67 |        8,287,178.49 |    0.6% |        1,230.00 |          299.41 |  4.108 |          66.00 |    1.5% |      1.56 | `Load_Scalar_32`
+|               30.60 |       32,684,184.90 |    0.7% |          171.00 |           76.03 |  2.249 |          10.00 |    0.0% |      1.66 | `Load_AVX2`
+|               18.66 |       53,602,141.29 |    0.3% |           97.00 |           46.34 |  2.093 |           6.00 |    0.0% |      1.66 | `Load_AVX512`
+|              135.25 |        7,393,699.75 |    0.5% |          294.00 |          336.43 |  0.874 |           6.00 |    0.0% |      1.66 | `Gather32_AVX512`
 
 ### Texture Swizzling
-GPUs typically rearrange texture data in some way to improve memory spatial locality, so that nearby texels are always close to each other independent of transformations like rotations. In my limited experiments, this didn't seem to have a significant impact outside of artificial benchmarks. After mip-mapping, sampling seems to get bound by compute more than memory latency.
+GPUs typically rearrange texture data in some way to improve memory spatial locality, so that nearby texels are always close to each other independently of transformations like rotations. In my limited experiments, this didn't seem to have a significant impact outside of artificial benchmarks. After mip-mapping, sampling seems to get bound by compute more than memory latency.
 
 Below are the [benchmark](https://github.com/dubiousconst282/GLimpSW/commit/d0896e9788f73c2372b424d031d55741006f0f2b) results from scanning over a 2048x2048 texture in row-major order, after applying the specified rotation or zeroing UVs. With smaller textures (1024x1024) the difference is quite negligible, since the data will fit almost entirely in the L3 cache.
 
@@ -84,7 +125,7 @@ That sounds neat in theory, but the benchmark results for my [experimental imple
 | Fine only   | 6.17 ms |
 | Coarse      | 6.63 ms |
 
-Ultimately, this isn't that surprising considering that the basic rasterizer can skip non-covered fragments in just about 5 cycles or so, and most triangles on even relatively simple scenes are very small. For Sponza at 1080p, more than 90% triangles have bounding boxes smaller than 16x16 when viewed from the center. Setup cost and other overhead dominates at least a third of processing time, so it might make sense to use smaller SIMD fragments, or even dynamically switch between them depending on triangle size (with maybe some preprocessor/template magic).
+Ultimately, this isn't that surprising considering that the basic rasterizer can skip non-covered fragments in just about 5 cycles or so, and most triangles on even relatively simple scenes are very small. For Sponza at 1080p, more than 90% triangles have bounding boxes smaller than 16x16 when viewed from the center. Setup cost and other overhead dominates at least a third of processing time, so it might make sense to use smaller SIMD vectors, or even try to have separate raster and shading passes to avoid inactive SIMD lanes.
 
 ### Multi-threading
 Use of multi-threading is currently fairly limited and only done for bin rasterization and full-screen passes, using the parallel loops from `std::for_each(par_unseq)`. This is far from optimal because it leads to stalls between vertex shading/triangle setup and rasterization, so the CPU is never fully busy. It could probably be improved to some extent without complicating state and memory management too much, but threading is hard... Maybe OpenMP would be nice for this.

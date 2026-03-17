@@ -23,3 +23,9 @@ target_include_directories(SwRast PRIVATE ${stb_SOURCE_DIR})
 if(CMAKE_HOST_LINUX)
     target_link_libraries(SwRast PRIVATE tbb)
 endif()
+
+add_executable(BenchmarkApp
+    Benchmarks/TexGather64.cpp
+)
+target_link_libraries(BenchmarkApp PRIVATE glm::glm nanobench)
+target_compile_options(BenchmarkApp PRIVATE "-march=native" "-ffast-math" "-Wno-unused" "-Wsign-conversion")

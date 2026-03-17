@@ -526,13 +526,25 @@ private:
         v_int iy = iyf >> LerpFracBits;
 
         v_int indices00 = offset + ix + (iy << stride);
-        v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)Height ? v_int(1) << stride : 0);
-        v_int clampX = ((ix + 1) << mipLevel) >= (int32_t)Width;
+        v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)Height ? 1 << stride : 0);
+        v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)Width;
 
-        v_int data00 = GatherRawTexels(indices00);
-        v_int data10 = GatherRawTexels(indices00 + (clampX ? 0 : 1));
-        v_int data01 = GatherRawTexels(indices01);
-        v_int data11 = GatherRawTexels(indices01 + (clampX ? 0 : 1));
+#if 0
+        v_int data00 = _mm512_i32gather_epi32(indices00, Data.get() + 0, 4);
+        v_int data10 = _mm512_i32gather_epi32(indices00, Data.get() + 1, 4);
+        v_int data01 = _mm512_i32gather_epi32(indices01, Data.get() + 0, 4);
+        v_int data11 = _mm512_i32gather_epi32(indices01, Data.get() + 1, 4);
+#else
+        v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data.get(), 4);
+        v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data.get(), 4);
+        v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data.get(), 4);
+        v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data.get(), 4);
+
+        v_int data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 0, row0_hi);
+        v_int data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 1, row0_hi);
+        v_int data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 0, row1_hi);
+        v_int data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 1, row1_hi);
+#endif
 
         if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {
             // 15-bit fraction for mulhrs
@@ -540,6 +552,7 @@ private:
             v_int fy = (iyf & LerpFracMask) << (15 - LerpFracBits);
             fx = (fx << 16) | fx;
             fy = (fy << 16) | fy;
+            fx = inboundX ? fx : 0;
 
             // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
             v_int rbRow1 = simd::lerp16((data00 >> 0) & 0x00FF00FF, (data10 >> 0) & 0x00FF00FF, fx);
@@ -547,7 +560,6 @@ private:
             v_int rbRow2 = simd::lerp16((data01 >> 0) & 0x00FF00FF, (data11 >> 0) & 0x00FF00FF, fx);
             v_int gaRow2 = simd::lerp16((data01 >> 8) & 0x00FF00FF, (data11 >> 8) & 0x00FF00FF, fx);
 
-            // Columns
             v_int rbCol = simd::lerp16(rbRow1, rbRow2, fy);
             v_int gaCol = simd::lerp16(gaRow1, gaRow2, fy);
 
@@ -558,6 +570,7 @@ private:
             const float fracScale = 1.0f / (LerpFracMask + 1);
             v_float fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
             v_float fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
+            fx = inboundX ? fx : 0;
 
             R colors00 = Texel::Unpack(data00);
             R colors10 = Texel::Unpack(data10);
