@@ -15,7 +15,8 @@ struct Framebuffer {
 
     uint32_t Width, Height, TileStride;
     uint32_t AttachmentStride, NumAttachments;
-    
+
+    // TODO: experiment with fast clears for depth
     AlignedBuffer<uint32_t> ColorBuffer;
     AlignedBuffer<float> DepthBuffer;
     AlignedBuffer<uint8_t> AttachmentBuffer;
@@ -89,7 +90,6 @@ private:
         // Non-temporal fill is ~2-3x faster than memset(), but makes rasterization a bit slower. Still a small win overall.
         // https://en.algorithmica.org/hpc/cpu-cache/bandwidth/
         uint32_t count = Width * Height;
-
         for (uint32_t i = 0; i < count; i += 16) {
             _mm512_stream_si512((uint32_t*)ptr + i, _mm512_set1_epi32((int32_t)value));
         }
@@ -98,83 +98,63 @@ private:
 };
 
 struct ShadedMeshlet {
-    static constexpr uint32_t MaxVertices = 64, MaxPrims = 128, MaxAttribs = 16;
+    static constexpr uint32_t MaxVertices = 64, MaxPrims = 128;
 
     uint8_t PrimCount = 0;
     alignas(64) uint8_t Indices[3][MaxPrims];
-    alignas(64) float Attribs[16][MaxVertices];  // 0..3: SV_Position, 4..: Custom
+    alignas(64) float Position[4][MaxVertices];
 
-    template<typename T>
-    void SetAttrib(uint32_t attrId, uint32_t offset, const T& value) {
-        assert(offset % 16 == 0 && sizeof(T) % sizeof(v_float) == 0);
-        for (uint32_t i = 0; i < sizeof(T) / sizeof(v_float); i++) {
-            memcpy(&Attribs[attrId + i][offset], (v_float*)&value + i, sizeof(v_float));
-        }
+    void SetPosition(uint32_t index, v_float4 value) {
+        assert(index % simd::vec_width == 0);
+        simd::store(value.x, &Position[0][index]);
+        simd::store(value.y, &Position[1][index]);
+        simd::store(value.z, &Position[2][index]);
+        simd::store(value.w, &Position[3][index]);
     }
 };
 
+enum class FaceCullMode { None, FrontCCW, FrontCW };
+
 struct TrianglePacket {
-    v_float2 Z0, Z1, Z2; // Z,W
-    v_int MinX, MinY, MaxX, MaxY;
-    v_int W0, W1, W2;
+    v_uint MinXY, MaxXY;
+    v_int Edge0, Edge1, Edge2;
     v_int A01, A12, A20;
     v_int B01, B12, B20;
-    v_float RcpArea;
 
-    // Computes edge variables based on shaded vertices.
-    void Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize);
+    v_float Z0, Z10, Z20;
+    v_float W0, W0S, W1S, W2S;
+
+    // Computes edge variables based on vertices in NDC space.
+    v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode);
 };
 
-struct VaryingBuffer {
-    const ShadedMeshlet* Meshlet;
+struct FragmentVars {
     uint32_t MeshletId, PrimitiveId;
     uint8_t Indices[3];
 
     uint32_t TileOffset;
     v_mask TileMask;
 
-    v_float W0, W1, W2;
+    v_float3 Bary;
     v_float Depth;
 
     // Interpolates vertex attributes using the current barycentric weights.
-    v_float GetSmooth(uint32_t attrId) const {
-        float v0 = GetFlat(attrId, 0);
-        float v1 = GetFlat(attrId, 1);
-        float v2 = GetFlat(attrId, 2);
-        return simd::fma(v0, W0, simd::fma(v1, W1, v2 * W2));           // 3 op per attrib + 2 setup
-        // return simd::fma(v1 - v0, W1, simd::fma(v2 - v0, W2, v0));   // 4 op per attrib
-    }
-    // Returns the value of the specified vertex attribute, without interpolation.
-    // If `vertexId != 0`, returns `attr[vertexId] - attr[0]`.
-    float GetFlat(uint32_t attrId, uint32_t vertexId = 0) const {
-        assert(attrId < 16 && vertexId < 3);
-        return Meshlet->Attribs[attrId][Indices[vertexId]];
+    v_float Interpolate(v_float v0, v_float v1, v_float v2) const {
+        return simd::fma(v0, Bary.x, simd::fma(v1, Bary.y, v2 * Bary.z));       // 3 op per attrib + setup
+        // return simd::fma(v1 - v0, Bary.y, simd::fma(v2 - v0, Bary.z, v0));   // 4 op per attrib
     }
 
     // Interpolates a vector of vertex attributes. `T` should be a struct containing only `v_float` fields.
     template<typename T>
-    T GetSmooth(uint32_t attrId) const {
-        static_assert(sizeof(T) % sizeof(v_float) == 0);
-
+    T Interpolate(T v0, T v1, T v2) const {
         constexpr uint32_t count = sizeof(T) / sizeof(v_float);
-        v_float dest[count];
 
-        for (uint32_t i = 0; i < count; i++) {
-            dest[i] = GetSmooth(attrId + i);
-        }
-        return *(T*)&dest;
-    }
-
-    void ApplyPerspectiveCorrection() {
-        // https://stackoverflow.com/a/24460895
-        const uint32_t AttribW = 3;
-        v_float v0 = GetFlat(AttribW, 0);
-        v_float v1 = GetFlat(AttribW, 1);
-        v_float v2 = GetFlat(AttribW, 2);
-        v_float vp = simd::rcp14(simd::fma(v0, W0, simd::fma(v1, W1, v2 * W2)));
-
-        W1 *= vp * v1;
-        W2 *= vp * v2;
+        T result;
+        result.x = Interpolate(v0.x, v1.x, v2.x);
+        result.y = Interpolate(v0.y, v1.y, v2.y);
+        if constexpr (count >= 3) result.z = Interpolate(v0.z, v1.z, v2.z);
+        if constexpr (count >= 4) result.w = Interpolate(v0.w, v1.w, v2.w);
+        return result;
     }
 };
 
@@ -187,33 +167,26 @@ struct Clipper {
         Near = 4,    // Z-
         Far = 5,     // Z+
     };
-    struct Vertex {
-        float Attribs[ShadedMeshlet::MaxAttribs];
-    };
     struct ClipCodes {
-        v_mask AcceptMask;       // Triangles that are in-bounds and can be immediately rasterized.
-        v_mask NonTrivialMask;   // Triangles that need to be clipped.
+        v_mask AcceptMask;      // Triangles that are in-bounds and can be immediately rasterized.
+        v_mask NonTrivialMask;  // Triangles that need to be clipped.
         uint8_t OutCodes[16];   // Planes that need to be clipped against (per-triangle).
     };
 
     uint32_t Count, FreeVtx;
-    float GuardBandPlaneDistXY[2]{ 1.0f, 1.0f };
+    glm::vec2 GuardBandPlaneDist = { 1.0f, 1.0f };
     uint8_t Indices[24];
-    Vertex Vertices[24];
+    glm::vec4 Vertices[24];
 
     // Compute Cohen-Sutherland clip codes
     ClipCodes ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2);
 
-    void ClipAgainstPlane(Plane plane, uint32_t numAttribs);
-
-    void LoadTriangle(TrianglePacket& srcTri, uint32_t srcTriIdx, uint32_t numAttribs);
-    void StoreTriangle(TrianglePacket& destTri, uint32_t destTriIdx, uint32_t srcTriFanIdx, uint32_t numAttribs);
+    void ClipAgainstPlane(Plane plane);
 };
 
 template<typename T>
 concept ShaderProgram =
-    requires(T s, ShadedMeshlet& meshlet, Framebuffer& fb, VaryingBuffer& vars) {
-        { T::NumCustomAttribs } -> std::convertible_to<uint32_t>;
+    requires(T s, ShadedMeshlet& meshlet, Framebuffer& fb, FragmentVars& vars) {
         { s.ShadeMeshlet(0u, meshlet) } -> std::same_as<void>;
         { s.ShadePixels(fb, vars) } -> std::same_as<void>;
     };
@@ -272,67 +245,67 @@ class Rasterizer {
     template<ShaderProgram TShader>
     void DrawTriangleImmediate(const TShader& shader, const TrianglePacket& tri, const ShadedMeshlet& mesh,
                                uint8_t i, uint8_t primIdx, uint32_t meshletId) {
-        uint32_t minX = (uint32_t)tri.MinX[i];
-        uint32_t minY = (uint32_t)tri.MinY[i];
-        uint32_t maxX = (uint32_t)tri.MaxX[i];
-        uint32_t maxY = (uint32_t)tri.MaxY[i];
-
-        v_int tileOffsX = simd::FragPixelOffsetsX, tileOffsY = simd::FragPixelOffsetsY;
+        uint32_t minX = tri.MinXY[i] & 0xFFFF, minY = tri.MinXY[i] >> 16;
+        uint32_t maxX = tri.MaxXY[i] & 0xFFFF, maxY = tri.MaxXY[i] >> 16;
+        [[assume(minX <= maxX), assume(minY <= maxY)]];         // avoids redundant initial bounds check
+        [[assume((minX & 3) == 0), assume((minY & 3) == 0)]];   // avoids redundant masking in GetTileOffset()
 
         v_int stepX0 = tri.A12[i], stepX1 = tri.A20[i], stepX2 = tri.A01[i];
         v_int stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
 
         // Barycentric coordinates at start of row
-        v_int rowW0 = tri.W0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
-        v_int rowW1 = tri.W1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
-        v_int rowW2 = tri.W2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
+        constexpr v_int tileOffsX = simd::FragPixelOffsetsX, tileOffsY = simd::FragPixelOffsetsY;
+        v_int edge0 = tri.Edge0[i] + stepX0 * tileOffsX + stepY0 * tileOffsY;
+        v_int edge1 = tri.Edge1[i] + stepX1 * tileOffsX + stepY1 * tileOffsY;
+        v_int edge2 = tri.Edge2[i] + stepX2 * tileOffsX + stepY2 * tileOffsY;
 
         stepX0 *= 4, stepX1 *= 4, stepX2 *= 4;
         stepY0 *= 4, stepY1 *= 4, stepY2 *= 4;
 
-        float area = tri.RcpArea[i];
-        VaryingBuffer vars = {
-            .Meshlet = &mesh,
+        FragmentVars vars = {
             .MeshletId = meshletId,
             .PrimitiveId = primIdx,
             .Indices = { mesh.Indices[0][primIdx], mesh.Indices[1][primIdx], mesh.Indices[2][primIdx] },
         };
 
         for (uint32_t y = minY; y <= maxY; y += 4) {
-            v_int w0 = rowW0, w1 = rowW1, w2 = rowW2;
+            v_int edgeX0 = edge0, edgeX1 = edge1, edgeX2 = edge2;
+            vars.TileOffset = _fb.GetPixelOffset(minX, y);
 
-            for (uint32_t x = minX; x <= maxX; x += 4) {
-                v_mask tileMask = simd::movemask((w0 | w1 | w2) >= 0);
+            for (uint32_t x = minX; x <= maxX; x += 4, vars.TileOffset += 16) {
+                v_mask tileMask = simd::movemask((edgeX0 | edgeX1 | edgeX2) >= 0);
 
                 if (tileMask != 0) [[unlikely]] {
-                    vars.TileOffset = _fb.GetPixelOffset(x, y);
-                    vars.W1 = simd::conv2f(w1) * area;
-                    vars.W2 = simd::conv2f(w2) * area;
-                    vars.W0 = 1.0f - vars.W1 - vars.W2;
+                    v_float u = simd::conv2f(edgeX1);
+                    v_float v = simd::conv2f(edgeX2);
 
-                    v_float oldDepth = simd::load(&_fb.DepthBuffer[vars.TileOffset]);
-                    v_float newDepth = simd::fma(tri.Z0.x, vars.W0, simd::fma(tri.Z1.x, vars.W1, tri.Z2.x * vars.W2));
+                    vars.TileMask = tileMask;
+                    vars.Depth = simd::fma(tri.Z10[i], u, simd::fma(tri.Z20[i], v, tri.Z0[i]));
 
-                    //tileMask &= simd::movemask(newDepth < oldDepth);
+                    // Perspective correction - https://stackoverflow.com/a/24460895
+                    // (Relying on code motion to move this after depth-test branch in shader)
+                    v_float pw0 = simd::fma(u + v, -tri.W0S[i], tri.W0[i]);
+                    v_float pw1 = tri.W1S[i];  // (1/area) is baked in!
+                    v_float pw2 = tri.W2S[i];
+                    v_float rcpW = simd::rcp14(simd::fma(pw1, u, simd::fma(pw2, v, pw0)));
+                    u *= pw1 * rcpW;
+                    v *= pw2 * rcpW;
+                    vars.Bary = { 1 - u - v, u, v };
 
-                    if (tileMask != 0) {
-                        vars.Depth = newDepth;
-                        vars.TileMask = tileMask;
-
-                        [[clang::always_inline]] shader.ShadePixels(_fb, vars);
-                    }
+                    [[clang::always_inline]] shader.ShadePixels(_fb, vars);
                 }
-                w0 += stepX0, w1 += stepX1, w2 += stepX2;
+                edgeX0 += stepX0, edgeX1 += stepX1, edgeX2 += stepX2;
             }
-            rowW0 += stepY0, rowW1 += stepY1, rowW2 += stepY2;
+            edge0 += stepY0, edge1 += stepY1, edge2 += stepY2;
         }
     }
 
 public:
+    FaceCullMode CullMode = FaceCullMode::FrontCCW;
+
     Rasterizer(Framebuffer& fb) : _fb(fb), _batch(fb.Width, fb.Height) {
         const float maxViewSize = 2048.0f;
-        _clipper.GuardBandPlaneDistXY[0] = maxViewSize / fb.Width;
-        _clipper.GuardBandPlaneDistXY[1] = maxViewSize / fb.Height;
+        _clipper.GuardBandPlaneDist = maxViewSize / glm::vec2(fb.Width, fb.Height);
     }
 
     template<ShaderProgram TShader>
@@ -340,7 +313,6 @@ public:
         DrawMeshletsImpl(count, {
             .MeshFn = [&](uint32_t index, ShadedMeshlet& meshlet) { shader.ShadeMeshlet(index, meshlet); },
             .DrawFn = [&](auto&&... args) { DrawTriangleImmediate(shader, args...); }
-          //  .NumCustomAttribs = shader.NumCustomAttribs,
         });
     }
 };

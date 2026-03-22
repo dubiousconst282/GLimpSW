@@ -25,12 +25,8 @@ _Sample scenes rendered at 1080p on a 4-core laptop CPU @ ~3.5GHz (i5-11320H)_
 - Multi-threaded tiled rasterizer (binning)
 - Guard-band clipping
 
-_Most of the effects aren't quite correct nor very well tuned, since this is a toy project and my focus was more on performance and simplicity than final quality._
-
 ## Building
-The project uses CMake and CPM for project and dependency management. Clang or GCC must be used for building, as MSVC builds were initially about 2x slower, and some `__builtin_*` intrinsics are now being used. Debug builds are also too slow for most of anything, so release/optimized builds are preferred except for heavy debugging.
-
-Open project on VS or VSC or wherever, or build through CLI:
+The project uses CMake and CPM for build and dependency management. It depends on Clang's vector type extension and various related intrinsics.
 
 ```
 cmake -S ./src/SwRast -B ./build/ -G Ninja -DCMAKE_CXX_COMPILER="C:/Program Files/LLVM/bin/clang++.exe" -DCMAKE_C_COMPILER="C:/Program Files/LLVM/bin/clang.exe"
@@ -51,7 +47,7 @@ cmake --build ./build/ --config RelWithDebInfo
 - https://github.com/Mesa3D/mesa
 - https://github.com/google/swiftshader
 
-## Appendix: Implementation Notes
+## Implementation Notes
 A boring brain dump about a few intricacies I have and haven't tried.
 
 ### Texture Sampling
@@ -63,10 +59,10 @@ A micro-optimization for sampling multiple textures of the same size is to pack 
 
 Seamless cubemaps are relatively important as they will otherwise cause quite noticeable artifacts on high-roughness materials and pre-filtered environment maps. The current impl adjusts UVs and offsets near face edges to the nearest adjacent face when they are sampled using a [LUT](https://github.com/dubiousconst282/GLimpSW/blob/c1660c5bba70219798215898c8f744a1517be773/src/SwRast/Texture.h#L241-L246). An [easier and likely faster way](https://github.com/google/filament/blob/main/libs/ibl/src/Cubemap.cpp#L94) would be to pre-bake adjacent texels on the same face (or maybe some dummy memory location to avoid non-pow2 strides), so the sampling function could remain mostly unchanged. Alternatively, octahedron maps may prove to be far simpler to implement.
 
-### Memory Gather Throughput
-Current consumer-level x86 CPUs do not implement coalescing logic for AVX gathers, instead always scalarizing to 1uop per lane. There is also a small overhead compared to scalar loads, so there must be enough computation involved to make up for it.
+### Memory Gathers
+Current consumer-level x86 CPUs do not implement coalescing logic for AVX gathers, instead always scalarizing to 1uop per lane. There is also a small overhead compared to scalar loads, so enough computation must be involved to make up for it.
 
-For bilinear texture filtering, 4 gather instructions are needed to fetch the pixels neighboring each sample (P00, P10, P01, P11). Since we index textures linearly (`x + y * stride`), the two pixels neighboring across the X axis can be fetched at once for ~half the cost using 64-bit gather instructions, combined with 2-input permutes for unpacking. This improves raw throughput by ~1.3x on benchmarks, but again the effect is relatively subtle on real workloads.
+For bilinear texture sampling, 4 gather instructions are needed to fetch the pixels neighboring each sample (P00, P10, P01, P11). Since we index textures linearly (`x + y * stride`), the two pixels neighboring across the X axis can be fetched at once for ~half the cost using 64-bit gather instructions, combined with 2-input permutes for unpacking. This improves raw throughput by ~1.3x on benchmarks, and ~8% when sampling once in fragment shader. [TexBench64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
 
 ```cpp
     v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), tex.Data.get(), 4);
@@ -80,13 +76,21 @@ For bilinear texture filtering, 4 gather instructions are needed to fetch the pi
     v_int data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 1, row1_hi);
 ```
 
-[TexBench64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
-|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark
-|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------
-|                1.05 |      955,441,466.75 |    0.2% |            5.38 |            2.61 |  2.063 |           0.19 |    0.0% |      1.58 | `Gather32`
-|                0.77 |    1,293,362,045.65 |    0.1% |            5.94 |            1.92 |  3.087 |           0.19 |    0.0% |      1.60 | `Gather64`
+For gathering values from a small array (64 elements), replacing gathers with loads + permutes provides a ~2.2x speedup. This is used to load clip-space positions output from the mesh shader. [GatherSmall.cpp](./src/SwRast/Benchmarks/GatherSmall.cpp)
 
-When the "Gather Data Sampling" vulnerability mitigation is enabled on TigerLake and older Intel CPUs, gather throughput is reduced by over 3x, which slows down the renderer noticeably. On Linux, it can be disabled by booting with kernel parameter `mitigations=off` or `gather_data_sampling=off`.
+```cpp
+static v_float GatherPreload64(const float data[64], v_int idx) {
+    v_float v0 = _mm512_load_ps(&data[0]);
+    v_float v1 = _mm512_load_ps(&data[16]);
+    v_float v2 = _mm512_load_ps(&data[32]);
+    v_float v3 = _mm512_load_ps(&data[48]);
+    v_float p01 = _mm512_permutex2var_ps(v0, idx, v1);
+    v_float p23 = _mm512_permutex2var_ps(v2, idx, v3);
+    return idx < 32 ? p01 : p23;
+}
+```
+
+When the "Gather Data Sampling" vulnerability mitigation is enabled on TigerLake and older Intel CPUs, gather throughput is reduced by over 3x, which slows down the renderer noticeably. On Linux, it can be disabled by booting with kernel parameter `mitigations=off` or `gather_data_sampling=off`. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp)
 
 default
 |               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark
@@ -116,16 +120,25 @@ Below are the [benchmark](https://github.com/dubiousconst282/GLimpSW/commit/d089
 | Z-Order     | 4.55 ms | 5.96 ms | 11.0 ms | 12.3 ms |
 
 ### Coarse Rasterization
-The basic rasterizer always traverses over fixed size tiles (in this case, 4x4 pixels) to test whether any pixels are covered or not, before doing the depth test and invoking the shader. A [coarse rasterizer](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/) first rasterizes bigger tiles and collect masks about which fragments are partially or fully covered, so it can skip through tiles of the bounding box that are outside the triangle much quicker.
+The basic rasterizer always traverses over the triangle's bounding box in fixed size steps (in this case, 4x4 pixels) to test whether any pixels are covered, before invoking the shader. A [coarse rasterizer](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/) first test bigger tiles to collect masks about which fragments are partially or fully covered, so it can skip through tiles of the bounding box that are outside the triangle much quicker.
 
-That sounds neat in theory, but the benchmark results for my [experimental implementation](https://github.com/dubiousconst282/GLimpSW/blob/hierarchical-rast/src/SwRast/SwRast.h#L427) weren't very promising, though:
+My [initial implementation](https://github.com/dubiousconst282/GLimpSW/blob/hierarchical-rast/src/SwRast/SwRast.h#L427) did not show a considerable improvement, likely because most triangles on even relatively simple scenes are very small. For Sponza at 1080p, over 90% triangles have bounding boxes smaller than 16x16 when viewed from the center.
 
 | Rasterizer  | Time    |
 | ----------  | ----    |
 | Fine only   | 6.17 ms |
 | Coarse      | 6.63 ms |
 
-Ultimately, this isn't that surprising considering that the basic rasterizer can skip non-covered fragments in just about 5 cycles or so, and most triangles on even relatively simple scenes are very small. For Sponza at 1080p, more than 90% triangles have bounding boxes smaller than 16x16 when viewed from the center. Setup cost and other overhead dominates at least a third of processing time, so it might make sense to use smaller SIMD vectors, or even try to have separate raster and shading passes to avoid inactive SIMD lanes.
+[TODO3] This may prove more sucessful when applied in isolation to bigger triangles.
+
+Other approaches as suggested by Pineda and others (backtrack, zig-zag, middle-out) have shown to be difficult to implement correctly and efficiently. In another experiment, seeking to the start of a row and exiting after the first non-covered tile provided a ~10% speed up, but is not trivial as it first appears: simply checking for an empty tile coverage mask is not enough and causes occasional artifacts, since very thin triangles may produce gaps between tile rows; separate edge weights/bias may be necessary.
+
+[TODO2] Additionally, it may be feasible to rasterize multiple small triangles at a time, by splitting a 16 vector to 4 triangles and processing 2x2 pixels at a time. Scattering results to the framebuffer may be problematic and require scalarized conflict resolution.
+
+### Visibility Buffer
+[TODO1]
+
+Vis-buffers do not require any complex shader operations and largely only write trivial parameters to the framebuffer, which should help reduce the problem of wasting SIMD lanes and register pressure.
 
 ### Multi-threading
-Use of multi-threading is currently fairly limited and only done for bin rasterization and full-screen passes, using the parallel loops from `std::for_each(par_unseq)`. This is far from optimal because it leads to stalls between vertex shading/triangle setup and rasterization, so the CPU is never fully busy. It could probably be improved to some extent without complicating state and memory management too much, but threading is hard... Maybe OpenMP would be nice for this.
+Use of multi-threading is currently fairly limited and only done for bin rasterization and full-screen passes, using the parallel loops from `std::for_each(par_unseq)`. This is far from optimal because it leads to stalls between vertex shading/triangle setup and rasterization, so the CPU is never fully busy.

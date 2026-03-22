@@ -19,6 +19,7 @@ struct Material {
 struct Node {
     std::vector<Node> Children;
     uint32_t MeshletOffset = 0, MeshletCount = 0;
+    glm::mat4 LocalTransform = glm::mat4(1);
     glm::mat4 GlobalTransform = glm::mat4(1);
     glm::vec3 BoundMin = glm::vec3(FLT_MAX);
     glm::vec3 BoundMax = glm::vec3(-FLT_MAX);
@@ -28,7 +29,7 @@ struct Meshlet {
     glm::vec3 ConeApex, ConeAxis;
     float ConeCutoff;
 
-    uint8_t NumVertices, NumTriangles;
+    uint16_t NumVertices, NumTriangles;
     uint32_t MaterialId;
 
     alignas(64) float Positions[3][64];
@@ -55,7 +56,7 @@ struct Model {
             _node = &RootNode;
         }
 
-        glm::mat4 localMat = _node->GlobalTransform * _parentMat;
+        glm::mat4 localMat = _node->LocalTransform * _parentMat;
 
         if (_node->MeshletCount > 0 && !visitor(*_node, localMat)) return;
 

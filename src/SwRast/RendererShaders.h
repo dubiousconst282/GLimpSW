@@ -46,10 +46,10 @@ struct DefaultShader {
     swr::AlignedBuffer<uint32_t> ResolvedTAABuffer;
 
     // Uniform: Forward
-    glm::mat4 ProjMat;
-    glm::mat3 ModelMat;
+    glm::mat4 ProjMat, ModelMat;
     const scene::Meshlet* Meshlets;
     const swr::RgbaTexture2D* MaterialTex;  // See `scene::Material` for what's on this texture.
+    const scene::Material* Materials;
 
     // Uniform: Compose pass
     const swr::Framebuffer* ShadowBuffer;
@@ -58,46 +58,62 @@ struct DefaultShader {
 
     float IntensityIBL = 0.3f;
     float Exposure = 1.0f;
-    bool EnableTAA = true;
+    bool EnableTAA = false;
     bool BlurSkybox = false;
 
     void ShadeMeshlet(uint32_t index, swr::ShadedMeshlet& output) const {
         auto& mesh = Meshlets[index];
 
-        output.PrimCount = 0;
-        if (glm::dot(glm::normalize(mesh.ConeApex - ViewPos), mesh.ConeAxis) >= mesh.ConeCutoff) return;
+        // output.PrimCount = 0;
+        // if (glm::dot(glm::normalize(mesh.ConeApex - ViewPos), mesh.ConeAxis) >= mesh.ConeCutoff) return;
 
         for (uint32_t i = 0; i < mesh.NumVertices; i += vec_width) {
             v_float3 worldPos = { load(&mesh.Positions[0][i]), load(&mesh.Positions[1][i]), load(&mesh.Positions[2][i]) };
-            v_float4 clipPos = TransformVector(ProjMat, { worldPos, 1.0f });
-            output.SetAttrib(0, i, clipPos);
+            output.SetPosition(i, TransformVector(ProjMat, { worldPos, 1.0f }));
         }
         output.PrimCount = mesh.NumTriangles;
         memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
     }
 
-    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
-       // vars.ApplyPerspectiveCorrection();
+    static glm::vec2 UnpackHalf2x16(uint32_t x) {
+        // GLM emulates this with 100 instructions.
+        auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
+        return { v[0], v[1] };
+    }
 
+    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {
         if (true) {
-            v_int baseColor = swr::pixfmt::RGBA8u::Pack({ vars.W1, vars.W2, vars.W0, 0 });
-          //  baseColor=round2i(vars.Depth*255.0f)*0x010101;
-            fb.WriteTile(vars.TileOffset, vars.TileMask, baseColor, vars.Depth);
+            // Depth test
+            v_float oldDepth = load(&fb.DepthBuffer[vars.TileOffset]);
+            vars.TileMask &= movemask(vars.Depth > oldDepth);
+            if (vars.TileMask == 0) return;
+
+            auto& mesh = Meshlets[vars.MeshletId];
+            v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[0]]);
+            v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[1]]);
+            v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[2]]);
+            v_float2 uv = vars.Interpolate(uv0,uv1,uv2);
+
+            auto tex = Materials[mesh.MaterialId].Texture;
+            v_int color = tex->Sample<SurfaceSampler>(uv.x,uv.y);
+
+           // v_int color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
+            fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
             return;
         }
 
-        v_float u = vars.GetSmooth(0);
-        v_float v = vars.GetSmooth(1);
+        v_float u = 0;
+        v_float v = 0;
 
         v_int baseColor = MaterialTex->Sample<SurfaceSampler>(u, v, 0);
-        v_float3 N = normalize(vars.GetSmooth<v_float3>(2));
+        v_float3 N = normalize(v_float3(0));
 
         v_float metalness = 0.0f;
         v_float roughness = 0.5f;
 
         if (MaterialTex->NumLayers >= 2) [[likely]] {
             v_float4 SN = swr::pixfmt::RGBA8u::Unpack(MaterialTex->Sample<SurfaceSampler>(u, v, 1));
-            v_float3 T = vars.GetSmooth<v_float3>(5);
+            v_float3 T = v_float3(0);
 
             // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
             // Re-orthogonalize T with respect to N
@@ -155,11 +171,11 @@ struct DefaultShader {
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             v_float tileDepth = load(&fb.DepthBuffer[tileOffset]);
-            v_int skyMask = tileDepth >= 1.0f;
+            v_int skyMask = tileDepth <= 0.0f;
 
             v_int tileX = (int32_t)x + FragPixelOffsetsX;
             v_int tileY = (int32_t)y + FragPixelOffsetsY;
-            v_float3 worldPos = v_float3(PerspectiveDiv(TransformVector(invProj, { conv2f(tileX), conv2f(tileY), tileDepth, 1.0f })));
+            v_float3 worldPos = v_float3(PerspectiveDiv(TransformVector(invProj, { conv2f(tileX), conv2f(tileY), skyMask ? 0.5f : tileDepth, 1.0f })));
 
             v_float3 finalColor;
 
@@ -177,7 +193,7 @@ struct DefaultShader {
                 v_float roughness = perceptualRoughness * perceptualRoughness;
 
                 // Microfacet BRDF
-                v_float3 V = normalize(ViewPos - worldPos);
+                v_float3 V = normalize(0 - worldPos);
                 v_float3 L = normalize(LightPos);
                 v_float3 H = normalize(V + L);
 
@@ -239,13 +255,12 @@ struct DefaultShader {
 
             if (any(skyMask) && SkyboxTex != nullptr) {
                 auto& envTex = BlurSkybox ? FilteredEnvMap : SkyboxTex;
-                v_float3 skyColor = envTex->SampleCube<EnvSampler>(worldPos - ViewPos, 1);
+                v_float3 skyColor = envTex->SampleCube<EnvSampler>(worldPos, 1);
 
                 finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
                 finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
                 finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
             }
-
             finalColor = Tonemap_Unreal(finalColor * Exposure);
 
             v_int packedColor = swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
@@ -336,7 +351,7 @@ struct DefaultShader {
         fb.IterateTiles([&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             v_float tileDepth = load(&fb.DepthBuffer[tileOffset]);
-            v_int skyMask = tileDepth >= 1.0f;
+            v_int skyMask = tileDepth <= 0.0f;
 
             v_float3 finalColor = 0.0f;
 
@@ -688,7 +703,7 @@ struct DepthOnlyShader {
     //     vars.Position = TransformVector(ProjMat, pos);
     // }
 
-    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {
         _mm512_mask_storeu_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
     }
 };
@@ -702,7 +717,7 @@ struct OverdrawShader {
     //     vars.Position = TransformVector(ProjMat, pos);
     // }
 
-    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
+    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {
         v_int color = load(&fb.ColorBuffer[vars.TileOffset]);
         color = _mm512_adds_epu8(color, _mm512_set1_epi32((int32_t)0xFF'000020));
         fb.WriteTile(vars.TileOffset, 0xFFFF, color, vars.Depth);
@@ -721,11 +736,9 @@ struct TexCacheHeatmapShader {
     //     vars.SetAttribs(0, data.ReadAttribs<v_float2>(&scene::Vertex::u));
     // }
 
-    void ShadePixels(swr::Framebuffer& fb, swr::VaryingBuffer& vars) const {
-        vars.ApplyPerspectiveCorrection();
-        
-        v_float u = vars.GetSmooth(0);
-        v_float v = vars.GetSmooth(1);
+    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {        
+        v_float u = 0;//vars.GetSmooth(0);
+        v_float v = 0;//vars.GetSmooth(1);
 
         constexpr swr::SamplerDesc sampler = {
             .Wrap = swr::WrapMode::Repeat,

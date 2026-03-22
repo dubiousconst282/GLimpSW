@@ -13,13 +13,14 @@
             "visualizerFile": "${workspaceFolder}/src/DebugDisplay.natvis"
         },
         {
-            "name": "(cppdbg) Launch",
-            "type": "cppdbg",
+            "name": "(lldb) Launch",
+            "type": "lldb",
             "request": "launch",
             "program": "${command:cmake.launchTargetPath}",
             "args": [],
             "cwd": "${workspaceFolder}",
-            "internalConsoleOptions": "openOnSessionStart"
+            "internalConsoleOptions": "openOnSessionStart",
+            "console": "internalConsole"
         },
     ]
 }

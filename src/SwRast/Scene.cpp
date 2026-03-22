@@ -6,6 +6,7 @@
 #define CGLTF_IMPLEMENTATION
 #include <cgltf.h>
 #include <meshoptimizer.h>
+#include <stb_image.h>
 
 namespace scene {
 
@@ -45,10 +46,26 @@ static void InsertEmissiveMask(swr::StbImage& baseMap, const swr::StbImage& emis
 static swr::StbImage LoadImage(Model& m, const cgltf_texture_view& view) {
     if (!view.texture || !view.texture->image) return {};
 
-    auto fullPath = std::filesystem::path(m.BasePath) / view.texture->image->uri;
-    if (!std::filesystem::exists(fullPath)) return { };
+    const cgltf_image* imgInfo = view.texture->image;
+    int width, height;
+    uint8_t* pixels = nullptr;
 
-    return swr::StbImage::Load(fullPath.string().data());
+    if (imgInfo->uri && strncmp(imgInfo->uri, "data:", 5) != 0) {
+        std::string path = m.BasePath + "/" + imgInfo->uri;
+        pixels = stbi_load(path.c_str(), &width, &height, nullptr, 4);
+    } else if (imgInfo->buffer_view) {
+        auto* data = (const uint8_t*)imgInfo->buffer_view->buffer->data;
+        pixels = stbi_load_from_memory(&data[imgInfo->buffer_view->offset], imgInfo->buffer_view->size, &width, &height, nullptr, 4);
+    }
+    if (pixels == nullptr) {
+        throw std::runtime_error("Failed to load image");
+    }
+    return {
+        .Width = (uint32_t)width,
+        .Height = (uint32_t)height,
+        .Type = swr::StbImage::PixelType::RGBA_U8,
+        .Data = { pixels, stbi_image_free },
+    };
 }
 
 static swr::RgbaTexture2D LoadTextures(Model& m, const cgltf_material* mat) {
@@ -91,7 +108,6 @@ static uint32_t PackRGB10(const glm::vec3& value) {
 
     return (uint32_t)(ri << 22 | gi << 12 | bi << 2);
 }
-
 Model::Model(const std::string& path) {
     cgltf_options gltfOptions = {};
     cgltf_data* gltf = NULL;
@@ -161,7 +177,7 @@ Model::Model(const std::string& path) {
 
                 meshopt_Bounds bounds =
                     meshopt_computeMeshletBounds(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count,
-                                                 &positions[m.vertex_offset].x, m.vertex_count, sizeof(glm::vec3));
+                                                 &positions[0].x, positions.size(), sizeof(glm::vec3));
 
                 Meshlet& om = this->Meshlets.emplace_back();
                 om.BoundSphere = glm::vec4(bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius);
@@ -171,7 +187,7 @@ Model::Model(const std::string& path) {
 
                 om.NumVertices = m.vertex_count;
                 om.NumTriangles = m.triangle_count;
-                om.MaterialId = cgltf_material_index(gltf, prim->material);
+                om.MaterialId = prim->material ? cgltf_material_index(gltf, prim->material) : UINT_MAX;
 
                 for (uint32_t i = 0; i < m.vertex_count; i++) {
                     uint32_t vertIdx = meshletVertices[m.vertex_offset + i];
@@ -210,9 +226,8 @@ Model::Model(const std::string& path) {
         uint32_t nodeIdx = cgltf_node_index(gltf, srcNode);
         Node node = { };
 
-        glm::mat4 localTransform;
-        cgltf_node_transform_local(srcNode, &localTransform[0][0]);
-        node.GlobalTransform = parentTransform * localTransform;
+        cgltf_node_transform_local(srcNode, &node.LocalTransform[0][0]);
+        node.GlobalTransform = parentTransform * node.LocalTransform;
 
         if (srcNode->mesh) {
             glm::uvec2 range = primMeshletRanges[cgltf_mesh_index(gltf, srcNode->mesh)];

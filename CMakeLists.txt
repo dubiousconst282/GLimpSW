@@ -21,6 +21,7 @@ CPMAddPackage("gh:jkuhlmann/cgltf#v1.15")
 CPMAddPackage("gh:zeux/meshoptimizer#v1.0")
 
 CPMAddPackage("gh:martinus/nanobench#v4.3.11")
+CPMAddPackage("gh:wolfpld/tracy#v0.13.1")
 
 # Glad
 add_library(glad STATIC deps/glad/src/glad.c)
