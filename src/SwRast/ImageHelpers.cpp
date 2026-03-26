@@ -31,50 +31,50 @@ StbImage StbImage::Load(const char* path, PixelType type) {
 
 namespace texutil {
 
-RgbaTexture2D LoadImage(const char* path, uint32_t mipLevels) {
+RgbaTexture2D::Ptr LoadImage(const char* path, uint32_t mipLevels) {
     int width, height, channels;
     stbi_uc* pixels = stbi_load(path, &width, &height, &channels, 4);
 
-    auto tex = RgbaTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
-    tex.SetPixels(pixels, tex.Width, 0);
-    tex.GenerateMips();
+    auto tex = CreateTexture<RgbaTexture2D>((uint32_t)width, (uint32_t)height, mipLevels, 1);
+    tex->SetPixels(pixels, tex->Width, 0);
+    tex->GenerateMips();
 
     stbi_image_free(pixels);
     return tex;
 }
 
-HdrTexture2D LoadImageHDR(const char* path, uint32_t mipLevels) {
+HdrTexture2D::Ptr LoadImageHDR(const char* path, uint32_t mipLevels) {
     int width, height, channels;
     float* pixels = stbi_loadf(path, &width, &height, &channels, 3);
 
-    auto tex = HdrTexture2D((uint32_t)width, (uint32_t)height, mipLevels, 1);
+    auto tex = CreateTexture<HdrTexture2D>((uint32_t)width, (uint32_t)height, mipLevels, 1);
 
-    for (uint32_t y = 0; y < tex.Height; y += 4) {
-        for (uint32_t x = 0; x < tex.Width; x += 4) {
+    for (uint32_t y = 0; y < tex->Height; y += 4) {
+        for (uint32_t x = 0; x < tex->Width; x += 4) {
             v_float3 tile;
 
             for (uint32_t sy = 0; sy < 4; sy++) {
                 for (uint32_t sx = 0; sx < 4; sx++) {
-                    uint32_t idx = (x + sx) + (y + sy) * tex.Width;
+                    uint32_t idx = (x + sx) + (y + sy) * tex->Width;
                     tile.x[sx + sy * 4] = pixels[idx * 3 + 0];
                     tile.y[sx + sy * 4] = pixels[idx * 3 + 1];
                     tile.z[sx + sy * 4] = pixels[idx * 3 + 2];
                 }
             }
-            tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(tile), x, y);
+            tex->WriteTile(tile, x, y);
         }
     }
     stbi_image_free(pixels);
 
-    tex.GenerateMips();
+    tex->GenerateMips();
 
     return tex;
 }
-HdrTexture2D LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels) {
+HdrTexture2D::Ptr LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels) {
     auto panoTex = LoadImageHDR(path, 1);
 
-    uint32_t faceSize = panoTex.Width / 4;
-    auto cubeTex = HdrTexture2D(faceSize, faceSize, mipLevels, 6);
+    uint32_t faceSize = panoTex->Width / 4;
+    auto cubeTex = CreateTexture<HdrTexture2D>(faceSize, faceSize, mipLevels, 6);
 
     constexpr SamplerDesc PanoSampler = {
         .Wrap = WrapMode::Repeat,
@@ -97,13 +97,13 @@ HdrTexture2D LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels) {
                     v[i] = std::asinf(-dir.y[i]) / simd::pi + 0.5f;
                 }
 
-                v_float3 tile = panoTex.Sample<PanoSampler>(u, v);
-                cubeTex.WriteTile(swr::pixfmt::R11G11B10f::Pack(tile), x, y, layer);
+                v_float3 tile = panoTex->Sample<PanoSampler>(u, v);
+                cubeTex->WriteTile(tile, x, y, layer);
             }
         }
     }
 
-    cubeTex.GenerateMips();
+    cubeTex->GenerateMips();
     return cubeTex;
 }
 

@@ -43,7 +43,7 @@ struct Model {
     std::string BasePath;
 
     std::vector<Material> Materials;
-    std::vector<swr::RgbaTexture2D> Textures;
+    std::vector<swr::RgbaTexture2D::Ptr> Textures;
 
     std::vector<Meshlet> Meshlets;
 

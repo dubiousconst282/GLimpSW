@@ -20,10 +20,10 @@ constexpr int LerpFracBits = 8, LerpFracMask = (1 << LerpFracBits) - 1;
     v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)tex.Height ? 1 << stride : 0);
     v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)tex.Width;
 
-    v_int data00 = _mm512_i32gather_epi32(indices00, tex.Data.get() + 0, 4);
-    v_int data10 = _mm512_i32gather_epi32(indices00, tex.Data.get() + 1, 4);
-    v_int data01 = _mm512_i32gather_epi32(indices01, tex.Data.get() + 0, 4);
-    v_int data11 = _mm512_i32gather_epi32(indices01, tex.Data.get() + 1, 4);
+    v_int data00 = _mm512_i32gather_epi32(indices00, tex.Data + 0, 4);
+    v_int data10 = _mm512_i32gather_epi32(indices00, tex.Data + 1, 4);
+    v_int data01 = _mm512_i32gather_epi32(indices01, tex.Data + 0, 4);
+    v_int data11 = _mm512_i32gather_epi32(indices01, tex.Data + 1, 4);
 
     // 15-bit fraction for mulhrs
     v_int fx = (ixf & LerpFracMask) << (15 - LerpFracBits);
@@ -57,10 +57,10 @@ constexpr int LerpFracBits = 8, LerpFracMask = (1 << LerpFracBits) - 1;
     v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)tex.Height ? 1 << stride : 0);
     v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)tex.Width;
 
-    v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), tex.Data.get(), 4);
-    v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), tex.Data.get(), 4);
-    v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), tex.Data.get(), 4);
-    v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), tex.Data.get(), 4);
+    v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), tex.Data, 4);
+    v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), tex.Data, 4);
+    v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), tex.Data, 4);
+    v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), tex.Data, 4);
 
     v_int data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 0, row0_hi);
     v_int data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 1, row0_hi);
@@ -91,32 +91,32 @@ int main() {
     ctx.minEpochTime(std::chrono::milliseconds(50));
     ctx.epochs(30);
 
-    auto texture = swr::Texture2D<swr::pixfmt::RGBA8u>(4096, 4096, 1, 1);
-    for (uint32_t y = 0; y < texture.Height; y += 4) {
-        for (uint32_t x = 0; x < texture.Width; x += 4) {
-            texture.WriteTile((simd::lane_idx * 0x505050) | int(0xFF000000), x, y);
+    auto texture = swr::CreateTexture2D<swr::pixfmt::RGBA8u>(4096, 4096, 1, 1);
+    for (uint32_t y = 0; y < texture->Height; y += 4) {
+        for (uint32_t x = 0; x < texture->Width; x += 4) {
+            texture->WriteTile((simd::lane_idx * 0x505050) | int(0xFF000000), x, y);
         }
     }
 
-    ctx.batch(texture.Width * texture.Height);
+    ctx.batch(texture->Width * texture->Height);
     ctx.relative(true);
 
     ctx.run("Gather32", [&]() {
-        for (int y = 0; y < texture.Height; y += 4) {
-            for (int x = 0; x < texture.Width; x += 4) {
+        for (int y = 0; y < texture->Height; y += 4) {
+            for (int x = 0; x < texture->Width; x += 4) {
                 v_int tx = ((x + simd::FragPixelOffsetsX) << LerpFracBits) + (LerpFracMask/2);
                 v_int ty = ((y + simd::FragPixelOffsetsY) << LerpFracBits) + (LerpFracMask/2);
-                auto res = SampleLinear_G32(texture, tx, ty, 0, (int)texture.RowShift, 0);
+                auto res = SampleLinear_G32(*texture, tx, ty, 0, (int)texture->RowShift, 0);
                 ctx.doNotOptimizeAway(res);
             }
         }
     });
     ctx.run("Gather64", [&]() {
-        for (int y = 0; y < texture.Height; y += 4) {
-            for (int x = 0; x < texture.Width; x += 4) {
+        for (int y = 0; y < texture->Height; y += 4) {
+            for (int x = 0; x < texture->Width; x += 4) {
                 v_int tx = ((x + simd::FragPixelOffsetsX) << LerpFracBits) + (LerpFracMask / 2);
                 v_int ty = ((y + simd::FragPixelOffsetsY) << LerpFracBits) + (LerpFracMask / 2);
-                auto res = SampleLinear_G64(texture, tx, ty, 0, (int)texture.RowShift, 0);
+                auto res = SampleLinear_G64(*texture, tx, ty, 0, (int)texture->RowShift, 0);
                 ctx.doNotOptimizeAway(res);
             }
         }

@@ -68,11 +68,11 @@ static swr::StbImage LoadImage(Model& m, const cgltf_texture_view& view) {
     };
 }
 
-static swr::RgbaTexture2D LoadTextures(Model& m, const cgltf_material* mat) {
+static swr::RgbaTexture2D::Ptr LoadTextures(Model& m, const cgltf_material* mat) {
     swr::StbImage baseColorImg = LoadImage(m, mat->pbr_metallic_roughness.base_color_texture);
 
     if (!baseColorImg.Width) {
-        return swr::RgbaTexture2D(4, 4, 1, 1);
+        return swr::CreateTexture<swr::RgbaTexture2D>(4, 4, 1, 1);
     }
     swr::StbImage normalImg = LoadImage(m, mat->normal_texture);
     swr::StbImage metalRoughImg = LoadImage(m, mat->pbr_metallic_roughness.metallic_roughness_texture);
@@ -82,18 +82,18 @@ static swr::RgbaTexture2D LoadTextures(Model& m, const cgltf_material* mat) {
     bool hasEmissive = emissiveImg.Width == baseColorImg.Width && emissiveImg.Height == baseColorImg.Height;
 
     uint32_t numLayers = hasEmissive ? 3 : (hasNormals ? 2 : 1);
-    swr::RgbaTexture2D tex(baseColorImg.Width, baseColorImg.Height, 8, numLayers);
+    auto tex = swr::CreateTexture<swr::RgbaTexture2D>(baseColorImg.Width, baseColorImg.Height, 8, numLayers);
 
     if (hasNormals) {
         CombineNormalMR(normalImg, metalRoughImg);
-        tex.SetPixels(normalImg.Data.get(), normalImg.Width, 1);
+        tex->SetPixels(normalImg.Data.get(), normalImg.Width, 1);
     }
     if (hasEmissive) {
         InsertEmissiveMask(baseColorImg, emissiveImg);
-        tex.SetPixels(emissiveImg.Data.get(), emissiveImg.Width, 2);
+        tex->SetPixels(emissiveImg.Data.get(), emissiveImg.Width, 2);
     }
-    tex.SetPixels(baseColorImg.Data.get(), baseColorImg.Width, 0);
-    tex.GenerateMips();
+    tex->SetPixels(baseColorImg.Data.get(), baseColorImg.Width, 0);
+    tex->GenerateMips();
     return tex;
 }
 
@@ -130,7 +130,7 @@ Model::Model(const std::string& path) {
         Textures.emplace_back(LoadTextures(*this, mat));
 
         Materials.push_back({
-            .Texture = &Textures[i],
+            .Texture = Textures[i].get(),
         });
     }
 

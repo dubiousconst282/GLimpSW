@@ -34,9 +34,9 @@ struct DefaultShader {
     };
 
     // Owned
-    std::unique_ptr<swr::HdrTexture2D> SkyboxTex;
-    std::unique_ptr<swr::HdrTexture2D> IrradianceMap, FilteredEnvMap;
-    swr::Texture2D<swr::pixfmt::RG16f> BRDFEnvLut = GenerateBRDFEnvLut();
+    swr::HdrTexture2D::Ptr SkyboxTex;
+    swr::HdrTexture2D::Ptr IrradianceMap, FilteredEnvMap;
+    swr::TexturePtr2D<swr::pixfmt::RG16f> BRDFEnvLut = GenerateBRDFEnvLut();
 
     // TAA
     uint32_t FrameNo;
@@ -48,7 +48,6 @@ struct DefaultShader {
     // Uniform: Forward
     glm::mat4 ProjMat, ModelMat;
     const scene::Meshlet* Meshlets;
-    const swr::RgbaTexture2D* MaterialTex;  // See `scene::Material` for what's on this texture.
     const scene::Material* Materials;
 
     // Uniform: Compose pass
@@ -82,87 +81,32 @@ struct DefaultShader {
     }
 
     void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {
-        if (true) {
-            // Depth test
-            v_float oldDepth = load(&fb.DepthBuffer[vars.TileOffset]);
-            vars.TileMask &= movemask(vars.Depth > oldDepth);
-            if (vars.TileMask == 0) return;
+        // Depth test
+        v_float oldDepth = load(&fb.DepthBuffer[vars.TileOffset]);
+        vars.TileMask &= movemask(vars.Depth > oldDepth);
 
-            auto& mesh = Meshlets[vars.MeshletId];
-            v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[0]]);
-            v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[1]]);
-            v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.Indices[2]]);
-            v_float2 uv = vars.Interpolate(uv0,uv1,uv2);
+        if (vars.TileMask == 0) return;
 
-            auto tex = Materials[mesh.MaterialId].Texture;
-            v_int color = tex->Sample<SurfaceSampler>(uv.x,uv.y);
+        const scene::Meshlet& mesh = Meshlets[vars.MeshletId];
+        v_int color;
 
-           // v_int color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
-            fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
-            return;
+        if (mesh.MaterialId != UINT_MAX) {
+            const scene::Material& material = Materials[mesh.MaterialId];
+
+            v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
+            v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
+            v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
+            v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
+
+            color = material.Texture->Sample<SurfaceSampler>(uv.x, uv.y);
+        } else {
+            color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
         }
+        //color = 255<<24|(vars.MeshletId*1234567);
 
-        v_float u = 0;
-        v_float v = 0;
-
-        v_int baseColor = MaterialTex->Sample<SurfaceSampler>(u, v, 0);
-        v_float3 N = normalize(v_float3(0));
-
-        v_float metalness = 0.0f;
-        v_float roughness = 0.5f;
-
-        if (MaterialTex->NumLayers >= 2) [[likely]] {
-            v_float4 SN = swr::pixfmt::RGBA8u::Unpack(MaterialTex->Sample<SurfaceSampler>(u, v, 1));
-            v_float3 T = v_float3(0);
-
-            // Gram-schmidt process (produces higher-quality normal mapping on large meshes)
-            // Re-orthogonalize T with respect to N
-            T = normalize(T - dot(T, N) * N);
-            v_float3 B = cross(N, T);
-
-            // Flip bitangent depending on whether UVs are mirrored - https://stackoverflow.com/a/44901073
-            // TODO: maybe cheaper to compute tangents using screen derivatives all the way. (maybe too blocky?)
-            v_int det = re2i(dFdy(u) * dFdx(v) - dFdx(u) * dFdy(v)) & int(0x8000'0000);
-            B = { re2f(re2i(B.x) ^ det), re2f(re2i(B.y) ^ det), re2f(re2i(B.z) ^ det) };  // det < 0 ? -B : B
-
-            // Reconstruct Z from 2-channel normap map
-            // https://aras-p.info/texts/CompactNormalStorage.html
-            // https://www.researchgate.net/publication/259000109_Real-Time_Normal_Map_DXT_Compression
-            // This isn't exact due to interpolation and mipmapping, but it's quite subtle after texturing anyway.
-            v_float Sx = SN.x * 2.0f - 1.0f;
-            v_float Sy = SN.y * 2.0f - 1.0f;
-            v_float Sz = sqrt14(1.0f - (Sx * Sx + Sy * Sy));
-
-            N.x = T.x * Sx + B.x * Sy + N.x * Sz;
-            N.y = T.y * Sx + B.y * Sy + N.y * Sz;
-            N.z = T.z * Sx + B.z * Sy + N.z * Sz;
-
-            metalness = SN.z;
-            roughness = SN.w;
-        }
-        // G-Buffer channels
-        //               LSB 0  ...  31 MSB
-        //   #1 [24: BaseColor] [8: Metalness]
-        //   #2 [1: NormalSign] [1: HasEmissive] [10: Roughness] [20: EncNormal]
-        //   #3 [8: Unused] [24: EmissiveColor]
-        v_int alpha = shrl(baseColor, 24);
-        vars.TileMask &= movemask(alpha >= 128);  // alpha test
-
-        bool hasEmissive = MaterialTex->NumLayers >= 3 && any(alpha == 255);
-
-        if (hasEmissive) [[unlikely]] {
-            v_int emissiveColor = MaterialTex->Sample<SurfaceSampler>(u, v, 2);
-            _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(4, vars.TileOffset), vars.TileMask, emissiveColor);
-        }
-
-        v_int G1 = (baseColor & 0xFFFFFF) | round2i(metalness * 255.0f) << 24;
-        fb.WriteTile(vars.TileOffset, vars.TileMask, G1, vars.Depth);
-
-        v_int G2 = SignedOctEncode(N) | round2i(roughness * 63.0) << 1 | (hasEmissive ? 1 : 0);
-        _mm512_mask_store_epi32(fb.GetAttachmentBuffer<uint32_t>(0, vars.TileOffset), vars.TileMask, G2);
+        fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
     }
 
-    void Compose(swr::Framebuffer& fb, bool hasSSAO, swr::Framebuffer& prevFb) {
         glm::mat4 invProj = glm::inverse(ProjMat);
         // Bias matrix to take UVs in range [0..screen] rather than [-1..1]
         invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
@@ -225,7 +169,7 @@ struct DefaultShader {
                     v_float3 R = reflect(0 - V, N);
                     v_float3 irradiance = IrradianceMap->SampleCube<EnvSampler>(R);
                     v_float3 radiance = FilteredEnvMap->SampleCube<EnvSampler>(R, perceptualRoughness * (int32_t)FilteredEnvMap->MipLevels);
-                    v_float2 dfg = BRDFEnvLut.Sample<EnvSampler>(NoV, perceptualRoughness);
+                    v_float2 dfg = BRDFEnvLut->Sample<EnvSampler>(NoV, perceptualRoughness);
                     v_float3 specularColor = f0 * dfg.x + dfg.y;
                     v_float3 ibl = irradiance * diffuseColor + radiance * specularColor;
 
@@ -246,7 +190,7 @@ struct DefaultShader {
                 // Emissive color
                 if (any(emissiveMask)) {
                     v_int G3r = load(fb.GetAttachmentBuffer<uint32_t>(4, tileOffset));
-                    G3r = csel(emissiveMask, G3r, 0);
+                    G3r = emissiveMask ? G3r : 0;
 
                     v_float3 emissiveColor = v_float3(swr::pixfmt::RGBA8u::Unpack(G3r));
                     finalColor = finalColor + SrgbToLinear(emissiveColor);
@@ -257,9 +201,9 @@ struct DefaultShader {
                 auto& envTex = BlurSkybox ? FilteredEnvMap : SkyboxTex;
                 v_float3 skyColor = envTex->SampleCube<EnvSampler>(worldPos, 1);
 
-                finalColor.x = csel(skyMask, skyColor.x, finalColor.x);
-                finalColor.y = csel(skyMask, skyColor.y, finalColor.y);
-                finalColor.z = csel(skyMask, skyColor.z, finalColor.z);
+                finalColor.x = skyMask ? skyColor.x : finalColor.x;
+                finalColor.y = skyMask ? skyColor.y : finalColor.y;
+                finalColor.z = skyMask ? skyColor.z : finalColor.z;
             }
             finalColor = Tonemap_Unreal(finalColor * Exposure);
 
@@ -341,10 +285,10 @@ struct DefaultShader {
         std::swap(fb.ColorBuffer, PrevFrame->ColorBuffer);
     }
 
-    void SetSkybox(swr::HdrTexture2D&& envCube) {
-        IrradianceMap = std::make_unique<swr::HdrTexture2D>(GenerateIrradianceMap(envCube));
-        FilteredEnvMap = std::make_unique<swr::HdrTexture2D>(GenerateRadianceMap(envCube));
-        SkyboxTex = std::make_unique<swr::HdrTexture2D>(std::move(envCube));
+    void SetSkybox(swr::HdrTexture2D::Ptr&& envCube) {
+        IrradianceMap = GenerateIrradianceMap(*envCube);
+        FilteredEnvMap = GenerateRadianceMap(*envCube);
+        SkyboxTex = std::move(envCube);
     }
 
     void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
@@ -368,11 +312,11 @@ struct DefaultShader {
             } else if (layer == DebugLayer::Occlusion) {
                 finalColor = GetAO(fb, x, y);
             } else if (layer == DebugLayer::EmissiveMask) {
-                finalColor.x = csel((G2r & 1) != 0, v_float(1.0f), 0);
+                finalColor.x = (G2r & 1) != 0 ? 1.0f : 0;
             }
 
             uint32_t backgroundRGB = (x / 4 + y / 4) % 2 ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
-            v_int finalRGB = csel(skyMask, (int32_t)backgroundRGB, swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f }));
+            v_int finalRGB = skyMask ? (int32_t)backgroundRGB : swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
 
             store(finalRGB, &fb.ColorBuffer[tileOffset]);
         });
@@ -432,41 +376,41 @@ private:
         return conv2f(_mm512_cvtepu8_epi32(_mm_loadu_epi8(temp))) * (1.0f / 255);
     }
 
-    static swr::HdrTexture2D GenerateIrradianceMap(const swr::HdrTexture2D& envTex) {
-        swr::HdrTexture2D tex(32, 32, 1, 6);
+    static swr::HdrTexture2D::Ptr GenerateIrradianceMap(const swr::HdrTexture2D& envTex) {
+        auto tex = swr::CreateTexture<swr::HdrTexture2D>(32, 32, 1, 6);
 
         for (uint32_t layer = 0; layer < 6; layer++) {
-            swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
+            swr::texutil::IterateTiles(tex->Width, tex->Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
                 v_float3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
                 v_float3 color = PrefilterDiffuseIrradiance(envTex, dir);
-                tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(color), x, y, layer);
+                tex->WriteTile(color, x, y, layer);
             });
         }
         return tex;
     }
-    static swr::HdrTexture2D GenerateRadianceMap(const swr::HdrTexture2D& envTex) {
-        swr::HdrTexture2D tex(128, 128, 8, 6);
+    static swr::HdrTexture2D::Ptr GenerateRadianceMap(const swr::HdrTexture2D& envTex) {
+        auto tex = swr::CreateTexture<swr::HdrTexture2D>(128, 128, 8, 6);
 
         for (uint32_t layer = 0; layer < 6; layer++) {
-            for (uint32_t level = 0; level < tex.MipLevels; level++) {
-                uint32_t w = tex.Width >> level;
-                uint32_t h = tex.Height >> level;
+            for (uint32_t level = 0; level < tex->MipLevels; level++) {
+                uint32_t w = tex->Width >> level;
+                uint32_t h = tex->Height >> level;
 
                 swr::texutil::IterateTiles(w, h, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
                     v_float3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
-                    v_float3 color = PrefilterEnvMap(envTex, level / (tex.MipLevels - 1.0f), dir);
-                    tex.WriteTile(swr::pixfmt::R11G11B10f::Pack(color), x, y, layer, level);
+                    v_float3 color = PrefilterEnvMap(envTex, level / (tex->MipLevels - 1.0f), dir);
+                    tex->WriteTile(color, x, y, layer, level);
                 });
             }
         }
         return tex;
     }
-    static swr::Texture2D<swr::pixfmt::RG16f> GenerateBRDFEnvLut() {
-        swr::Texture2D<swr::pixfmt::RG16f> tex(128, 128, 1, 1);
+    static swr::TexturePtr2D<swr::pixfmt::RG16f> GenerateBRDFEnvLut() {
+        auto tex = swr::CreateTexture2D<swr::pixfmt::RG16f>(128, 128, 1, 1);
 
-        swr::texutil::IterateTiles(tex.Width, tex.Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
+        swr::texutil::IterateTiles(tex->Width, tex->Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
             v_float2 f_ab = IntegrateBRDF(u, v);
-            tex.WriteTile(swr::pixfmt::RG16f::Pack(f_ab), x, y);
+            tex->WriteTile(f_ab, x, y);
         });
         return tex;
     }
@@ -567,7 +511,7 @@ private:
             if (any(NoL > 0.0f)) {
                 v_float G = V_SmithGGXCorrelatedFast(NoV, NoL, roughness * roughness);
                 v_float Gv = G * 4.0f * VoH * NoL / NoH;
-                Gv = csel(NoL > 0.0f, Gv, 0.0f);
+                Gv = NoL > 0.0f ? Gv : 0.0f;
 
                 v_float Fc = pow5(1 - VoH);
                 r.x += Gv * (1 - Fc);
@@ -721,64 +665,6 @@ struct OverdrawShader {
         v_int color = load(&fb.ColorBuffer[vars.TileOffset]);
         color = _mm512_adds_epu8(color, _mm512_set1_epi32((int32_t)0xFF'000020));
         fb.WriteTile(vars.TileOffset, 0xFFFF, color, vars.Depth);
-    }
-};
-struct TexCacheHeatmapShader {
-    static constexpr uint32_t NumCustomAttribs = 2;
-
-    glm::mat4 ProjMat;
-    const swr::RgbaTexture2D* MaterialTex;
-
-    // void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars) const {
-    //     v_float4 pos = { data.ReadAttribs<v_float3>(&scene::Vertex::x), 1.0f };
-    //     vars.Position = TransformVector(ProjMat, pos);
-
-    //     vars.SetAttribs(0, data.ReadAttribs<v_float2>(&scene::Vertex::u));
-    // }
-
-    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {        
-        v_float u = 0;//vars.GetSmooth(0);
-        v_float v = 0;//vars.GetSmooth(1);
-
-        constexpr swr::SamplerDesc sampler = {
-            .Wrap = swr::WrapMode::Repeat,
-            .MagFilter = swr::FilterMode::Nearest,
-            .MinFilter = swr::FilterMode::Nearest,
-            .EnableMips = false,
-        };
-        uint64_t startTsc = __rdtsc();
-        v_int baseColor = MaterialTex->Sample<sampler>(u, v);
-        asm volatile("" : "+r,m"(baseColor) : :); // prevent optimization
-        uint64_t endTsc = __rdtsc();
-
-        v_int elapsed = load(&fb.ColorBuffer[vars.TileOffset]);
-        elapsed += (int32_t)(endTsc - startTsc);
-        fb.WriteTile(vars.TileOffset, vars.TileMask, elapsed, vars.Depth);
-    }
-
-    static void PostProcess(swr::Framebuffer& fb) {
-        static const uint32_t kPalette[] = { // ABGR
-            0xFF000000, 0xFF0A0201, 0xFF170404, 0xFF230507, 0xFF2D060B, 0xFF360710, 0xFF3E0816, 0xFF45091C,
-            0xFF4B0922, 0xFF510A28, 0xFF560B2F, 0xFF5A0C36, 0xFF5E0D3D, 0xFF610D44, 0xFF640F4A, 0xFF661051,
-            0xFF681158, 0xFF6A125F, 0xFF6B1465, 0xFF6C166C, 0xFF6C1772, 0xFF6C1979, 0xFF6B1B7F, 0xFF6A1E86,
-            0xFF69208C, 0xFF672292, 0xFF652598, 0xFF62289F, 0xFF5F2AA5, 0xFF5C2DAB, 0xFF5831B1, 0xFF5434B7,
-            0xFF4F37BC, 0xFF4B3BC2, 0xFF463FC8, 0xFF4143CD, 0xFF3B47D2, 0xFF364CD7, 0xFF3151DC, 0xFF2C56E1,
-            0xFF275BE5, 0xFF2261E9, 0xFF1D66ED, 0xFF196DF0, 0xFF1673F3, 0xFF137AF5, 0xFF1081F7, 0xFF0F88F9,
-            0xFF0E90FA, 0xFF0F97FA, 0xFF109FFB, 0xFF13A8FA, 0xFF16B0FA, 0xFF1CB8F9, 0xFF22C1F8, 0xFF2BC9F7,
-            0xFF34D2F6, 0xFF40DAF5, 0xFF4DE2F4, 0xFF5CEAF3, 0xFF6CF1F3, 0xFF7EF7F4, 0xFF92FDF6, 0xFFA7FFFA,
-        };
-        static const uint32_t kNumColors = std::size(kPalette);
-
-        fb.IterateTiles([&](uint32_t x, uint32_t y) {
-            uint32_t tileOffset = fb.GetPixelOffset(x, y);
-            v_float elapsed = conv2f(load(&fb.ColorBuffer[tileOffset]));
-
-            elapsed = (elapsed - 10) / 300;
-
-            v_int index = max(min(round2i(elapsed * kNumColors), kNumColors - 1), 0);
-            v_int color = gather((const int32_t*)kPalette, index);
-            store(color, &fb.ColorBuffer[tileOffset]);
-        });
     }
 };
 

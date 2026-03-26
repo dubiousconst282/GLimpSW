@@ -177,9 +177,13 @@ private:
 template<pixfmt::Texel Texel>
 struct Texture2D;
 
+template<pixfmt::Texel T>
+using TexturePtr2D = std::unique_ptr<Texture2D<T>, AlignedDeleter>;
+
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
 
+// TODO: delete or move this
 struct StbImage {
     enum class PixelType { Empty, RGBA_U8, RGB_F32 };
 
@@ -192,12 +196,12 @@ struct StbImage {
 
 namespace texutil {
 
-RgbaTexture2D LoadImage(const char* path, uint32_t mipLevels = 8);
+TexturePtr2D<pixfmt::RGBA8u> LoadImage(const char* path, uint32_t mipLevels = 8);
 
-HdrTexture2D LoadImageHDR(const char* path, uint32_t mipLevels = 8);
+TexturePtr2D<pixfmt::R11G11B10f> LoadImageHDR(const char* path, uint32_t mipLevels = 8);
 
 // Loads a equirectangular panorama into a cubemap.
-HdrTexture2D LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
+TexturePtr2D<pixfmt::R11G11B10f> LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
 
 // Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
 inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
@@ -212,10 +216,24 @@ inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
     }
 }
 
+// Calculate coarse partial derivatives for a 4x4 fragment.
+// https://gamedev.stackexchange.com/a/130933
+inline v_float dFdx(v_float p) {
+    auto a = _mm512_shuffle_ps(p, p, 0b10'10'00'00);  //[0 0 2 2]
+    auto b = _mm512_shuffle_ps(p, p, 0b11'11'01'01);  //[1 1 3 3]
+    return _mm512_sub_ps(b, a);
+}
+inline v_float dFdy(v_float p) {
+    // auto a = _mm256_permute2x128_si256(p, p, 0b00'00'00'00);  // dupe lower 128 lanes
+    // auto b = _mm256_permute2x128_si256(p, p, 0b01'01'01'01);  // dupe upper 128 lanes
+    auto a = _mm512_shuffle_f32x4(p, p, 0b10'10'00'00);
+    auto b = _mm512_shuffle_f32x4(p, p, 0b11'11'01'01);
+    return _mm512_sub_ps(b, a);
+}
 // Calculates mip-level for a 4x4 fragment using the partial derivatives of the given scaled UVs.
 inline v_int CalcMipLevel(v_float scaledU, v_float scaledV) {
-    v_float dxu = simd::dFdx(scaledU), dyu = simd::dFdy(scaledU);
-    v_float dxv = simd::dFdx(scaledV), dyv = simd::dFdy(scaledV);
+    v_float dxu = dFdx(scaledU), dyu = dFdy(scaledU);
+    v_float dxv = dFdx(scaledV), dyv = dFdy(scaledV);
 
     v_float maxDeltaSq = simd::max(simd::fma(dxu, dxu, dxv * dxv), simd::fma(dyu, dyu, dyv * dyv));
     return simd::ilog2(maxDeltaSq) >> 1;
@@ -345,54 +363,27 @@ struct SamplerDesc {
     bool EnableMips = true;
 };
 
-template<pixfmt::Texel Texel>
+template<pixfmt::Texel Texel_>
 struct Texture2D {
+    using Ptr = TexturePtr2D<Texel_>;
+    using Texel = Texel_;
+
     static constexpr int LerpFracBits = 8;  // Number of fractional bits in pixel coords for bilinear interpolation
     static constexpr int LerpFracMask = (1 << LerpFracBits) - 1;
 
     uint32_t Width, Height, MipLevels, NumLayers;
     uint32_t RowShift, LayerStride;
 
-    // Indexing: (layer * LayerStride) + MipOffsets[mipLevel] + (ix >> mipLevel) + (iy >> mipLevel) << (RowShift - mipLevel)
-    AlignedBuffer<uint32_t> Data;
-
     float ScaleU, ScaleV, ScaleLerpU, ScaleLerpV;
     int32_t MaskU, MaskV, MaskLerpU, MaskLerpV;
     alignas(64) uint32_t MipOffsets[16];
 
-    Texture2D(uint32_t width, uint32_t height, uint32_t mipLevels = 1, uint32_t numLayers = 1) {
-        assert(std::has_single_bit(width) && std::has_single_bit(height) && mipLevels < simd::vec_width);
+    // Indexing: (layer * LayerStride) + MipOffsets[mipLevel] + (ix >> mipLevel) + ((iy >> mipLevel) << (RowShift - mipLevel))
+    alignas(64) uint32_t Data[];
 
-        Width = width;
-        Height = height;
-        RowShift = (uint32_t)std::countr_zero(width);
-        NumLayers = numLayers;
-
-        MipLevels = 0;
-        LayerStride = 0;
-
-        for (; MipLevels < mipLevels; MipLevels++) {
-            uint32_t i = MipLevels;
-            if ((Width >> i) < 4 || (Height >> i) < 4) break;
-
-            MipOffsets[i] = LayerStride;
-            LayerStride += (Width >> i) * (Height >> i);
-            LayerStride = (LayerStride + 15) & ~15u; // align to 64 bytes
-        }
-        assert(LayerStride * (uint64_t)numLayers < INT32_MAX);
-
-        Data = alloc_buffer<uint32_t>(LayerStride * numLayers + 16);
-
-        ScaleU = (float)width;
-        ScaleV = (float)height;
-        MaskU = (int32_t)width - 1;
-        MaskV = (int32_t)height - 1;
-
-        MaskLerpU = (int32_t)(width << LerpFracBits) - 1;
-        MaskLerpV = (int32_t)(height << LerpFracBits) - 1;
-        ScaleLerpU = (float)(MaskLerpU + 1);
-        ScaleLerpV = (float)(MaskLerpV + 1);
-    }
+    Texture2D() = delete;
+    Texture2D(const Texture2D&) = delete;
+    Texture2D& operator=(const Texture2D&) = delete;
 
     // Writes raw packed pixels (with matching formats) to the texture buffer.
     void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0) {
@@ -416,6 +407,9 @@ struct Texture2D {
         _mm_storeu_epi32(&dst[x + ((y + 1) << stride)], _mm512_extracti32x4_epi32(value, 1));
         _mm_storeu_epi32(&dst[x + ((y + 2) << stride)], _mm512_extracti32x4_epi32(value, 2));
         _mm_storeu_epi32(&dst[x + ((y + 3) << stride)], _mm512_extracti32x4_epi32(value, 3));
+    }
+    void WriteTile(const Texel::UnpackedTy& value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
+        WriteTile(Texel::Pack(value), x, y, layer, mipLevel);
     }
 
     void GenerateMips() {
@@ -524,15 +518,15 @@ private:
         v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)Width;
 
 #if 0
-        v_int data00 = _mm512_i32gather_epi32(indices00, Data.get() + 0, 4);
-        v_int data10 = _mm512_i32gather_epi32(indices00, Data.get() + 1, 4);
-        v_int data01 = _mm512_i32gather_epi32(indices01, Data.get() + 0, 4);
-        v_int data11 = _mm512_i32gather_epi32(indices01, Data.get() + 1, 4);
+        v_int data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
+        v_int data10 = _mm512_i32gather_epi32(indices00, Data + 1, 4);
+        v_int data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
+        v_int data11 = _mm512_i32gather_epi32(indices01, Data + 1, 4);
 #else
-        v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data.get(), 4);
-        v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data.get(), 4);
-        v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data.get(), 4);
-        v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data.get(), 4);
+        v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
+        v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
+        v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
+        v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
 
         v_int data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 0, row0_hi);
         v_int data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 1, row0_hi);
@@ -604,7 +598,7 @@ private:
     }
 
     v_int GatherRawTexels(v_int indices) const {
-        return simd::gather((const int32_t*)Data.get(), indices);
+        return simd::gather((const int32_t*)Data, indices);
     }
     Texel::UnpackedTy GatherTexels(int32_t offset, uint32_t stride, v_int ix, v_int iy) const {
         return Texel::Unpack(GatherRawTexels(offset + ix + (iy << stride)));
@@ -649,5 +643,50 @@ private:
         }
     }
 };
+
+template<pixfmt::Texel T>
+inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    assert(std::has_single_bit(width) && std::has_single_bit(height) && maxLevels < simd::vec_width);
+
+    uint32_t rowShift = (uint32_t)std::countr_zero(width);
+    uint32_t mipOffsets[16] = {};
+    uint32_t layerStride = 0;
+    uint32_t mip = 0;
+
+    for (; mip < maxLevels; mip++) {
+        if ((width >> mip) < 4 || (height >> mip) < 4) break;
+
+        mipOffsets[mip] = layerStride;
+        layerStride += ((width >> mip) * (height >> mip) + 15) & ~15u;  // align to 64 bytes
+    }
+    assert(layerStride * (uint64_t)numLayers < INT32_MAX);
+
+    auto tex = (Texture2D<T>*)_mm_malloc(sizeof(Texture2D<T>) + (size_t)layerStride * numLayers * 4 + 64, 64);
+    tex->Width = width;
+    tex->Height = height;
+    tex->RowShift = rowShift;
+    tex->NumLayers = numLayers;
+    tex->LayerStride = layerStride;
+
+    tex->MipLevels = mip;
+    memcpy(tex->MipOffsets, mipOffsets, sizeof(mipOffsets));
+
+    tex->ScaleU = (float)width;
+    tex->ScaleV = (float)height;
+    tex->MaskU = (int32_t)width - 1;
+    tex->MaskV = (int32_t)height - 1;
+
+    tex->MaskLerpU = (int32_t)(width << Texture2D<T>::LerpFracBits) - 1;
+    tex->MaskLerpV = (int32_t)(height << Texture2D<T>::LerpFracBits) - 1;
+    tex->ScaleLerpU = (float)(tex->MaskLerpU + 1);
+    tex->ScaleLerpV = (float)(tex->MaskLerpV + 1);
+
+    return TexturePtr2D<T>(tex);
+}
+
+template<typename T>
+inline T::Ptr CreateTexture(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    return CreateTexture2D<typename T::Texel>(width, height, maxLevels, numLayers);
+}
 
 };  // namespace swr
