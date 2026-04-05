@@ -21,6 +21,8 @@ CPMAddPackage("gh:jkuhlmann/cgltf#v1.15")
 CPMAddPackage("gh:zeux/meshoptimizer#v1.0")
 
 CPMAddPackage("gh:martinus/nanobench#v4.3.11")
+
+set(TRACY_ON_DEMAND ON)
 CPMAddPackage("gh:wolfpld/tracy#v0.13.1")
 
 # Glad
@@ -28,7 +30,7 @@ add_library(glad STATIC deps/glad/src/glad.c)
 target_include_directories(glad PUBLIC deps/glad/include/)
 
 # ImGui
-CPMAddPackage("gh:ocornut/imgui#v1.91.9b")
+CPMAddPackage("gh:ocornut/imgui#v1.92.7")
 CPMAddPackage("gh:CedricGuillemet/ImGuizmo#master")
 
 add_library(imgui STATIC

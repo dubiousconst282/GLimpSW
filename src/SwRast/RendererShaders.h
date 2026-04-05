@@ -1,6 +1,6 @@
 #pragma once
 
-#include "SwRast.h"
+#include "Rasterizer.h"
 #include "Texture.h"
 #include "Scene.h"
 #include <random>
@@ -66,16 +66,23 @@ struct DefaultShader {
         // output.PrimCount = 0;
         // if (glm::dot(glm::normalize(mesh.ConeApex - ViewPos), mesh.ConeAxis) >= mesh.ConeCutoff) return;
 
+        // TODO: meshlet compression, the mem loads take longest here (>65%)
+        // https://liamtyler.github.io/posts/meshlet_compression/
+        // https://gpuopen.com/learn/mesh_shaders/mesh_shaders-meshlet_compression/
         for (uint32_t i = 0; i < mesh.NumVertices; i += vec_width) {
             v_float3 worldPos = { load(&mesh.Positions[0][i]), load(&mesh.Positions[1][i]), load(&mesh.Positions[2][i]) };
             output.SetPosition(i, TransformVector(ProjMat, { worldPos, 1.0f }));
         }
         output.PrimCount = mesh.NumTriangles;
         memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
+
+        if (mesh.MaterialId != UINT_MAX) {
+            auto& material = Materials[mesh.MaterialId];
+            output.CullMode = material.IsDoubleSided ? swr::FaceCullMode::None : swr::FaceCullMode::FrontCCW;
+        }
     }
 
     static glm::vec2 UnpackHalf2x16(uint32_t x) {
-        // GLM emulates this with 100 instructions.
         auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
         return { v[0], v[1] };
     }
@@ -84,7 +91,6 @@ struct DefaultShader {
         // Depth test
         v_float oldDepth = load(&fb.DepthBuffer[vars.TileOffset]);
         vars.TileMask &= movemask(vars.Depth > oldDepth);
-
         if (vars.TileMask == 0) return;
 
         const scene::Meshlet& mesh = Meshlets[vars.MeshletId];
@@ -99,6 +105,10 @@ struct DefaultShader {
             v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
 
             color = material.Texture->Sample<SurfaceSampler>(uv.x, uv.y);
+            if (material.AlphaCutoff < 255) {
+                vars.TileMask &= movemask((color >> 24 & 255) >= material.AlphaCutoff);
+            }
+            color |= (int)0xFF'000000;
         } else {
             color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
         }
@@ -107,12 +117,13 @@ struct DefaultShader {
         fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
     }
 
+    void Compose(swr::Rasterizer& raster, swr::Framebuffer& fb, bool hasSSAO) {
         glm::mat4 invProj = glm::inverse(ProjMat);
         // Bias matrix to take UVs in range [0..screen] rather than [-1..1]
         invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
         invProj = glm::scale(invProj, glm::vec3(2.0f / fb.Width, 2.0f / fb.Height, 1.0f));
-
-        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+        
+        raster.DispatchPass(fb, [&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             v_float tileDepth = load(&fb.DepthBuffer[tileOffset]);
             v_int skyMask = tileDepth <= 0.0f;
@@ -232,7 +243,7 @@ struct DefaultShader {
         // 
         // TODO: it might be possible to work in tiles rather than on the entire fb to improve cache-ability
         if (EnableTAA && FrameNo > 0) {
-            fb.IterateTiles([&](uint32_t x, uint32_t y) {
+            raster.DispatchPass(fb, [&](uint32_t x, uint32_t y) {
                 uint32_t tileOffset = fb.GetPixelOffset(x, y);
                 v_int currColor = load(&fb.ColorBuffer[tileOffset]);
                 v_int prevColor = load(fb.GetAttachmentBuffer<uint32_t>(0, tileOffset));
@@ -291,8 +302,8 @@ struct DefaultShader {
         SkyboxTex = std::move(envCube);
     }
 
-    void ComposeDebug(swr::Framebuffer& fb, DebugLayer layer) {
-        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+    void ComposeDebug(swr::Rasterizer& raster, swr::Framebuffer& fb, DebugLayer layer) {
+        raster.DispatchPass(fb, [&](uint32_t x, uint32_t y) {
             uint32_t tileOffset = fb.GetPixelOffset(x, y);
             v_float tileDepth = load(&fb.DepthBuffer[tileOffset]);
             v_int skyMask = tileDepth <= 0.0f;
@@ -705,7 +716,7 @@ struct SSAO {
         }
     }
 
-    void Generate(swr::Framebuffer& fb, const scene::DepthPyramid& depthMap, glm::mat4& projViewMat) {
+    void Generate(swr::Rasterizer& raster, swr::Framebuffer& fb, const scene::DepthPyramid& depthMap, glm::mat4& projViewMat) {
         glm::mat4 invProj = glm::inverse(projViewMat);
         // Bias matrix so that input UVs can be in range [0..1] rather than [-1..1]
         invProj = glm::translate(invProj, glm::vec3(-1.0f, -1.0f, 0.0f));
@@ -716,7 +727,8 @@ struct SSAO {
 
         XorShiftStep(_randSeed); // update RNG on each frame for TAA
 
-        fb.IterateTiles([&](uint32_t x, uint32_t y) {
+        raster.Dispatch(fb.Width / 2, fb.Height / 2, [&](uint32_t x, uint32_t y) {
+            x *= 8, y *= 8;
             v_int rng = _randSeed * (int32_t)(x * 12345 + y * 9875);
 
             v_int iu = (int32_t)x + FragPixelOffsetsX * 2;
@@ -781,7 +793,7 @@ struct SSAO {
             for (uint32_t sy = 0; sy < 4; sy++) {
                 std::memcpy(&aoBuffer[(x / 2) + (y / 2 + sy) * stride], (uint32_t*)&occlusion + sy, 4);
             }
-        }, 2);
+        });
 
         //ApplyBlur(fb);
     }

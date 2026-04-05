@@ -2,10 +2,8 @@
 
 #include <immintrin.h>
 
-#include <cassert>
 #include <cstdint>
 #include <memory>
-#include <bit>
 #include <glm/mat4x4.hpp>
 
 namespace swr {
@@ -251,6 +249,19 @@ SIMD_INLINE v_float4 PerspectiveDiv(const v_float4& v) {
     return { v.x * rw, v.y * rw, v.z * rw, rw };
 }
 
+template<std::unsigned_integral T>
+SIMD_INLINE constexpr uint32_t popcnt(T value) {
+    return (uint32_t)__builtin_popcountg(value);
+}
+template<std::unsigned_integral T>
+SIMD_INLINE constexpr uint32_t tzcnt(T value) {
+    return (uint32_t)__builtin_ctzg(value);
+}
+template<std::unsigned_integral T>
+SIMD_INLINE constexpr uint32_t lzcnt(T value) {
+    return (uint32_t)__builtin_clzg(value);
+}
+
 };  // namespace simd
 
 struct AlignedDeleter {
@@ -267,16 +278,16 @@ AlignedBuffer<T> alloc_buffer(size_t count, size_t align = 64) {
 }
 
 class BitIter {
-    uint32_t _mask;
+    uint64_t _mask;
 
 public:
-    BitIter(uint32_t mask) : _mask(mask) {}
+    BitIter(uint64_t mask) : _mask(mask) {}
 
     BitIter& operator++() {
         _mask &= (_mask - 1);
         return *this;
     }
-    uint32_t operator*() const { return (uint32_t)std::countr_zero(_mask); }
+    uint32_t operator*() const { return (uint32_t)__builtin_ctzg(_mask); }
     friend bool operator!=(const BitIter& a, const BitIter& b) { return a._mask != b._mask; }
 
     BitIter begin() const { return *this; }

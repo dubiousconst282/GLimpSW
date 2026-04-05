@@ -322,34 +322,6 @@ inline void GetAdjacentCubeFace(v_int& faceIdx, v_int& u, v_int& v, v_int scaleU
     v = invV ? scaleV - sv : sv;
 }
 
-// Texture swizzling doesn't improve performance by much, the functions below are keept for reference.
-
-// 32-bit Z-curve/morton encode. Takes ~8.5 cycles per 16 coord pairs on TigerLake, according to llvm-mca.
-// - https://lemire.me/blog/2018/01/09/how-fast-can-you-bit-interleave-32-bit-integers-simd-edition/
-// - https://github.com/KWillets/simd_interleave/blob/master/simd.c
-inline v_int Interleave(v_int x, v_int y) {
-    const __m512i m0 = _mm512_broadcast_i32x4(_mm_set_epi8(85, 84, 81, 80, 69, 68, 65, 64, 21, 20, 17, 16, 5, 4, 1, 0));
-    const __m512i m1 = _mm512_slli_epi64(m0, 1);
-    const __m512i bm = _mm512_set_epi8(125, 61, 124, 60, 121, 57, 120, 56, 117, 53, 116, 52, 113, 49, 112, 48, 109, 45, 108, 44, 105, 41,
-                                       104, 40, 101, 37, 100, 36, 97, 33, 96, 32, 93, 29, 92, 28, 89, 25, 88, 24, 85, 21, 84, 20, 81, 17,
-                                       80, 16, 77, 13, 76, 12, 73, 9, 72, 8, 69, 5, 68, 4, 65, 1, 64, 0);
-
-    __m512i xl = _mm512_shuffle_epi8(m0, (x >> 0) & 0x0F'0F'0F'0F);
-    __m512i xh = _mm512_shuffle_epi8(m0, (x >> 4) & 0x0F'0F'0F'0F);
-    __m512i yl = _mm512_shuffle_epi8(m1, (y >> 0) & 0x0F'0F'0F'0F);
-    __m512i yh = _mm512_shuffle_epi8(m1, (y >> 4) & 0x0F'0F'0F'0F);
-
-    __m512i lo = _mm512_or_si512(xl, yl);
-    __m512i hi = _mm512_or_si512(xh, yh);
-
-    return _mm512_permutex2var_epi8(lo, bm, hi);
-}
-inline v_int GetTiledOffset(v_int ix, v_int iy, v_int rowShift) {
-    v_int tileId = (ix >> 2) + ((iy >> 2) << (rowShift - 2));
-    v_int pixelOffset = (ix & 3) + (iy & 3) * 4;
-    return tileId * 16 + pixelOffset;
-}
-
 };  // namespace texutil
 
 enum class WrapMode { Repeat, ClampToEdge };

@@ -1,12 +1,16 @@
 #include "Scene.h"
 
-#include <filesystem>
 #include <glm/packing.hpp>
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"
 
 #define CGLTF_IMPLEMENTATION
 #include <cgltf.h>
 #include <meshoptimizer.h>
 #include <stb_image.h>
+
+#pragma clang diagnostic pop
 
 namespace scene {
 
@@ -131,6 +135,8 @@ Model::Model(const std::string& path) {
 
         Materials.push_back({
             .Texture = Textures[i].get(),
+            .IsDoubleSided = mat->double_sided != 0,
+            .AlphaCutoff = (uint8_t)(mat->alpha_mode == cgltf_alpha_mode_mask ? mat->alpha_cutoff * 255.0f + 0.5f : 255),
         });
     }
 

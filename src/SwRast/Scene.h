@@ -4,7 +4,7 @@
 #include <vector>
 #include <memory>
 
-#include "SwRast.h"
+#include "Rasterizer.h"
 #include "Texture.h"
 
 namespace scene {
@@ -14,6 +14,8 @@ struct Material {
     // Layer 1?: Normal (XY), Metallic (Z), Roughness (W)
     // Layer 2?: Emissive, BaseColor.A==255 is a mask for non-zero emission. Normal values range between [0..254]
     const swr::RgbaTexture2D* Texture;
+    bool IsDoubleSided;
+    uint8_t AlphaCutoff;
 };
 
 struct Node {
