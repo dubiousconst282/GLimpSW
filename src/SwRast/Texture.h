@@ -15,28 +15,28 @@ concept IsAnyOf = (std::same_as<T, U> || ...);
 // Represents a SIMD pixel packet in storage form, where the unpacked form consists of floats.
 // NOTE: Packed size is currently restricted to 32-bits as that's the only element size texture sampling supports gathering.
 template<typename T>
-concept Texel = requires(const T& s, const T::UnpackedTy& u, v_int p) {
-    IsAnyOf<typename T::UnpackedTy, v_int, v_float, v_float2, v_float3, v_float4>;
-    IsAnyOf<typename T::LerpedTy, v_int, typename T::UnpackedTy>;
+concept Texel = requires(const T& s, const T::UnpackedTy& u, v_uint p) {
+    IsAnyOf<typename T::UnpackedTy, v_uint, v_float, v_float2, v_float3, v_float4>;
+    IsAnyOf<typename T::LerpedTy, v_uint, typename T::UnpackedTy>;
     { T::Unpack(p) } -> std::same_as<typename T::UnpackedTy>;
-    { T::Pack(u) } -> std::same_as<v_int>;
+    { T::Pack(u) } -> std::same_as<v_uint>;
 };
 
 // RGBA x 8-bit unorm
 struct RGBA8u {
     using UnpackedTy = v_float4;
-    using LerpedTy = v_int;
+    using LerpedTy = v_uint;
 
-    static v_float4 Unpack(v_int packed) {
+    static v_float4 Unpack(v_uint packed) {
         const float scale = 1.0f / 255;
         return {
-            simd::conv2f((packed >> 0) & 255) * scale,
-            simd::conv2f((packed >> 8) & 255) * scale,
-            simd::conv2f((packed >> 16) & 255) * scale,
-            simd::conv2f((packed >> 24) & 255) * scale,
+            simd::conv<float>((packed >> 0) & 255) * scale,
+            simd::conv<float>((packed >> 8) & 255) * scale,
+            simd::conv<float>((packed >> 16) & 255) * scale,
+            simd::conv<float>((packed >> 24) & 255) * scale,
         };
     }
-    static v_int Pack(const v_float4& value) {
+    static v_uint Pack(const v_float4& value) {
         auto ri = simd::round2i(value.x * 255.0f);
         auto gi = simd::round2i(value.y * 255.0f);
         auto bi = simd::round2i(value.z * 255.0f);
@@ -56,15 +56,15 @@ struct RGB10u {
     using UnpackedTy = v_float3;
     using LerpedTy = UnpackedTy;
 
-    static v_float3 Unpack(v_int packed) {
+    static v_float3 Unpack(v_uint packed) {
         const float scale = 1.0f / 1023;
         return {
-            simd::conv2f(packed >> 22 & 1023) * scale,
-            simd::conv2f(packed >> 12 & 1023) * scale,
-            simd::conv2f(packed >> 2 & 1023) * scale,
+            simd::conv<float>(packed >> 22 & 1023) * scale,
+            simd::conv<float>(packed >> 12 & 1023) * scale,
+            simd::conv<float>(packed >> 2 & 1023) * scale,
         };
     }
-    static v_int Pack(const v_float3& value) {
+    static v_uint Pack(const v_float3& value) {
         v_int ri = simd::round2i(value.x * 1023.0f);
         v_int gi = simd::round2i(value.y * 1023.0f);
         v_int bi = simd::round2i(value.z * 1023.0f);
@@ -73,7 +73,7 @@ struct RGB10u {
         gi = simd::min(simd::max(gi, 0), 1023);
         bi = simd::min(simd::max(bi, 0), 1023);
 
-        return ri << 22 | gi << 12 | bi << 2;
+        return v_uint(ri << 22 | gi << 12 | bi << 2);
     }
 };
 
@@ -82,8 +82,8 @@ struct R32f {
     using UnpackedTy = v_float;
     using LerpedTy = UnpackedTy;
 
-    static v_float Unpack(v_int packed) { return simd::re2f(packed); }
-    static v_int Pack(const v_float& value) { return simd::re2i(value); }
+    static v_float Unpack(v_uint packed) { return simd::as<float>(packed); }
+    static v_uint Pack(const v_float& value) { return simd::as<uint32_t>(value); }
 };
 
 // RG x 16-bit float
@@ -91,15 +91,15 @@ struct RG16f {
     using UnpackedTy = v_float2;
     using LerpedTy = UnpackedTy;
 
-    static v_float2 Unpack(v_int packed) {
+    static v_float2 Unpack(v_uint packed) {
         return {
             _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed)),
             _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed >> 16)),
         };
     }
-    static v_int Pack(const v_float2& value) {
-        v_int r = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        v_int g = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    static v_uint Pack(const v_float2& value) {
+        v_uint r = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        v_uint g = _mm512_cvtepi16_epi32(_mm512_cvtps_ph(value.y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         return r | (g << 16);
     }
 };
@@ -109,14 +109,14 @@ struct R11G11B10f {
     using UnpackedTy = v_float3;
     using LerpedTy = UnpackedTy;
 
-    static v_float3 Unpack(v_int packed) {
+    static v_float3 Unpack(v_uint packed) {
         return {
             UnpackF11(packed >> 21),
             UnpackF11(packed >> 10),
             UnpackF10(packed >> 0),
         };
     }
-    static v_int Pack(const v_float3& value) {
+    static v_uint Pack(const v_float3& value) {
         return
             PackF11(value.x) << 21 |
             PackF11(value.y) << 10 |
@@ -126,32 +126,32 @@ private:
     // https://learn.microsoft.com/en-us/windows/win32/direct3d11/floating-point-rules#11-bit-and-10-bit-floating-point-rules
     // Note that these don't follow denorm/NaN/Inf rules. Only clamping is applied.
     // This code was based on clang's output for the scalar version, as it doesn't seem to optimize the SIMD version well.
-    static v_int PackF11(v_float x) {
+    static v_uint PackF11(v_float x) {
         x = simd::max(x, 1.0f / (1 << 15));
         x = simd::min(x, 130048.0f); // UnpackF11(2047)
 
-        return (simd::re2i(x) >> 17 & 0x3FFF) - 0x1C00;
+        return (simd::as<uint32_t>(x) >> 17 & 0x3FFF) - 0x1C00;
     }
-    static v_int PackF10(v_float x) {
+    static v_uint PackF10(v_float x) {
         x = simd::max(x, 1.0f / (1 << 15));
         x = simd::min(x, 129024.0f);  // UnpackF10(1023)
 
-        return (simd::re2i(x) >> 18 & 0x1FFF) - 0x0E00;
+        return (simd::as<uint32_t>(x) >> 18 & 0x1FFF) - 0x0E00;
     }
 
     // 5-bit exp, 6-bit mantissa
-    static v_float UnpackF11(v_int x) {
+    static v_float UnpackF11(v_uint x) {
         // int exp = (x >> 6) & 0x1F;
         // int frc = x & 0x3F;
         // return (exp - 15 + 127) << 23 | frc << (23 - 6);
 
         x = x << 17;
-        return simd::re2f((x & 0x0FFE0000) + 0x38000000);
+        return simd::as<float>((x & 0x0FFE0000) + 0x38000000);
     }
     // 5-bit exp, 5-bit mantissa
-    static v_float UnpackF10(v_int x) {
+    static v_float UnpackF10(v_uint x) {
         x = x << 18;
-        return simd::re2f((x & 0x0FFC0000) + 0x38000000);
+        return simd::as<float>((x & 0x0FFC0000) + 0x38000000);
     }
 
     // static uint32_t PackFloat(float x, uint32_t fracBits) {
@@ -178,10 +178,13 @@ template<pixfmt::Texel Texel>
 struct Texture2D;
 
 template<pixfmt::Texel T>
-using TexturePtr2D = std::unique_ptr<Texture2D<T>, AlignedDeleter>;
+using TexturePtr2D = std::unique_ptr<Texture2D<T>, simd::AlignedDeleter>;
 
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
+
+constexpr v_int TilePixelOffsetsX = simd::lane_idx<v_int> & 3;
+constexpr v_int TilePixelOffsetsY = simd::lane_idx<v_int> >> 2;
 
 // TODO: delete or move this
 struct StbImage {
@@ -209,8 +212,8 @@ inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
 
     for (int32_t y = 0; y < height; y += 4) {
         for (int32_t x = 0; x < width; x += 4) {
-            v_float u = simd::conv2f(x + simd::FragPixelOffsetsX) + 0.5f;
-            v_float v = simd::conv2f(y + simd::FragPixelOffsetsY) + 0.5f;
+            v_float u = simd::conv<float>(x + TilePixelOffsetsX) + 0.5f;
+            v_float v = simd::conv<float>(y + TilePixelOffsetsY) + 0.5f;
             visitor((uint32_t)x, (uint32_t)y, u * (1.0f / width), v * (1.0f / height));
         }
     }
@@ -259,17 +262,17 @@ inline void ProjectCubemap(v_float3 dir, v_float& u, v_float& v, v_int& faceIdx)
 
     faceIdx = wz ? 4 : (wy ? 2 : 0);
     // faceIdx += w < 0 ? 1 : 0
-    faceIdx += simd::shrl(simd::re2i(w), 31);
+    faceIdx += (simd::as<uint32_t>(w) >> 31);
 
     // uv = { x: zy,  y: xz,  z: xy }[w]
-    w = simd::rcp14(simd::abs(w)) * 0.5f;
+    w = simd::approx_rcp(simd::abs(w)) * 0.5f;
     u = (wx ? dir.x : dir.z) * w + 0.5f;
     v = (wy ? dir.z : dir.y) * w + 0.5f;
 }
 
 // Unprojects the given cubemap face index and UVs to a normalized direction vector.
 inline v_float3 UnprojectCubemap(v_float u, v_float v, v_int faceIdx) {
-    v_float w = simd::re2f((faceIdx << 31) | 0x3F800000);  //(faceIdx & 1) ? -1.0 : +1.0
+    v_float w = simd::as<float>(v_uint(faceIdx << 31) | 0x3F800000);  //(faceIdx & 1) ? -1.0 : +1.0
     v_int axis = faceIdx >> 1;
 
     u = u * 2.0f - 1.0f;
@@ -286,7 +289,7 @@ inline v_float3 UnprojectCubemap(v_float u, v_float v, v_int faceIdx) {
         axis == 1 ? w : v,
         axis == 2 ? w : (axis == 0 ? u : v),
     };
-    return unnormDir * simd::rsqrt14(u * u + v * v + 1.0f);
+    return unnormDir * simd::approx_rsqrt(u * u + v * v + 1.0f);
 }
 
 // Lookups the adjacent cube face and UVs to the nearest edge.
@@ -305,8 +308,8 @@ inline void GetAdjacentCubeFace(v_int& faceIdx, v_int& u, v_int& v, v_int scaleU
     // if (data & (1 << 5)) v = 1 - v;
 
     v_int cu = (scaleU >> 1) - u, cv = (scaleV >> 1) - v;
-    v_int quadIdx = simd::abs(cu) > simd::abs(cv) ? simd::shrl(cu, 31) + 2 : simd::shrl(cv, 31);
-    v_int tableIdx = quadIdx * 8 + faceIdx;
+    v_uint quadIdx = simd::abs(cu) > simd::abs(cv) ? (v_uint(cu) >> 31) + 2 : (v_uint(cv) >> 31);
+    v_uint tableIdx = quadIdx * 8 + faceIdx;
 
     v_int data = _mm512_permutexvar_epi8(tableIdx, _mm512_broadcast_i32x8(_mm256_loadu_epi8(AdjFaceLUT)));
 
@@ -367,7 +370,7 @@ struct Texture2D {
     }
 
     // Writes a 4x4 tile of texels to the texture buffer. Coords are in pixel space.
-    void WriteTile(v_int value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
+    void WriteTile(v_uint value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
         assert(x + 3 < Width && y + 3 < Height);
         assert(x % 4 == 0 && y % 4 == 0);
         assert(layer < NumLayers && mipLevel < MipLevels);
@@ -433,9 +436,9 @@ struct Texture2D {
         if (filter == FilterMode::Nearest) [[likely]] {
             ix >>= LerpFracBits;
             iy >>= LerpFracBits;
-            v_int res = GatherRawTexels(offset + ix + (iy << stride));
+            v_uint res = simd::gather(Data, offset + ix + (iy << stride));
 
-            if constexpr (std::is_same<typename Texel::LerpedTy, v_int>()) {
+            if constexpr (std::is_same<typename Texel::LerpedTy, v_uint>()) {
                 return res;
             } else {
                 return Texel::Unpack(res);
@@ -464,10 +467,10 @@ struct Texture2D {
         if (__builtin_constant_p(tmp) && tmp < 0) {
             return Sample<SD, true, true>(u, v, faceIdx);
         }
-        v_int baseMip = simd::trunc2i(mipLevel);
+        v_int baseMip = simd::conv<int>(mipLevel);
         auto baseSample = Sample<SD, false, true>(u, v, faceIdx, baseMip);
 
-        v_float mipFrac = mipLevel - simd::conv2f(baseMip);
+        v_float mipFrac = mipLevel - simd::conv<float>(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
             auto lowerSample = Sample<SD, false, true>(u, v, faceIdx, baseMip + 1);
             return baseSample + (lowerSample - baseSample) * mipFrac;
@@ -490,46 +493,46 @@ private:
         v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)Width;
 
 #if 0
-        v_int data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
-        v_int data10 = _mm512_i32gather_epi32(indices00, Data + 1, 4);
-        v_int data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
-        v_int data11 = _mm512_i32gather_epi32(indices01, Data + 1, 4);
+        v_uint data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
+        v_uint data10 = _mm512_i32gather_epi32(indices00, Data + 1, 4);
+        v_uint data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
+        v_uint data11 = _mm512_i32gather_epi32(indices01, Data + 1, 4);
 #else
-        v_int row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
-        v_int row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
-        v_int row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
-        v_int row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
+        v_uint row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
+        v_uint row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
+        v_uint row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
+        v_uint row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
 
-        v_int data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 0, row0_hi);
-        v_int data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx * 2 + 1, row0_hi);
-        v_int data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 0, row1_hi);
-        v_int data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx * 2 + 1, row1_hi);
+        v_uint data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 0, row0_hi);
+        v_uint data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 1, row0_hi);
+        v_uint data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 0, row1_hi);
+        v_uint data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 1, row1_hi);
 #endif
 
         if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {
             // 15-bit fraction for mulhrs
-            v_int fx = (ixf & LerpFracMask) << (15 - LerpFracBits);
-            v_int fy = (iyf & LerpFracMask) << (15 - LerpFracBits);
+            v_uint fx = v_uint(ixf & LerpFracMask) << (15 - LerpFracBits);
+            v_uint fy = v_uint(iyf & LerpFracMask) << (15 - LerpFracBits);
             fx = (fx << 16) | fx;
             fy = (fy << 16) | fy;
             fx = inboundX ? fx : 0;
 
             // Lerp 2 channels at the same time (RGBA -> R0B0, 0G0A)
-            v_int rbRow1 = simd::lerp16((data00 >> 0) & 0x00FF00FF, (data10 >> 0) & 0x00FF00FF, fx);
-            v_int gaRow1 = simd::lerp16((data00 >> 8) & 0x00FF00FF, (data10 >> 8) & 0x00FF00FF, fx);
-            v_int rbRow2 = simd::lerp16((data01 >> 0) & 0x00FF00FF, (data11 >> 0) & 0x00FF00FF, fx);
-            v_int gaRow2 = simd::lerp16((data01 >> 8) & 0x00FF00FF, (data11 >> 8) & 0x00FF00FF, fx);
+            v_uint rbRow1 = simd::lerp16((data00 >> 0) & 0x00FF00FF, (data10 >> 0) & 0x00FF00FF, fx);
+            v_uint gaRow1 = simd::lerp16((data00 >> 8) & 0x00FF00FF, (data10 >> 8) & 0x00FF00FF, fx);
+            v_uint rbRow2 = simd::lerp16((data01 >> 0) & 0x00FF00FF, (data11 >> 0) & 0x00FF00FF, fx);
+            v_uint gaRow2 = simd::lerp16((data01 >> 8) & 0x00FF00FF, (data11 >> 8) & 0x00FF00FF, fx);
 
-            v_int rbCol = simd::lerp16(rbRow1, rbRow2, fy);
-            v_int gaCol = simd::lerp16(gaRow1, gaRow2, fy);
+            v_uint rbCol = simd::lerp16(rbRow1, rbRow2, fy);
+            v_uint gaCol = simd::lerp16(gaRow1, gaRow2, fy);
 
             return rbCol | (gaCol << 8);
         } else {
             using R = Texel::UnpackedTy;
 
             const float fracScale = 1.0f / (LerpFracMask + 1);
-            v_float fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
-            v_float fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
+            v_float fx = simd::conv<float>(ixf & LerpFracMask) * fracScale;
+            v_float fy = simd::conv<float>(iyf & LerpFracMask) * fracScale;
             fx = inboundX ? fx : 0;
 
             R colors00 = Texel::Unpack(data00);
@@ -555,8 +558,8 @@ private:
         v_int iy = iyf >> LerpFracBits;
 
         const float fracScale = 1.0f / (LerpFracMask + 1);
-        v_float fx = simd::conv2f(ixf & LerpFracMask) * fracScale;
-        v_float fy = simd::conv2f(iyf & LerpFracMask) * fracScale;
+        v_float fx = simd::conv<float>(ixf & LerpFracMask) * fracScale;
+        v_float fy = simd::conv<float>(iyf & LerpFracMask) * fracScale;
 
         R colors00 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 0, iy + 0);
         R colors10 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 1, iy + 0);
@@ -569,11 +572,8 @@ private:
         return rowA + (rowB - rowA) * fy;
     }
 
-    v_int GatherRawTexels(v_int indices) const {
-        return simd::gather((const int32_t*)Data, indices);
-    }
     Texel::UnpackedTy GatherTexels(int32_t offset, uint32_t stride, v_int ix, v_int iy) const {
-        return Texel::Unpack(GatherRawTexels(offset + ix + (iy << stride)));
+        return Texel::Unpack(simd::gather(Data, offset + ix + (iy << stride)));
     }
     Texel::UnpackedTy GatherTexelsNearCubeEdge(v_int offset, v_int stride, v_int mipLevel, v_int faceIdx, v_int ix, v_int iy) const {
         v_int scaleU = MaskU >> mipLevel, scaleV = MaskV >> mipLevel;
@@ -589,7 +589,7 @@ private:
             iy = simd::min(simd::max(iy, 0), scaleV);
             offset += fallMask ? ((adjFace - faceIdx) * (int)LayerStride) : 0;
         }
-        return Texel::Unpack(GatherRawTexels(offset + ix + (iy << stride)));
+        return Texel::Unpack(simd::gather(Data, offset + ix + (iy << stride)));
     }
 
     void GenerateMip(uint32_t level, uint32_t layer) {
@@ -599,8 +599,8 @@ private:
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
-                v_int ix = ((int32_t)x + simd::FragPixelOffsetsX) << 1;
-                v_int iy = ((int32_t)y + simd::FragPixelOffsetsY) << 1;
+                v_int ix = ((int32_t)x + TilePixelOffsetsX) << 1;
+                v_int iy = ((int32_t)y + TilePixelOffsetsY) << 1;
 
                 // This will never go out of bounds if texture size is POT and >4x4.
                 // Storage is padded by +16*4 bytes so nothing bad should happen if we do.

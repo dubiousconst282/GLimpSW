@@ -175,9 +175,9 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, const ShaderDis
             SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
 
             for (uint32_t primOffset = 0; primOffset < mesh.PrimCount; primOffset += simd::vec_width) {
-                v_int i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
-                v_int i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
-                v_int i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
+                v_uint i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
+                v_uint i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
+                v_uint i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
                 v_float4 v0 = GatherPos(mesh, i0);
                 v_float4 v1 = GatherPos(mesh, i1);
                 v_float4 v2 = GatherPos(mesh, i2);
@@ -212,7 +212,7 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, const ShaderDis
                     memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
                     memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                    for (uint32_t i : BitIter(acceptMask)) {
+                    for (uint32_t i : simd::BitIter(acceptMask)) {
                         uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 34;
                         dispatcher.DrawFn(dispatcher.Shader, fb, vars, i, boundRect);
                     }
@@ -284,9 +284,9 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, const ShaderD
             for (; primOffset < mesh.PrimCount && !batchFull; primOffset += simd::vec_width) {
                 isIdle = false;
 
-                v_int i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
-                v_int i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
-                v_int i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
+                v_uint i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
+                v_uint i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
+                v_uint i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
                 v_float4 v0 = GatherPos(mesh, i0);
                 v_float4 v1 = GatherPos(mesh, i1);
                 v_float4 v2 = GatherPos(mesh, i2);
@@ -346,7 +346,7 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, const ShaderD
                         uint32_t shift = (workerId + i * 64) % 64;
                         uint64_t mask = _queue->FrameBitmap[i] & (workerBinElectMask << shift);
 
-                        for (uint32_t j : BitIter(mask)) {
+                        for (uint32_t j : simd::BitIter(mask)) {
                             uint32_t binId = i * 64 + j;
                             RasterizeBin(fb, dispatcher, binId);
                         }
@@ -444,7 +444,7 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, const ShaderDispatcher& dispatche
                 assert((simd::movemask(x0 > x1 || y0 > y1) & acceptMask) == 0);
             }
 
-            for (uint32_t j : BitIter(acceptMask)) {
+            for (uint32_t j : simd::BitIter(acceptMask)) {
                 // clang sometimes emits full vector reload when indexing (only for local vars?)
                 uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
                 dispatcher.DrawFn(dispatcher.Shader, fb, edges, j, boundRect);
@@ -639,7 +639,7 @@ void ClipNonTrivial(v_mask mask) {
     uint16_t outIdx = 0;
     Clipper clipper;
 
-    for (uint32_t i : BitIter(mask)) {
+    for (uint32_t i : simd::BitIter(mask)) {
         clipper.Vertices[0] = { v0.x[i], v0.y[i], v0.z[i], v0.w[i] };
         clipper.Vertices[1] = { v1.x[i], v1.y[i], v1.z[i], v1.w[i] };
         clipper.Vertices[2] = { v2.x[i], v2.y[i], v2.z[i], v2.w[i] };
@@ -651,7 +651,7 @@ void ClipNonTrivial(v_mask mask) {
         clipper.Indices[2] = 2;
         clipper.Count = clipper.OutIdx = 3;
 
-        for (uint32_t j : BitIter(cc.OutCodes[i])) {
+        for (uint32_t j : simd::BitIter(cc.OutCodes[i])) {
             float planeDist = j < (int)Clipper::Plane::Near ? guardBandPlaneDist[j / 2] : 1.0f;
             clipper.ClipAgainstPlane((Clipper::Plane)j, planeDist);
         }
@@ -681,25 +681,14 @@ void ClipNonTrivial(v_mask mask) {
             outIdx++;
         }
     }
-
-    v0 = simd::PerspectiveDiv(v0);
-    v1 = simd::PerspectiveDiv(v1);
-    v2 = simd::PerspectiveDiv(v2);
-
-    TrianglePacket tris;
-    v_mask mask = tris.Setup(v0, v1, v2, glm::ivec2(fb.Width, fb.Height) / 2, mesh.CullMode);
-    mask &= (1u << outIdx) - 1;
-
-    for (uint32_t i : BitIter(mask)) {
-    }
 }
 #endif
 
 // https://fgiesen.wordpress.com/2013/02/08/triangle-rasterization-in-practice
 v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode) {
-    v0 = simd::PerspectiveDiv(v0);
-    v1 = simd::PerspectiveDiv(v1);
-    v2 = simd::PerspectiveDiv(v2);
+    v0 = simd::perspective_div(v0);
+    v1 = simd::perspective_div(v1);
+    v2 = simd::perspective_div(v2);
 
     glm::vec2 fixScale = vpHalfSize * 16;
     v_int x0 = simd::round2i(v0.x * fixScale.x), y0 = simd::round2i(v0.y * fixScale.y);
@@ -761,7 +750,7 @@ void TriangleEdgeVars::Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize) 
     Edge1 = ComputeEdge(A20, sampleX - x2, B20, sampleY - y2);
     Edge2 = ComputeEdge(A01, sampleX - x0, B01, sampleY - y0);
 
-    v_float rcpArea = 16.0f / simd::conv2f(det);
+    v_float rcpArea = 16.0f / simd::conv<float>(det);
     Z0 = tris.Z0;
     Z10 = (tris.Z1 - tris.Z0) * rcpArea;
     Z20 = (tris.Z2 - tris.Z0) * rcpArea;

@@ -15,9 +15,9 @@ struct Framebuffer {
     uint32_t AttachmentStride, NumAttachments;
 
     // TODO: experiment with fast clears for depth
-    AlignedBuffer<uint32_t> ColorBuffer;
-    AlignedBuffer<float> DepthBuffer;
-    AlignedBuffer<uint8_t> AttachmentBuffer;
+    simd::AlignedBuffer<uint32_t> ColorBuffer;
+    simd::AlignedBuffer<float> DepthBuffer;
+    simd::AlignedBuffer<uint8_t> AttachmentBuffer;
 
     Framebuffer(uint32_t width, uint32_t height, uint32_t numAttachments = 0) {
         Width = (width + TileMask) & ~TileMask;
@@ -26,9 +26,9 @@ struct Framebuffer {
         AttachmentStride = (Width * Height + 63) & ~63u;
         NumAttachments = numAttachments;
 
-        ColorBuffer = alloc_buffer<uint32_t>(Width * Height);
-        DepthBuffer = alloc_buffer<float>(Width * Height);
-        AttachmentBuffer = alloc_buffer<uint8_t>(AttachmentStride * numAttachments);
+        ColorBuffer = simd::alloc_buffer<uint32_t>(Width * Height);
+        DepthBuffer = simd::alloc_buffer<float>(Width * Height);
+        AttachmentBuffer = simd::alloc_buffer<uint8_t>(AttachmentStride * numAttachments);
     }
 
     void Clear(uint32_t color, float depth) {
@@ -49,7 +49,7 @@ struct Framebuffer {
         return tileId * TileNumPixels + pixelOffset;
     }
 
-    void WriteTile(uint32_t offset, uint16_t mask, v_int color, v_float depth) {
+    void WriteTile(uint32_t offset, uint16_t mask, v_uint color, v_float depth) {
         _mm512_mask_store_epi32(&ColorBuffer[offset], mask, color);
         _mm512_mask_store_ps(&DepthBuffer[offset], mask, depth);
     }
@@ -71,7 +71,7 @@ struct Framebuffer {
         v_mask boundMask = _mm512_cmplt_epu32_mask(ix, v_int((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, v_int((int32_t)Height));
         return _mm512_mask_i32gather_ps(_mm512_set1_ps(1.0f), boundMask, indices, DepthBuffer.get(), 4);
     }
-    [[gnu::always_inline]] v_int SampleColor(v_int ix, v_int iy, v_int defaultColor = 0) const {
+    [[gnu::always_inline]] v_uint SampleColor(v_int ix, v_int iy, v_uint defaultColor = 0) const {
         // Twos-complement unsigned compare trick to check for both (x >= 0 && x < N) at once.
         v_int indices = GetPixelOffset(ix, iy);
         v_mask boundMask = _mm512_cmplt_epu32_mask(ix, v_int((int32_t)Width)) & _mm512_cmplt_epu32_mask(iy, v_int((int32_t)Height));
@@ -105,10 +105,10 @@ struct ShadedMeshlet {
 
     void SetPosition(uint32_t index, v_float4 value) {
         assert(index % simd::vec_width == 0);
-        simd::store(value.x, &Position[0][index]);
-        simd::store(value.y, &Position[1][index]);
-        simd::store(value.z, &Position[2][index]);
-        simd::store(value.w, &Position[3][index]);
+        simd::store(&Position[0][index], value.x);
+        simd::store(&Position[1][index], value.y);
+        simd::store(&Position[2][index], value.z);
+        simd::store(&Position[3][index], value.w);
     }
 };
 
@@ -243,9 +243,12 @@ private:
 
     void WorkerFn(uint32_t workerId);
 
+    static constexpr v_int FragPixelOffsetsX = simd::lane_idx<v_int> & 3;
+    static constexpr v_int FragPixelOffsetsY = simd::lane_idx<v_int> >> 2;
+
     template<ShaderProgram TShader>
     static void DrawTriangle(const TShader& shader, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
-        [[assume(i < simd::vec_width)]];  // avoids masking on vector indexing
+        [[assume(i < simd::vec_width<v_int>)]];  // avoids masking on vector indexing
 
         uint16_t minX = boundRect >> 0, minY = boundRect >> 16;
         uint16_t offsetExtentX = boundRect >> 32, offsetExtentY = boundRect >> 48;  // (max - min) / 4 * 16
@@ -259,7 +262,7 @@ private:
         v_int stepY0 = tri.B12[i], stepY1 = tri.B20[i], stepY2 = tri.B01[i];
 
         // Barycentric coordinates at start of row
-        v_int baseX = minX + simd::FragPixelOffsetsX, baseY = minY + simd::FragPixelOffsetsY;
+        v_int baseX = minX + FragPixelOffsetsX, baseY = minY + FragPixelOffsetsY;
         v_int edgeY0 = tri.Edge0[i] + stepX0 * baseX + stepY0 * baseY;
         v_int edgeY1 = tri.Edge1[i] + stepX1 * baseX + stepY1 * baseY;
         v_int edgeY2 = tri.Edge2[i] + stepX2 * baseX + stepY2 * baseY;
@@ -284,8 +287,8 @@ private:
                 v_mask tileMask = _mm512_movepi32_mask(_mm512_ternarylogic_epi32(edgeX0, edgeX1, edgeX2, ~(_MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C)));
 
                 if (tileMask != 0) [[unlikely]] {
-                    v_float u = simd::conv2f(edgeX1);
-                    v_float v = simd::conv2f(edgeX2);
+                    v_float u = simd::conv<float>(edgeX1);
+                    v_float v = simd::conv<float>(edgeX2);
                     vars.Depth = simd::fma(u, tri.Z10[i], simd::fma(v, tri.Z20[i], tri.Z0[i]));
                     vars.TileOffset = offset;
                     vars.TileMask = tileMask;
@@ -295,7 +298,7 @@ private:
                     v_float pw0 = simd::fma(u + v, -tri.W0S[i], tri.W0[i]);
                     v_float pw1 = tri.W1S[i];  // (1/area) is baked in!
                     v_float pw2 = tri.W2S[i];
-                    v_float rcpW = simd::rcp14(simd::fma(pw1, u, simd::fma(pw2, v, pw0)));
+                    v_float rcpW = simd::approx_rcp(simd::fma(u, pw1, simd::fma(v, pw2, pw0)));
                     u *= pw1 * rcpW;
                     v *= pw2 * rcpW;
                     vars.Bary = { 1 - u - v, u, v };

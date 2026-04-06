@@ -87,8 +87,8 @@ HdrTexture2D::Ptr LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevel
         for (uint32_t y = 0; y < faceSize; y += 4) {
             for (uint32_t x = 0; x < faceSize; x += 4) {
                 float scaleUV = 1.0f / (faceSize - 1);
-                v_float u = simd::conv2f((int32_t)x + simd::FragPixelOffsetsX) * scaleUV;
-                v_float v = simd::conv2f((int32_t)y + simd::FragPixelOffsetsY) * scaleUV;
+                v_float u = simd::conv<float>((int32_t)x + swr::TilePixelOffsetsX) * scaleUV;
+                v_float v = simd::conv<float>((int32_t)y + swr::TilePixelOffsetsY) * scaleUV;
 
                 v_float3 dir = UnprojectCubemap(u, v, (int32_t)layer);
 

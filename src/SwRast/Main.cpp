@@ -27,7 +27,6 @@ class SwRenderer {
     std::unique_ptr<renderer::DefaultShader> _shader;
 
     Camera _cam;
-    scene::DepthPyramid _depthPyramid;
 
     GLuint _fbTexture = 0;
     GLuint _shadowDebugTex = 0;
@@ -40,8 +39,6 @@ class SwRenderer {
     std::vector<std::filesystem::path> _scenePaths;
     std::vector<std::filesystem::path> _skyboxPaths;
     std::string _currSceneName, _currSkyboxName;
-
-    renderer::SSAO _ssao;
 
 public:
     SwRenderer() {
@@ -174,13 +171,6 @@ public:
             }
         }
 
-        ImGui::Checkbox("SSAO", &s_EnableSSAO);
-        if (s_EnableSSAO) {
-            ImGui::Indent();
-            ImGui::InputFloat("Radius", &_ssao.Radius, 0.1f);
-            ImGui::InputFloat("Range##SSAO", &_ssao.MaxRange, 0.1f);
-            ImGui::Unindent();
-        }
         ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
         ImGui::Checkbox("Blur Skybox", &_shader->BlurSkybox);
 
@@ -240,14 +230,6 @@ public:
             return true;
         });
         SWR_PERF_BEGIN(Compose);
-
-        if (s_HzbOcclusion) {
-            _depthPyramid.Update(*_fb, projViewMat);
-            //RenderDebugHzb();
-        }
-        if (s_EnableSSAO) {
-            _ssao.Generate(*_rast, *_fb, _depthPyramid, projViewMat);
-        }
 
         _shader->ProjMat = projMat * _cam.GetViewMatrix(false);
 
@@ -359,7 +341,7 @@ public:
 
             for (uint32_t y = 0; y < h; y++) {
                 for (uint32_t x = 0; x < w; x++) {
-                    float d = _depthPyramid.GetDepth(x / (float)(w - 1), y / (float)(h - 1), level);
+                    float d = 0;//  _depthPyramid.GetDepth(x / (float)(w - 1), y / (float)(h - 1), level);
 
                     uint8_t c = (uint8_t)(glm::sqrt(1.0f - d * d) * 255.0f);
                     buf[x + y * w] = c * 0x01'01'01 | 0xFF'000000;

@@ -10,9 +10,6 @@
 
 #include <stb_image_write.h>
 
-namespace simd = swr::simd;
-using swr::v_int, swr::v_float, swr::v_float2, swr::v_float3, swr::v_mask;
-
 struct VisShader {
     glm::mat4 ProjMat;
     glm::mat3 ModelMat;
@@ -24,7 +21,7 @@ struct VisShader {
 
         for (uint32_t i = 0; i < mesh.NumVertices; i += simd::vec_width) {
             v_float3 worldPos = { simd::load(&mesh.Positions[0][i]), simd::load(&mesh.Positions[1][i]), simd::load(&mesh.Positions[2][i]) };
-            output.SetPosition(i, simd::TransformVector(ProjMat, { worldPos, 1.0f }));
+            output.SetPosition(i, simd::mul(ProjMat, { worldPos, 1.0f }));
         }
         output.PrimCount = mesh.NumTriangles;
         memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
@@ -50,9 +47,9 @@ struct VisShader {
             .EnableMips = true,
         };
         auto tex = Materials[mesh.MaterialId].Texture;
-        v_int color = tex->Sample<sampler>(uv.x, uv.y);
+        v_uint color = tex->Sample<sampler>(uv.x, uv.y);
 #else
-        v_int color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
+        v_uint color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
 #endif
         fb.WriteTile(vars.TileOffset, vars.TileMask, color, vars.Depth);
     }
@@ -101,7 +98,7 @@ int main(int argc, const char** args) {
         });
     });
 
-    auto pixels = swr::alloc_buffer<uint32_t>(fb.Width * fb.Height);
+    auto pixels = simd::alloc_buffer<uint32_t>(fb.Width * fb.Height);
     fb.GetPixels(pixels.get(), fb.Width);
     stbi_write_png("logs/bench_view.png", (int)fb.Width, (int)fb.Height, 4, pixels.get(), (int)fb.Width * 4);
 }

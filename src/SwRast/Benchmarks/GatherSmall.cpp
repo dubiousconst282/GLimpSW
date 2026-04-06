@@ -5,9 +5,6 @@
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include <nanobench.h>
 
-namespace simd = swr::simd;
-using swr::v_int, swr::v_mask;
-
 [[gnu::noinline]] v_int Gather32x64_Native(const int data[64], v_int idx) {
     return _mm512_i32gather_epi32(idx, data, 4);
 }
@@ -26,8 +23,8 @@ int main() {
     alignas(64) int data[64];
     for (int i = 0; i < 64; i++) data[i] = i;
 
-    auto R1=Gather32x64_Native(data, simd::lane_idx*4);
-    auto R2=Gather32x64_Perm2i(data, simd::lane_idx*4);
+    auto R1=Gather32x64_Native(data, simd::lane_idx<v_int>*4);
+    auto R2=Gather32x64_Perm2i(data, simd::lane_idx<v_int>*4);
 
     printf("N: ");
     for (uint32_t i = 0; i < 16; i++) printf("% 5d", R1[i]);
@@ -46,13 +43,13 @@ int main() {
 
     ctx.run("Native", [&]() {
         for (int i = 0; i < 64; i++) {
-            auto r = Gather32x64_Native(data, ((simd::lane_idx + i) * 397) & 63);
+            auto r = Gather32x64_Native(data, ((simd::lane_idx<v_int> + i) * 397) & 63);
             ankerl::nanobench::detail::doNotOptimizeAway(r);
         }
     });
     ctx.run("Perm2i", [&]() {
         for (int i = 0; i < 64; i++) {
-            auto r = Gather32x64_Perm2i(data, ((simd::lane_idx + i) * 397) & 63);
+            auto r = Gather32x64_Perm2i(data, ((simd::lane_idx<v_int> + i) * 397) & 63);
             ankerl::nanobench::detail::doNotOptimizeAway(r);
         }
     });
