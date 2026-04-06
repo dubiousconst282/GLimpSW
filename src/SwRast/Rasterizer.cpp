@@ -163,6 +163,7 @@ static uint32_t ReduceMax_U16x2(v_uint value, v_mask mask) {
 }
 
 void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, const ShaderDispatcher& dispatcher) {
+    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
     glm::vec2 guardBandPlaneDist = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
 
     _runner->Dispatch([&](uint32_t workerId) {
@@ -194,18 +195,26 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, const ShaderDis
 
                 if (cc.AcceptMask != 0) {
                     TrianglePacket tris;
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, glm::ivec2(fb.Width, fb.Height) / 2, mesh.CullMode);
+                    v_mask acceptMask = tris.Setup(v0, v1, v2, vpHalfSize, mesh.CullMode);
                     acceptMask &= cc.AcceptMask;
 
-                    tris.MeshletId = meshIdx;
-                    tris.BasePrimId = primOffset;
-                    memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                    memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                    memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
+                    if (acceptMask == 0) continue;
+
+                    v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                    v_uint extent = boundBox.y - boundBox.x;
+
+                    TriangleEdgeVars vars;
+                    vars.Setup(tris, vpHalfSize);
+
+                    vars.MeshletId = meshIdx;
+                    vars.BasePrimId = primOffset;
+                    memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                    memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                    memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
                     for (uint32_t i : BitIter(acceptMask)) {
-                        uint64_t boundRect = tris.MinPos[i] | uint64_t(tris.MaxPos[i] - tris.MinPos[i]) << 34;
-                        dispatcher.DrawFn(dispatcher.Shader, fb, tris, i, boundRect);
+                        uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 34;
+                        dispatcher.DrawFn(dispatcher.Shader, fb, vars, i, boundRect);
                     }
                     SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
                 }
@@ -230,10 +239,11 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, const ShaderD
     for (uint32_t i = 0; i < 64; i += _queue->NumWorkers) {
         workerBinElectMask |= 1ull << i;
     }
-
+    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
     glm::vec2 guardBandPlaneDist = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
-    std::atomic<uint32_t> doneMeshCount = 0;
+
     auto readyBarrier = Barrier(_queue->NumWorkers);
+    std::atomic<uint32_t> doneMeshCount = 0;
 
     // #define DBG(msg, ...) printf("[RasterJob %d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
     #define DBG(...)
@@ -295,7 +305,7 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, const ShaderD
                 if (cc.AcceptMask != 0) {
                     assert(nextPacketIdx < maxPacketIdx);
                     TrianglePacket& tris = _queue->Batch[nextPacketIdx];
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, glm::ivec2(fb.Width, fb.Height) / 2, mesh.CullMode);
+                    v_mask acceptMask = tris.Setup(v0, v1, v2, vpHalfSize, mesh.CullMode);
 
                     acceptMask &= cc.AcceptMask;
                     if (acceptMask == 0) continue;
@@ -306,7 +316,8 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, const ShaderD
                     memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
                     memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                    batchFull |= !DistributeToBins(workerId, nextPacketIdx, acceptMask, tris.MinPos, tris.MaxPos);
+                    v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                    batchFull |= !DistributeToBins(workerId, nextPacketIdx, acceptMask, boundBox.x, boundBox.y);
                     batchFull |= nextPacketIdx + 1 >= maxPacketIdx;
 
                     nextPacketIdx++;
@@ -403,6 +414,8 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, const ShaderDispatcher& dispatche
     uint32_t binX = binId - binY * _queue->BinsPerRow;
     binX *= BinSize, binY *= BinSize;
 
+    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
+
     // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
     volatile uint32_t binPosMin = binX | binY << 16;
     volatile uint32_t binPosMax = binPosMin + (BinSize * 0x0001'0001);
@@ -416,9 +429,14 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, const ShaderDispatcher& dispatche
             TrianglePacket& tris = _queue->CommitedBatch[bin.Ids[i] >> 16];
             v_mask acceptMask = bin.Ids[i];
 
-            v_uint bbMin = _mm512_max_epi16(tris.MinPos, _mm512_set1_epi32((int)binPosMin));
-            v_uint bbMax = _mm512_min_epi16(tris.MaxPos, _mm512_set1_epi32((int)binPosMax));
+            v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+            v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)binPosMin));
+            v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)binPosMax));
             v_uint bbExtent = ((bbMax - bbMin) >> 2) * 16;
+
+            TriangleEdgeVars edges;
+            memcpy(edges.VertexId, tris.VertexId, 64);
+            edges.Setup(tris, vpHalfSize);
 
             {
                 v_uint x0 = bbMin & 0xFFFF, y0 = bbMin >> 16;
@@ -429,7 +447,7 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, const ShaderDispatcher& dispatche
             for (uint32_t j : BitIter(acceptMask)) {
                 // clang sometimes emits full vector reload when indexing (only for local vars?)
                 uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
-                dispatcher.DrawFn(dispatcher.Shader, fb, tris, j, boundRect);
+                dispatcher.DrawFn(dispatcher.Shader, fb, edges, j, boundRect);
             }
             numTrianglesDrawn += simd::popcnt(acceptMask);
         }
@@ -677,19 +695,41 @@ void ClipNonTrivial(v_mask mask) {
 }
 #endif
 
-static v_int ComputeMinBB(v_int a, v_int b, v_int c, int32_t vpSize) {
-    v_int r = simd::min(simd::min(a, b), c);
-    r = (r + 7) >> 4;                                     // round to pixel center
-    r = r & ~3;                                           // align to tile boundary
-    r = simd::min(simd::max(r + vpSize, 0), vpSize * 2);  // translate to 0,0 origin and clamp to vp size
-    return r;
-}
-static v_int ComputeMaxBB(v_int a, v_int b, v_int c, int32_t vpSize) {
-    v_int r = simd::max(simd::max(a, b), c);
-    r = (r + 7) >> 4;                                     // round to pixel center
-    r = (r + 3) & ~3;                                     // align up to tile boundary
-    r = simd::min(simd::max(r + vpSize, 0), vpSize * 2);  // translate to 0,0 origin and clamp to vp size
-    return r;
+// https://fgiesen.wordpress.com/2013/02/08/triangle-rasterization-in-practice
+v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode) {
+    v0 = simd::PerspectiveDiv(v0);
+    v1 = simd::PerspectiveDiv(v1);
+    v2 = simd::PerspectiveDiv(v2);
+
+    glm::vec2 fixScale = vpHalfSize * 16;
+    v_int x0 = simd::round2i(v0.x * fixScale.x), y0 = simd::round2i(v0.y * fixScale.y);
+    v_int x1 = simd::round2i(v1.x * fixScale.x), y1 = simd::round2i(v1.y * fixScale.y);
+    v_int x2 = simd::round2i(v2.x * fixScale.x), y2 = simd::round2i(v2.y * fixScale.y);
+
+    v_int A01 = y1 - y0, B01 = x0 - x1;
+    v_int A20 = y0 - y2, B20 = x2 - x0;
+    v_int det = B20 * A01 - B01 * A20;
+
+    if (cullMode != FaceCullMode::FrontCCW) {
+        v_int flip = (cullMode == FaceCullMode::FrontCW) ? -1 : (det < 0);
+        det = flip ? -det : det;
+    }
+    // Cull backfacing triangles or with zero area
+    v_mask mask = simd::movemask(det > 0);
+    if (mask == 0) return 0;
+
+    Pos0 = (x0 & 0xFFFF) | (y0 << 16);
+    Pos1 = (x1 & 0xFFFF) | (y1 << 16);
+    Pos2 = (x2 & 0xFFFF) | (y2 << 16);
+
+    // Cull thin triangles covering no samples, or outside viewport (some of them will get here due to guard-band)
+    v_uint2 boundBox = GetRenderBoundingBox(vpHalfSize);
+    mask &= _mm512_cmpeq_epi32_mask(_mm512_movm_epi16(_mm512_cmpge_epi16_mask(boundBox.x, boundBox.y)), _mm512_set1_epi32(0));
+
+    Z0 = v0.z, Z1 = v1.z, Z2 = v2.z;
+    W0 = v0.w, W1 = v1.w, W2 = v2.w;
+
+    return mask;
 }
 
 static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
@@ -697,47 +737,23 @@ static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
     w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1;  // top-left rule bias
     return w >> 4;                               // normalize fixed point
 }
-
-// https://fgiesen.wordpress.com/2013/02/08/triangle-rasterization-in-practice
-[[clang::always_inline]]
-v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode) {
-    v0 = simd::PerspectiveDiv(v0);
-    v1 = simd::PerspectiveDiv(v1);
-    v2 = simd::PerspectiveDiv(v2);
-
-    glm::vec2 fixScale = vpHalfSize * 16;
-    v_int x0 = simd::round2i(v0.x * fixScale.x);
-    v_int x1 = simd::round2i(v1.x * fixScale.x);
-    v_int x2 = simd::round2i(v2.x * fixScale.x);
-    v_int y0 = simd::round2i(v0.y * fixScale.y);
-    v_int y1 = simd::round2i(v1.y * fixScale.y);
-    v_int y2 = simd::round2i(v2.y * fixScale.y);
+void TriangleEdgeVars::Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize) {
+    v_int x0 = tris.Pos0 << 16 >> 16, y0 = tris.Pos0 >> 16;
+    v_int x1 = tris.Pos1 << 16 >> 16, y1 = tris.Pos1 >> 16;
+    v_int x2 = tris.Pos2 << 16 >> 16, y2 = tris.Pos2 >> 16;
 
     A01 = y1 - y0, B01 = x0 - x1;
     A12 = y2 - y1, B12 = x1 - x2;
     A20 = y0 - y2, B20 = x2 - x0;
     v_int det = B20 * A01 - B01 * A20;
 
-    if (cullMode != FaceCullMode::FrontCCW) {
-        v_int flip = (cullMode == FaceCullMode::FrontCW) ? -1 : (det < 0);
+    if (simd::any(det < 0)) {
+        v_int flip = (det < 0);
         A01 = flip ? -A01 : A01, B01 = flip ? -B01 : B01;
         A12 = flip ? -A12 : A12, B12 = flip ? -B12 : B12;
         A20 = flip ? -A20 : A20, B20 = flip ? -B20 : B20;
         det = flip ? -det : det;
     }
-    // Cull backfacing triangles or with zero area
-    v_mask mask = simd::movemask(det > 0);
-    if (mask == 0) return 0;
-
-    v_int minX = ComputeMinBB(x0, x1, x2, vpHalfSize.x);
-    v_int minY = ComputeMinBB(y0, y1, y2, vpHalfSize.y);
-    v_int maxX = ComputeMaxBB(x0, x1, x2, vpHalfSize.x);
-    v_int maxY = ComputeMaxBB(y0, y1, y2, vpHalfSize.y);
-    MinPos = (v_uint)(minX | minY << 16);
-    MaxPos = (v_uint)(maxX | maxY << 16);
-
-    // Cull thin triangles covering no samples
-    mask &= simd::movemask((maxX > minX) && (maxY > minY));
 
     // Evaluate edge coeffs at screen origin (0.5, 0.5)
     v_int sampleX = (-vpHalfSize.x << 4) + 8, sampleY = (-vpHalfSize.y << 4) + 8;
@@ -746,50 +762,73 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 v
     Edge2 = ComputeEdge(A01, sampleX - x0, B01, sampleY - y0);
 
     v_float rcpArea = 16.0f / simd::conv2f(det);
-    Z0 = v0.z;
-    Z10 = (v1.z - v0.z) * rcpArea;
-    Z20 = (v2.z - v0.z) * rcpArea;
+    Z0 = tris.Z0;
+    Z10 = (tris.Z1 - tris.Z0) * rcpArea;
+    Z20 = (tris.Z2 - tris.Z0) * rcpArea;
 
-    W0 = v0.w;
-    W0S = v0.w * rcpArea;
-    W1S = v1.w * rcpArea;
-    W2S = v2.w * rcpArea;
-    
-    return mask;
+    W0 = tris.W0;
+    W0S = tris.W0 * rcpArea;
+    W1S = tris.W1 * rcpArea;
+    W2S = tris.W2 * rcpArea;
 }
+
+v_int2 TrianglePacket::GetBoundingBox() const {
+    v_int minPos = _mm512_min_epi16(_mm512_min_epi16(Pos0, Pos1), Pos2);
+    v_int maxPos = _mm512_max_epi16(_mm512_max_epi16(Pos0, Pos1), Pos2);
+
+    minPos = _mm512_srai_epi16(minPos + 0x0007'0007, 4);  // round to pixel center
+    maxPos = _mm512_srai_epi16(maxPos + 0x0007'0007, 4);
+
+    return { minPos, maxPos };
+}
+v_uint2 TrianglePacket::GetRenderBoundingBox(glm::ivec2 vpHalfSize) const {
+    v_int2 packed = GetBoundingBox();
+
+    v_int vpSize = vpHalfSize.x | (vpHalfSize.y << 16);
+    packed.x = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(packed.x, vpSize), v_int(0)), vpSize * 2);
+    packed.y = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(packed.y, vpSize), v_int(0)), vpSize * 2);
+
+    packed.x = (packed.x + 0x0000'0000) & ~0x0003'0003;  // align to tile boundary
+    packed.y = (packed.y + 0x0003'0003) & ~0x0003'0003;
+
+    return v_uint2((v_uint)packed.x, (v_uint)packed.y);
+}
+
 ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, glm::vec2 guardBandPlaneDist) {
     using v_byte = uint8_t [[clang::ext_vector_type(16)]];
     using v_bool = bool [[clang::ext_vector_type(16)]];
 
-    v_int outmask0 = simd::max_abs(simd::max_abs(v0.x, v0.y), v0.z) > v0.w;
-    v_int outmask1 = simd::max_abs(simd::max_abs(v1.x, v1.y), v1.z) > v1.w;
-    v_int outmask2 = simd::max_abs(simd::max_abs(v2.x, v2.y), v2.z) > v2.w;
-    v_mask partialOutMask = simd::movemask(outmask0 | outmask1 | outmask2);
-    v_mask combinedOutMask = simd::movemask(outmask0 & outmask1 & outmask2);
-
-    // Only a very small fraction of triangles intersect with the frustum planes (< 3%),
-    // so we can bail here most of the times.
-    if ((partialOutMask & ~combinedOutMask) == 0) [[likely]] {
-        return { .AcceptMask = (v_mask)~combinedOutMask };
-    }
+    v_byte partialOutcodes = 0;       // non-zero if at least one vertex is out
+    v_byte combinedOutcodes = 255;    // non-zero if all vertices are out
+    v_mask trivialMask = v_mask(~0);  // inside guard band
 
     float bx = guardBandPlaneDist.x, by = guardBandPlaneDist.y;
-    v_byte outcodes = 0;
 
-    outcodes |= v_bool(v0.x < -(v0.w * bx) || v1.x < -(v1.w * bx) || v2.x < -(v2.w * bx)) ? v_byte(1 << (int)ClipPlane::Left) : 0;
-    outcodes |= v_bool(v0.x > +(v0.w * bx) || v1.x > +(v1.w * bx) || v2.x > +(v2.w * bx)) ? v_byte(1 << (int)ClipPlane::Right) : 0;
-    outcodes |= v_bool(v0.y < -(v0.w * by) || v1.y < -(v1.w * by) || v2.y < -(v2.w * by)) ? v_byte(1 << (int)ClipPlane::Top) : 0;
-    outcodes |= v_bool(v0.y > +(v0.w * by) || v1.y > +(v1.w * by) || v2.y > +(v2.w * by)) ? v_byte(1 << (int)ClipPlane::Bottom) : 0;
-    outcodes |= v_bool(v0.z < -v0.w || v1.z < -v1.w || v2.z < -v2.w) ? v_byte(1 << (int)ClipPlane::Near) : 0;
-    outcodes |= v_bool(v0.z > +v0.w || v1.z > +v1.w || v2.z > +v2.w) ? v_byte(1 << (int)ClipPlane::Far) : 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 3; i++) {
+        v_float4 vi = i == 0 ? v0 : (i == 1 ? v1 : v2);
 
-    v_mask nonTrivialMask = _mm_cmpneq_epu8_mask(outcodes, _mm_setzero_si128());
+        v_byte outcode = 0;
+        outcode |= v_bool(vi.x < -vi.w) ? v_byte(1 << (int)ClipPlane::Left) : 0;
+        outcode |= v_bool(vi.x > +vi.w) ? v_byte(1 << (int)ClipPlane::Right) : 0;
+        outcode |= v_bool(vi.y < -vi.w) ? v_byte(1 << (int)ClipPlane::Top) : 0;
+        outcode |= v_bool(vi.y > +vi.w) ? v_byte(1 << (int)ClipPlane::Bottom) : 0;
+        outcode |= v_bool(vi.z < -vi.w) ? v_byte(1 << (int)ClipPlane::Near) : 0;
+        outcode |= v_bool(vi.z > +vi.w) ? v_byte(1 << (int)ClipPlane::Far) : 0;
+
+        partialOutcodes |= outcode;
+        combinedOutcodes &= outcode;
+
+        trivialMask &= simd::movemask(simd::abs(vi.x) < vi.w * bx && simd::abs(vi.y) < vi.w * by);
+    }
+    trivialMask &= _mm_testn_epi8_mask(partialOutcodes, _mm_set1_epi8((1 << (int)ClipPlane::Near) | (1 << (int)ClipPlane::Far)));
+    v_mask rejectMask = _mm_cmpneq_epi8_mask(combinedOutcodes, _mm_set1_epi8(0));
 
     ClipCodes codes = {
-        .AcceptMask = (v_mask)(~combinedOutMask & ~nonTrivialMask),
-        .NonTrivialMask = (v_mask)(~combinedOutMask & nonTrivialMask),
+        .AcceptMask = v_mask(trivialMask & ~rejectMask),
+        .NonTrivialMask = v_mask(~trivialMask & ~rejectMask),
     };
-    memcpy(codes.OutCodes, &outcodes, 16);
+    memcpy(codes.OutCodes, &partialOutcodes, 16);
     return codes;
 }
 

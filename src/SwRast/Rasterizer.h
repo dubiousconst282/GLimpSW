@@ -151,25 +151,6 @@ concept ShaderProgram =
     };
 
 struct TrianglePacket {
-    v_uint MinPos, MaxPos;
-    v_int Edge0, Edge1, Edge2;
-    v_int A01, A12, A20;
-    v_int B01, B12, B20;
-
-    v_float Z0, Z10, Z20;
-    v_float W0, W0S, W1S, W2S;
-
-    uint8_t VertexId[3][simd::vec_width];
-    uint8_t BasePrimId;
-    uint32_t MeshletId;
-
-    // Computes edge variables based on vertices in NDC space.
-    v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode);
-};
-
-// TODO: can we move edge setup later, during bin rasterizaion? how will it interact with clipping?
-#if 0
-struct TrianglePacket2 {
     v_int Pos0, Pos1, Pos2; // Fixed-point viewport coords (2 x s16)
 
     v_float Z0, Z1, Z2;
@@ -177,18 +158,29 @@ struct TrianglePacket2 {
 
     uint8_t VertexId[3][simd::vec_width];
     uint8_t BasePrimId;
-    FaceCullMode CullMode;
     uint32_t MeshletId;
+    const float* ClippedUV = nullptr;
+
+    v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode);
+
+    v_int2 GetBoundingBox() const;
+    v_uint2 GetRenderBoundingBox(glm::ivec2 vpHalfSize) const;
 };
 struct TriangleEdgeVars {
+    uint8_t VertexId[3][simd::vec_width];
+    uint8_t BasePrimId;
+    uint32_t MeshletId;
+    const float* ClippedUV = nullptr;
+
     v_int Edge0, Edge1, Edge2;  // Start edge distances
     v_int A01, A12, A20;        // Edge deltas on X axis
     v_int B01, B12, B20;        // Edge deltas on Y axis
 
     v_float Z0, Z10, Z20;       // Z0, ((Z1, Z2) - Z0) * rcpArea 
     v_float W0, W0S, W1S, W2S;  // W0, (W0, W1, W2) * rcpArea
+
+    void Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize);
 };
-#endif
 
 // Internal
 struct BinQueue;
@@ -209,7 +201,7 @@ struct Rasterizer {
             .MeshFn = [](const void* pShader, uint32_t idx, ShadedMeshlet& meshlet) {
                 ((const TShader*)pShader)->ShadeMeshlet(idx, meshlet);
             },
-            .DrawFn = [](const void* pShader,  Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint64_t boundRect) {
+            .DrawFn = [](const void* pShader,  Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
                 DrawTriangle(*(const TShader*)pShader, fb, tri, i, boundRect);
             },
         });
@@ -240,7 +232,7 @@ private:
         const void* Shader;
 
         void (*MeshFn)(const void* shader, uint32_t idx, ShadedMeshlet& meshlet);
-        void (*DrawFn)(const void* shader, Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint64_t boundRect);
+        void (*DrawFn)(const void* shader, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect);
     };
 
     void DrawMeshlets(Framebuffer& fb, uint32_t count, const ShaderDispatcher& shader);
@@ -252,7 +244,7 @@ private:
     void WorkerFn(uint32_t workerId);
 
     template<ShaderProgram TShader>
-    static void DrawTriangle(const TShader& shader, Framebuffer& fb, const TrianglePacket& tri, uint32_t i, uint64_t boundRect) {
+    static void DrawTriangle(const TShader& shader, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
         [[assume(i < simd::vec_width)]];  // avoids masking on vector indexing
 
         uint16_t minX = boundRect >> 0, minY = boundRect >> 16;
@@ -294,7 +286,7 @@ private:
                 if (tileMask != 0) [[unlikely]] {
                     v_float u = simd::conv2f(edgeX1);
                     v_float v = simd::conv2f(edgeX2);
-                    vars.Depth = simd::fma(tri.Z10[i], u, simd::fma(tri.Z20[i], v, tri.Z0[i]));
+                    vars.Depth = simd::fma(u, tri.Z10[i], simd::fma(v, tri.Z20[i], tri.Z0[i]));
                     vars.TileOffset = offset;
                     vars.TileMask = tileMask;
 
