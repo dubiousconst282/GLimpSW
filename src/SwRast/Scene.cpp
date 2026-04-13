@@ -111,7 +111,7 @@ static uint32_t PackRGB10(const glm::vec3& value) {
     gi = glm::min(glm::max(gi, 0), 1023);
     bi = glm::min(glm::max(bi, 0), 1023);
 
-    return (uint32_t)(ri << 22 | gi << 12 | bi << 2);
+    return (uint32_t)(ri << 0 | gi << 10 | bi << 20);
 }
 Model::Model(const std::string& path) {
     cgltf_options gltfOptions = {};
@@ -212,10 +212,10 @@ Model::Model(const std::string& path) {
                     if (normalAcc && tangentAcc) {
                         glm::vec3 normal;
                         glm::vec4 tangent;
-                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &normal.x, 3);
-                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &tangent.x, 4);
+                        cgltf_accessor_read_float(normalAcc, vertIdx, &normal.x, 3);
+                        cgltf_accessor_read_float(tangentAcc, vertIdx, &tangent.x, 4);
                         om.Normals[i] = PackRGB10(normal * 0.5f + 0.5f);
-                        om.Tangents[i] = PackRGB10(tangent * 0.5f + 0.5f) | (tangent.w < 0 ? 1 : 0);
+                        om.Tangents[i] = PackRGB10(tangent * 0.5f + 0.5f) | (tangent.w < 0 ? (1u << 31) : 0);
                     }
                 }
                 for (uint32_t i = 0; i < m.triangle_count; i++) {

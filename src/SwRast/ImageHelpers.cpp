@@ -70,36 +70,34 @@ HdrTexture2D::Ptr LoadImageHDR(const char* path, uint32_t mipLevels) {
 
     return tex;
 }
-HdrTexture2D::Ptr LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels) {
+HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels) {
     auto panoTex = LoadImageHDR(path, 1);
 
-    uint32_t faceSize = panoTex->Width / 4;
-    auto cubeTex = CreateTexture<HdrTexture2D>(faceSize, faceSize, mipLevels, 6);
+    uint32_t faceSize = panoTex->Width;
+    auto cubeTex = CreateTexture<HdrTexture2D>(faceSize, faceSize, mipLevels);
 
     constexpr SamplerDesc PanoSampler = {
         .Wrap = WrapMode::Repeat,
         .MagFilter = FilterMode::Linear,
         .MinFilter = FilterMode::Linear,
-        .EnableMips = false,
+        .CalcMipFromDerivs = false,
     };
 
-    for (uint32_t layer = 0; layer < 6; layer++) {
-        for (uint32_t y = 0; y < faceSize; y += 4) {
-            for (uint32_t x = 0; x < faceSize; x += 4) {
-                float scaleUV = 1.0f / (faceSize - 1);
-                v_float u = simd::conv<float>((int32_t)x + swr::TilePixelOffsetsX) * scaleUV;
-                v_float v = simd::conv<float>((int32_t)y + swr::TilePixelOffsetsY) * scaleUV;
+    float scaleUV = 1.0f / (faceSize - 1);
+    float centerUV = 0.5f * scaleUV;
+    for (uint32_t y = 0; y < faceSize; y += 4) {
+        for (uint32_t x = 0; x < faceSize; x += 4) {
+            v_float u = simd::conv<float>((int32_t)x + swr::TilePixelOffsetsX) * scaleUV + centerUV;
+            v_float v = simd::conv<float>((int32_t)y + swr::TilePixelOffsetsY) * scaleUV + centerUV;
+            v_float3 dir = UnmapOctahedron({ u, v });
 
-                v_float3 dir = UnprojectCubemap(u, v, (int32_t)layer);
-
-                for (uint32_t i = 0; i < simd::vec_width; i++) {
-                    u[i] = std::atan2f(dir.z[i], dir.x[i]) / simd::tau + 0.5f;
-                    v[i] = std::asinf(-dir.y[i]) / simd::pi + 0.5f;
-                }
-
-                v_float3 tile = panoTex->Sample<PanoSampler>(u, v);
-                cubeTex->WriteTile(tile, x, y, layer);
+            for (uint32_t i = 0; i < simd::vec_width; i++) {
+                u[i] = atan2f(dir.z[i], dir.x[i]) / simd::tau + 0.5f;
+                v[i] = asinf(-dir.y[i]) / simd::pi + 0.5f;
             }
+
+            v_float3 tile = panoTex->Sample<PanoSampler>(u, v);
+            cubeTex->WriteTile(tile, x, y);
         }
     }
 

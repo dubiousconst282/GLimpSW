@@ -25,6 +25,7 @@ add_executable(BenchmarkApp
     Benchmarks/RasterBench.cpp
     # Benchmarks/TexGather64.cpp
     # Benchmarks/GatherSmall.cpp
+    # Benchmarks/TexSwizzle.cpp
 
     Scene.cpp
     Rasterizer.cpp

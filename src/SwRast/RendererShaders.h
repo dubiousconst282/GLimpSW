@@ -378,31 +378,27 @@ private:
 #endif
 
     static swr::HdrTexture2D::Ptr GenerateIrradianceMap(const swr::HdrTexture2D& envTex) {
-        auto tex = swr::CreateTexture<swr::HdrTexture2D>(32, 32, 1, 6);
+        auto tex = swr::CreateTexture<swr::HdrTexture2D>(64, 64, 1, 1);
 
-        for (uint32_t layer = 0; layer < 6; layer++) {
-            swr::texutil::IterateTiles(tex->Width, tex->Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
-                v_float3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
-                v_float3 color = PrefilterDiffuseIrradiance(envTex, dir);
-                tex->WriteTile(color, x, y, layer);
-            });
-        }
+        swr::texutil::IterateTiles(tex->Width, tex->Height, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
+            v_float3 dir = swr::texutil::UnmapOctahedron({ u, v });
+            v_float3 color = PrefilterDiffuseIrradiance(envTex, dir);
+            tex->WriteTile(color, x, y);
+        });
         return tex;
     }
     static swr::HdrTexture2D::Ptr GenerateRadianceMap(const swr::HdrTexture2D& envTex) {
-        auto tex = swr::CreateTexture<swr::HdrTexture2D>(128, 128, 8, 6);
+        auto tex = swr::CreateTexture<swr::HdrTexture2D>(256, 256, 8);
 
-        for (uint32_t layer = 0; layer < 6; layer++) {
-            for (uint32_t level = 0; level < tex->MipLevels; level++) {
-                uint32_t w = tex->Width >> level;
-                uint32_t h = tex->Height >> level;
+        for (uint32_t level = 0; level < tex->MipLevels; level++) {
+            uint32_t w = tex->Width >> level;
+            uint32_t h = tex->Height >> level;
 
-                swr::texutil::IterateTiles(w, h, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
-                    v_float3 dir = swr::texutil::UnprojectCubemap(u, v, (int32_t)layer);
-                    v_float3 color = PrefilterEnvMap(envTex, level / (tex->MipLevels - 1.0f), dir);
-                    tex->WriteTile(color, x, y, layer, level);
-                });
-            }
+            swr::texutil::IterateTiles(w, h, [&](uint32_t x, uint32_t y, v_float u, v_float v) {
+                v_float3 dir = swr::texutil::UnmapOctahedron({ u, v });
+                v_float3 color = PrefilterEnvMap(envTex, level / (tex->MipLevels - 1.0f), dir);
+                tex->WriteTile(color, x, y, 0, level);
+            });
         }
         return tex;
     }
@@ -439,7 +435,7 @@ private:
                 // Spherical to World Space in two steps...
                 v_float3 tempVec = cosf(phi) * right + sinf(phi) * up;
                 v_float3 sampleVector = cosf(theta) * N + sinf(theta) * tempVec;
-                v_float3 envColor = envTex.SampleCube<EnvSampler>(sampleVector, 2);
+                v_float3 envColor = envTex.SampleOct<EnvSampler>(sampleVector, 2);
 
                 color = color + TonemapSample(envColor) * cosf(theta) * sinf(theta);
                 sampleCount++;
@@ -485,7 +481,7 @@ private:
                 // Mip level is determined by the ratio of our sample's solid angle to a texel's solid angle
                 v_float mipLevel = max(0.5f * approx_log2(omegaS / omegaP), 0.0f);
 
-                v_float3 envColor = envTex.SampleCube<EnvSampler>(L, mipLevel);
+                v_float3 envColor = envTex.SampleOct<EnvSampler>(L, mipLevel);
 
                 prefilteredColor = prefilteredColor + TonemapSample(envColor) * NoL;
                 totalWeight += NoL;

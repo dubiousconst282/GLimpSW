@@ -44,7 +44,7 @@ struct VisShader {
             .Wrap = swr::WrapMode::Repeat,
             .MagFilter = swr::FilterMode::Linear,
             .MinFilter = swr::FilterMode::Linear,
-            .EnableMips = true,
+            .CalcMipFromDerivs = true,
         };
         auto tex = Materials[mesh.MaterialId].Texture;
         v_uint color = tex->Sample<sampler>(uv.x, uv.y);
@@ -62,7 +62,7 @@ struct VisShader {
 
 // [model path] [(camera) <x> <y> <z> <yaw> <pitch>]
 int main(int argc, const char** args) {
-    auto scene = std::make_unique<scene::Model>(argc > 2 ? args[0] : "assets/models/Sponza/Sponza.gltf");
+    auto scene = std::make_unique<scene::Model>(argc > 2 ? args[1] : "assets/models/Sponza/Sponza.gltf");
     auto camera = Camera{ .Position = { -0.46608772755098471, 8.4925445559659511, -1.7022251220187172 }, .Euler = { -3.13643026, -1.4724431 } };
 
     if (argc >= 6) {

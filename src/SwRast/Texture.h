@@ -59,9 +59,9 @@ struct RGB10u {
     static v_float3 Unpack(v_uint packed) {
         const float scale = 1.0f / 1023;
         return {
-            simd::conv<float>(packed >> 22 & 1023) * scale,
-            simd::conv<float>(packed >> 12 & 1023) * scale,
-            simd::conv<float>(packed >> 2 & 1023) * scale,
+            simd::conv<float>(packed >> 0 & 1023) * scale,
+            simd::conv<float>(packed >> 10 & 1023) * scale,
+            simd::conv<float>(packed >> 20 & 1023) * scale,
         };
     }
     static v_uint Pack(const v_float3& value) {
@@ -73,7 +73,7 @@ struct RGB10u {
         gi = simd::min(simd::max(gi, 0), 1023);
         bi = simd::min(simd::max(bi, 0), 1023);
 
-        return v_uint(ri << 22 | gi << 12 | bi << 2);
+        return v_uint(ri << 0 | gi << 10 | bi << 20);
     }
 };
 
@@ -174,7 +174,12 @@ private:
 
 };  // namespace pixfmt
 
-template<pixfmt::Texel Texel>
+enum class TextureLayout {
+    Linear,   // Row-major
+    TiledY8,  // 8x8 tiling (optimal for texture sampling)
+};
+
+template<pixfmt::Texel Texel, TextureLayout Layout = TextureLayout::TiledY8>
 struct Texture2D;
 
 template<pixfmt::Texel T>
@@ -204,7 +209,7 @@ TexturePtr2D<pixfmt::RGBA8u> LoadImage(const char* path, uint32_t mipLevels = 8)
 TexturePtr2D<pixfmt::R11G11B10f> LoadImageHDR(const char* path, uint32_t mipLevels = 8);
 
 // Loads a equirectangular panorama into a cubemap.
-TexturePtr2D<pixfmt::R11G11B10f> LoadCubemapFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
+TexturePtr2D<pixfmt::R11G11B10f> LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
 
 // Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
 inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
@@ -219,7 +224,7 @@ inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
     }
 }
 
-// Calculate coarse partial derivatives for a 4x4 fragment.
+// Calculate partial derivatives for a 4x4 fragment via finite difference.
 // https://gamedev.stackexchange.com/a/130933
 inline v_float dFdx(v_float p) {
     auto a = _mm512_shuffle_ps(p, p, 0b10'10'00'00);  //[0 0 2 2]
@@ -227,107 +232,40 @@ inline v_float dFdx(v_float p) {
     return _mm512_sub_ps(b, a);
 }
 inline v_float dFdy(v_float p) {
-    // auto a = _mm256_permute2x128_si256(p, p, 0b00'00'00'00);  // dupe lower 128 lanes
-    // auto b = _mm256_permute2x128_si256(p, p, 0b01'01'01'01);  // dupe upper 128 lanes
     auto a = _mm512_shuffle_f32x4(p, p, 0b10'10'00'00);
     auto b = _mm512_shuffle_f32x4(p, p, 0b11'11'01'01);
     return _mm512_sub_ps(b, a);
 }
-// Calculates mip-level for a 4x4 fragment using the partial derivatives of the given scaled UVs.
-inline v_int CalcMipLevel(v_float scaledU, v_float scaledV) {
-    v_float dxu = dFdx(scaledU), dyu = dFdy(scaledU);
-    v_float dxv = dFdx(scaledV), dyv = dFdy(scaledV);
-
-    v_float maxDeltaSq = simd::max(simd::fma(dxu, dxu, dxv * dxv), simd::fma(dyu, dyu, dyv * dyv));
+// Calculates mip-level using derivatives from scaled sample UVs (dxu, dxv, dyu, dyv).
+inline v_int CalcMipLevel(v_float4 grad) {
+    v_float maxDeltaSq = simd::max(simd::fma(grad.x, grad.x, grad.y * grad.y), simd::fma(grad.z, grad.z, grad.w * grad.w));
     return simd::ilog2(maxDeltaSq) >> 1;
     // return simd::approx_log2(maxDeltaSq) * 0.5f;
 }
 
-// Projects the given direction vector (may be unnormalized) to cubemap face UV and layer.
-// This produces slightly different results from other graphics APIs, UVs are not flipped depending on faces.
-inline void ProjectCubemap(v_float3 dir, v_float& u, v_float& v, v_int& faceIdx) {
-    // https://gamedev.stackexchange.com/a/183463
-    // https://en.wikipedia.org/wiki/Cube_mapping#Memory_addressing
-    // Find axis with max magnitude
-    v_float w = dir.x;
-
-    v_int wy = simd::abs(dir.y) > simd::abs(w);
-    w = wy ? dir.y : w;
-
-    v_int wz = simd::abs(dir.z) > simd::abs(w);
-    w = wz ? dir.z : w;
-
-    v_int wx = wy | wz;  // negated
-    wy &= ~wz;
-
-    faceIdx = wz ? 4 : (wy ? 2 : 0);
-    // faceIdx += w < 0 ? 1 : 0
-    faceIdx += (simd::as<uint32_t>(w) >> 31);
-
-    // uv = { x: zy,  y: xz,  z: xy }[w]
-    w = simd::approx_rcp(simd::abs(w)) * 0.5f;
-    u = (wx ? dir.x : dir.z) * w + 0.5f;
-    v = (wy ? dir.z : dir.y) * w + 0.5f;
+inline v_float2 MapOctahedron(v_float3 norm) {
+    v_float w = simd::approx_rcp(simd::abs(norm.x) + simd::abs(norm.y) + simd::abs(norm.z));
+    v_float t = simd::max(-norm.z * w, 0.0);
+    v_float u = simd::fma(norm.x, w, simd::mulsign(t, norm.x));
+    v_float v = simd::fma(norm.y, w, simd::mulsign(t, norm.y));
+    return v_float2(u, v) * 0.5f + 0.5f;
 }
-
-// Unprojects the given cubemap face index and UVs to a normalized direction vector.
-inline v_float3 UnprojectCubemap(v_float u, v_float v, v_int faceIdx) {
-    v_float w = simd::as<float>(v_uint(faceIdx << 31) | 0x3F800000);  //(faceIdx & 1) ? -1.0 : +1.0
-    v_int axis = faceIdx >> 1;
-
-    u = u * 2.0f - 1.0f;
-    v = v * 2.0f - 1.0f;
-
-    // 0:  1,  v,  u
-    // 1: -1,  v,  u
-    // 2:  u,  1,  v
-    // 3:  u, -1,  v
-    // 4:  u,  v,  1
-    // 5:  u,  v, -1
-    v_float3 unnormDir = {
-        axis == 0 ? w : u,
-        axis == 1 ? w : v,
-        axis == 2 ? w : (axis == 0 ? u : v),
-    };
-    return unnormDir * simd::approx_rsqrt(u * u + v * v + 1.0f);
+inline v_float3 UnmapOctahedron(v_float2 uv) {
+    uv = uv * 2.0f - 1.0f;
+    v_float3 norm = v_float3(uv, 1.0 - simd::abs(uv.x) - simd::abs(uv.y));
+    v_float t = simd::max(-norm.z, 0.0);
+    norm.x -= simd::mulsign(t, norm.x);
+    norm.y -= simd::mulsign(t, norm.y);
+    return normalize(norm);
 }
-
-// Lookups the adjacent cube face and UVs to the nearest edge.
-inline void GetAdjacentCubeFace(v_int& faceIdx, v_int& u, v_int& v, v_int scaleU, v_int scaleV) {
-    static const uint8_t AdjFaceLUT[4][8] = {
-        { 0x1b, 0x0b, 0x25, 0x05, 0x23, 0x03 },  //
-        { 0x0a, 0x1a, 0x04, 0x24, 0x02, 0x22 },  //
-        { 0x15, 0x05, 0x29, 0x09, 0x11, 0x01 },  //
-        { 0x04, 0x14, 0x08, 0x28, 0x00, 0x10 },  //
-    };
-    // int q = abs(u - 0.5) > abs(v - 0.5) ? ((u > 0.5) ? 3 : 2) : ((v > 0.5) ? 1 : 0);
-    // uint8_t data = AdjFace[q][face];
-    // face = data & 7;
-    // if (data & (1 << 3)) std::swap(u, v);
-    // if (data & (1 << 4)) u = 1 - u;
-    // if (data & (1 << 5)) v = 1 - v;
-
-    v_int cu = (scaleU >> 1) - u, cv = (scaleV >> 1) - v;
-    v_uint quadIdx = simd::abs(cu) > simd::abs(cv) ? (v_uint(cu) >> 31) + 2 : (v_uint(cv) >> 31);
-    v_uint tableIdx = quadIdx * 8 + faceIdx;
-
-    v_int data = _mm512_permutexvar_epi8(tableIdx, _mm512_broadcast_i32x8(_mm256_loadu_epi8(AdjFaceLUT)));
-
-    faceIdx = data & 7;
-
-    v_int swap = (data >> 3 & 1) != 0;
-    v_int invU = (data >> 4 & 1) != 0;
-    v_int invV = (data >> 5 & 1) != 0;
-
-    v_int su = swap ? v : u;
-    v_int sv = swap ? u : v;
-    u = invU ? scaleU - su : su;
-    v = invV ? scaleV - sv : sv;
+inline v_float2 FixupOctahedronWrap(v_float2 uv) {
+    // TODO https://gpuopen.com/learn/fetching-from-cubes-and-octahedrons/
+    return uv;
 }
 
 };  // namespace texutil
 
-enum class WrapMode { Repeat, ClampToEdge };
+enum class WrapMode { Repeat, ClampToEdge, MirroredRepeat };
 enum class FilterMode { Nearest, Linear };
 
 // Texture sampler parameters
@@ -335,13 +273,14 @@ struct SamplerDesc {
     WrapMode Wrap = WrapMode::Repeat;
     FilterMode MagFilter = FilterMode::Linear;
     FilterMode MinFilter = FilterMode::Nearest;
-    bool EnableMips = true;
+    bool CalcMipFromDerivs = false;
 };
 
-template<pixfmt::Texel Texel_>
+template<pixfmt::Texel Texel_, TextureLayout Layout_>
 struct Texture2D {
     using Ptr = TexturePtr2D<Texel_>;
     using Texel = Texel_;
+    static constexpr TextureLayout Layout = Layout_;
 
     static constexpr int LerpFracBits = 8;  // Number of fractional bits in pixel coords for bilinear interpolation
     static constexpr int LerpFracMask = (1 << LerpFracBits) - 1;
@@ -352,36 +291,54 @@ struct Texture2D {
     float ScaleU, ScaleV, ScaleLerpU, ScaleLerpV;
     int32_t MaskU, MaskV, MaskLerpU, MaskLerpV;
     alignas(64) uint32_t MipOffsets[16];
-
-    // Indexing: (layer * LayerStride) + MipOffsets[mipLevel] + (ix >> mipLevel) + ((iy >> mipLevel) << (RowShift - mipLevel))
     alignas(64) uint32_t Data[];
 
     Texture2D() = delete;
     Texture2D(const Texture2D&) = delete;
     Texture2D& operator=(const Texture2D&) = delete;
 
-    // Writes raw packed pixels (with matching formats) to the texture buffer.
-    void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0) {
+    // Writes pixel data (with matching formats) to the texture.
+    void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) {
         assert(layer < NumLayers);
 
-        for (uint32_t y = 0; y < Height; y++) {
-            memcpy(&Data[(layer * LayerStride) + (y << RowShift)], (uint32_t*)pixels + y * stride, Width * 4);
+        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        const uint32_t* src = (const uint32_t*)pixels;
+
+        if constexpr (Layout_ == TextureLayout::Linear) {
+            for (uint32_t y = 0; y < Height; y++) {
+                memcpy(&dst[y << RowShift], &src[y * stride], Width * 4);
+            }
+        } else {
+            // TODO: optimize
+            for (uint32_t y = 0; y < Height; y++) {
+                for (uint32_t x = 0; x < Width; x++) {
+                    dst[GetTexelOffset(x, y, RowShift)] = src[x + y * stride];
+                }
+            }
         }
     }
 
-    // Writes a 4x4 tile of texels to the texture buffer. Coords are in pixel space.
+    // Writes a tile of texels to the texture buffer.
     void WriteTile(v_uint value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
         assert(x + 3 < Width && y + 3 < Height);
         assert(x % 4 == 0 && y % 4 == 0);
         assert(layer < NumLayers && mipLevel < MipLevels);
-        
-        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
-        uint32_t stride = RowShift - mipLevel;
 
-        _mm_storeu_epi32(&dst[x + ((y + 0) << stride)], _mm512_extracti32x4_epi32(value, 0));
-        _mm_storeu_epi32(&dst[x + ((y + 1) << stride)], _mm512_extracti32x4_epi32(value, 1));
-        _mm_storeu_epi32(&dst[x + ((y + 2) << stride)], _mm512_extracti32x4_epi32(value, 2));
-        _mm_storeu_epi32(&dst[x + ((y + 3) << stride)], _mm512_extracti32x4_epi32(value, 3));
+        uint32_t stride = RowShift - mipLevel;
+        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel] + GetTexelOffset(x, y, stride)];
+
+        if constexpr (Layout_ == TextureLayout::Linear) {
+            _mm_storeu_epi32(&dst[0 << stride], _mm512_extracti32x4_epi32(value, 0));
+            _mm_storeu_epi32(&dst[1 << stride], _mm512_extracti32x4_epi32(value, 1));
+            _mm_storeu_epi32(&dst[2 << stride], _mm512_extracti32x4_epi32(value, 2));
+            _mm_storeu_epi32(&dst[3 << stride], _mm512_extracti32x4_epi32(value, 3));
+        } else if constexpr (Layout_ == TextureLayout::TiledY8) {
+            value = _mm512_permutexvar_epi32(v_uint{ 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 }, value);
+            _mm_storeu_epi32(&dst[0], _mm512_extracti32x4_epi32(value, 0));
+            _mm_storeu_epi32(&dst[8], _mm512_extracti32x4_epi32(value, 1));
+            _mm_storeu_epi32(&dst[16], _mm512_extracti32x4_epi32(value, 2));
+            _mm_storeu_epi32(&dst[24], _mm512_extracti32x4_epi32(value, 3));
+        }
     }
     void WriteTile(const Texel::UnpackedTy& value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
         WriteTile(Texel::Pack(value), x, y, layer, mipLevel);
@@ -395,48 +352,64 @@ struct Texture2D {
         }
     }
 
-    // We're forcing always_inline everywhere because it helps avoid register spills across call boundaries.
+    // Fetch raw texels from storage. All coordinates must be in-bounds.
+    [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int x, v_int y, v_int layer = 0, v_int mipLevel = 0) const {
+        v_int stride = (int32_t)RowShift;
+        v_int offset = layer * (int)LayerStride;
 
-    template<SamplerDesc SD, bool CalcMipFromUVDerivs_ = true, bool IsCubeSample_ = false>
+        if (simd::any(mipLevel > 0)) {
+            x >>= mipLevel, y >>= mipLevel;
+            stride -= mipLevel;
+            offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
+        }
+        return simd::gather(Data, offset + GetTexelOffset(x, y, stride));
+    }
+
+    template<SamplerDesc SD>
     [[gnu::pure, gnu::always_inline]] Texel::LerpedTy Sample(v_float u, v_float v, v_int layer = 0, v_int mipLevel = 0) const {
         // Scale and round UVs 
         v_float su = u * ScaleLerpU, sv = v * ScaleLerpV;
         v_int ix = simd::round2i(su), iy = simd::round2i(sv);
 
         // Wrap
-        if constexpr (SD.Wrap == WrapMode::ClampToEdge || IsCubeSample_) {
+        if constexpr (SD.Wrap == WrapMode::ClampToEdge) {
             ix = simd::min(simd::max(ix, 0), MaskLerpU);
             iy = simd::min(simd::max(iy, 0), MaskLerpV);
-        } else {
-            static_assert(SD.Wrap == WrapMode::Repeat);
+        } else if constexpr (SD.Wrap == WrapMode::Repeat) {
             ix &= MaskLerpU;
             iy &= MaskLerpV;
+        } else if constexpr (SD.Wrap == WrapMode::MirroredRepeat) {
+            ix = (ix & MaskLerpU) ^ ((ix & (MaskLerpU + 1)) != 0 ? MaskLerpU : 0);
+            iy = (iy & MaskLerpV) ^ ((iy & (MaskLerpV + 1)) != 0 ? MaskLerpV : 0);
+        } else {
+            static_assert(!"Bad wrap mode");
         }
 
         // Select mip and filter mode
-        if constexpr (CalcMipFromUVDerivs_) {
-            mipLevel = texutil::CalcMipLevel(su, sv) - LerpFracBits;
-        }
+        FilterMode filter = SD.MagFilter;
 
-        FilterMode filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
-        mipLevel = SD.EnableMips ? simd::min(simd::max(mipLevel, 0), (int32_t)MipLevels - 1) : 0;
-        
+        if constexpr (SD.CalcMipFromDerivs) {
+            v_float4 grad = { texutil::dFdx(su), texutil::dFdx(sv), texutil::dFdy(su), texutil::dFdy(sv) };
+            mipLevel = texutil::CalcMipLevel(grad) - LerpFracBits;
+            filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
+        }
+        int maxLevel = (int)MipLevels - 1;
+        [[assume(maxLevel > 0)]];
+        mipLevel = simd::clamp(mipLevel, 0, maxLevel);
+
         // Calculate offsets and mip position
-        v_int stride = (int32_t)RowShift;
         v_int offset = layer * (int)LayerStride;
+        v_int stride = (int)RowShift;
 
         if (simd::any(mipLevel > 0)) {
-            ix >>= mipLevel;
-            iy >>= mipLevel;
+            ix >>= mipLevel, iy >>= mipLevel;
             stride -= mipLevel;
             offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
         }
 
         // Sample
         if (filter == FilterMode::Nearest) [[likely]] {
-            ix >>= LerpFracBits;
-            iy >>= LerpFracBits;
-            v_uint res = simd::gather(Data, offset + ix + (iy << stride));
+            v_uint res = simd::gather(Data, offset + GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, stride));
 
             if constexpr (std::is_same<typename Texel::LerpedTy, v_uint>()) {
                 return res;
@@ -444,38 +417,48 @@ struct Texture2D {
                 return Texel::Unpack(res);
             }
         }
-        if constexpr (IsCubeSample_) {
-            //    x < 1 || x >= N
-            // =  (x-1) >= (N-1)     given twos-complement + unsigned cmp
-            v_int edgeU = v_uint((ix >> LerpFracBits) - 1) >= v_uint((MaskU >> mipLevel) - 1);
-            v_int edgeV = v_uint((iy >> LerpFracBits) - 1) >= v_uint((MaskV >> mipLevel) - 1);
-
-            if (simd::any(edgeU | edgeV)) [[unlikely]] {
-                return SampleLinearNearCubeEdge(ix, iy, offset, stride, mipLevel, layer);
-            }
-        }
         return SampleLinear(ix, iy, offset, stride, mipLevel);
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleCube(const v_float3& dir, v_float mipLevel = -1.0f) const {
-        v_float u, v;
-        v_int faceIdx;
-        texutil::ProjectCubemap(dir, u, v, faceIdx);
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOct(const v_float3& dir, v_float mipLevel = -1.0f) const {
+        v_float2 uv = texutil::MapOctahedron(dir);
 
         int tmp = mipLevel[0];  // __builtin_constant_p() only works with variables - https://github.com/llvm/llvm-project/issues/65741
         if (__builtin_constant_p(tmp) && tmp < 0) {
-            return Sample<SD, true, true>(u, v, faceIdx);
+            return Sample<SD>(uv.x, uv.y);
         }
+        constexpr SamplerDesc SDNoMip = { WrapMode::MirroredRepeat, SD.MagFilter, SD.MinFilter, false };
         v_int baseMip = simd::conv<int>(mipLevel);
-        auto baseSample = Sample<SD, false, true>(u, v, faceIdx, baseMip);
+        auto baseSample = Sample<SDNoMip>(uv.x, uv.y, 0, baseMip);
 
         v_float mipFrac = mipLevel - simd::conv<float>(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
-            auto lowerSample = Sample<SD, false, true>(u, v, faceIdx, baseMip + 1);
+            auto lowerSample = Sample<SDNoMip>(uv.x, uv.y, 0, baseMip + 1);
             return baseSample + (lowerSample - baseSample) * mipFrac;
         }
         return baseSample;
+    }
+
+    static constexpr v_int GetTexelOffset(v_int x, v_int y, v_int stride) {
+        if constexpr (Layout_ == TextureLayout::Linear) {
+            return x + (y << stride);
+        }
+        if constexpr (Layout_ == TextureLayout::TiledY8) {
+            // ternlog prevents clang from duplicating mem load for const(7)
+            v_int t1 = _mm512_ternarylogic_epi32(y, y, v_int(7), _MM_TERNLOG_A & ~_MM_TERNLOG_C);
+            return (y & 7) | (x << 3) | (t1 << stride);
+        }
+        return 0;
+    }
+    static constexpr uint32_t GetTexelOffset(uint32_t x, uint32_t y, uint32_t stride) {
+        if constexpr (Layout_ == TextureLayout::Linear) {
+            return x + (y << stride);
+        }
+        if constexpr (Layout_ == TextureLayout::TiledY8) {
+            return (y & 7) | (x << 3) | ((y & ~7u) << stride);
+        }
+        return 0;
     }
 
 private:
@@ -488,26 +471,36 @@ private:
         v_int ix = ixf >> LerpFracBits;
         v_int iy = iyf >> LerpFracBits;
 
-        v_int indices00 = offset + ix + (iy << stride);
-        v_int indices01 = indices00 + (((iy + 1) << mipLevel) < (int32_t)Height ? 1 << stride : 0);
         v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)Width;
+        v_int inboundY = ((iy + 1) << mipLevel) < (int32_t)Height;
 
-#if 0
-        v_uint data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
-        v_uint data10 = _mm512_i32gather_epi32(indices00, Data + 1, 4);
-        v_uint data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
-        v_uint data11 = _mm512_i32gather_epi32(indices01, Data + 1, 4);
-#else
-        v_uint row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
-        v_uint row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
-        v_uint row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
-        v_uint row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
+        v_uint data00, data10, data01, data11;
 
-        v_uint data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 0, row0_hi);
-        v_uint data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 1, row0_hi);
-        v_uint data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 0, row1_hi);
-        v_uint data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 1, row1_hi);
-#endif
+        if constexpr (Layout_ == TextureLayout::Linear) {
+            v_int indices00 = offset + ix + (iy << stride);
+            v_int indices01 = indices00 + (inboundY ? (1 << stride) : 0);
+            v_uint row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
+            v_uint row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
+            v_uint row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
+            v_uint row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
+
+            data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 0, row0_hi);
+            data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 1, row0_hi);
+            data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 0, row1_hi);
+            data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 1, row1_hi);
+        } else if constexpr (Layout_ == TextureLayout::TiledY8) {
+            v_int indices00 = offset + GetTexelOffset(ix, iy, stride);
+            data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
+            data10 = _mm512_i32gather_epi32(indices00, Data + 8, 4);
+            v_int indices01 = offset + GetTexelOffset(ix, iy + (inboundY ? 1 : 0), stride);
+            data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
+            data11 = _mm512_i32gather_epi32(indices01, Data + 8, 4);
+        } else {
+            data00 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 0, iy + 0, stride), Data, 4);
+            data10 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 1, iy + 0, stride), Data, 4);
+            data01 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 0, iy + 1, stride), Data, 4);
+            data11 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 1, iy + 1, stride), Data, 4);
+        }
 
         if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {
             // 15-bit fraction for mulhrs
@@ -547,67 +540,20 @@ private:
         }
     }
 
-    // Interpolates texels overlapping the specified pixel coords near cubemap face edge (in N.LerpFracBits fixed-point). No bounds check.
-    [[gnu::pure, gnu::noinline]] Texel::LerpedTy SampleLinearNearCubeEdge(v_int ixf, v_int iyf, v_int offset, v_int stride, v_int mipLevel, v_int faceIdx) const {
-        using R = Texel::UnpackedTy;
-        
-        ixf = ixf - (LerpFracMask / 2);
-        iyf = iyf - (LerpFracMask / 2);
-
-        v_int ix = ixf >> LerpFracBits;
-        v_int iy = iyf >> LerpFracBits;
-
-        const float fracScale = 1.0f / (LerpFracMask + 1);
-        v_float fx = simd::conv<float>(ixf & LerpFracMask) * fracScale;
-        v_float fy = simd::conv<float>(iyf & LerpFracMask) * fracScale;
-
-        R colors00 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 0, iy + 0);
-        R colors10 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 1, iy + 0);
-        R rowA = colors00 + (colors10 - colors00) * fx;
-
-        R colors01 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 0, iy + 1);
-        R colors11 = GatherTexelsNearCubeEdge(offset, stride, mipLevel, faceIdx, ix + 1, iy + 1);
-        R rowB = colors01 + (colors11 - colors01) * fx;
-
-        return rowA + (rowB - rowA) * fy;
-    }
-
-    Texel::UnpackedTy GatherTexels(int32_t offset, uint32_t stride, v_int ix, v_int iy) const {
-        return Texel::Unpack(simd::gather(Data, offset + ix + (iy << stride)));
-    }
-    Texel::UnpackedTy GatherTexelsNearCubeEdge(v_int offset, v_int stride, v_int mipLevel, v_int faceIdx, v_int ix, v_int iy) const {
-        v_int scaleU = MaskU >> mipLevel, scaleV = MaskV >> mipLevel;
-        v_int fallMask = (ix & scaleU) != ix || (iy & scaleV) != iy;
-
-        if (simd::any(fallMask)) {
-            v_int adjFace = faceIdx, adjX = ix, adjY = iy;
-            texutil::GetAdjacentCubeFace(adjFace, adjX, adjY, scaleU, scaleV);
-
-            ix = fallMask ? adjX : ix;
-            iy = fallMask ? adjY : iy;
-            ix = simd::min(simd::max(ix, 0), scaleU);
-            iy = simd::min(simd::max(iy, 0), scaleV);
-            offset += fallMask ? ((adjFace - faceIdx) * (int)LayerStride) : 0;
-        }
-        return Texel::Unpack(simd::gather(Data, offset + ix + (iy << stride)));
-    }
-
     void GenerateMip(uint32_t level, uint32_t layer) {
         uint32_t w = Width >> level, h = Height >> level;
-        int32_t offset = (int32_t)(layer * LayerStride + MipOffsets[level - 1]);
-        uint32_t stride = RowShift - level + 1;
+        uint32_t* srcData = &Data[(layer * LayerStride) + MipOffsets[level - 1]];
+        int stride = (int)(RowShift - level + 1);
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
                 v_int ix = ((int32_t)x + TilePixelOffsetsX) << 1;
                 v_int iy = ((int32_t)y + TilePixelOffsetsY) << 1;
 
-                // This will never go out of bounds if texture size is POT and >4x4.
-                // Storage is padded by +16*4 bytes so nothing bad should happen if we do.
-                auto c00 = GatherTexels(offset, stride, ix + 0, iy + 0);
-                auto c10 = GatherTexels(offset, stride, ix + 1, iy + 0);
-                auto c01 = GatherTexels(offset, stride, ix + 0, iy + 1);
-                auto c11 = GatherTexels(offset, stride, ix + 1, iy + 1);
+                auto c00 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 0, stride)));
+                auto c10 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 0, stride)));
+                auto c01 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 1, stride)));
+                auto c11 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 1, stride)));
                 auto avg = (c00 + c10 + c01 + c11) * 0.25f;
 
                 WriteTile(Texel::Pack(avg), x, y, layer, level);
@@ -619,8 +565,7 @@ private:
 template<pixfmt::Texel T>
 inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
     assert(std::has_single_bit(width) && std::has_single_bit(height) && maxLevels < simd::vec_width);
-
-    uint32_t rowShift = (uint32_t)std::countr_zero(width);
+    uint32_t rowShift = (uint32_t)std::countr_zero(std::max(width, 8u));
     uint32_t mipOffsets[16] = {};
     uint32_t layerStride = 0;
     uint32_t mip = 0;
@@ -629,11 +574,11 @@ inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t
         if ((width >> mip) < 4 || (height >> mip) < 4) break;
 
         mipOffsets[mip] = layerStride;
-        layerStride += ((width >> mip) * (height >> mip) + 15) & ~15u;  // align to 64 bytes
+        layerStride += ((width >> mip) * (height >> mip) + 63) & ~63u;  // align to 256 bytes
     }
     assert(layerStride * (uint64_t)numLayers < INT32_MAX);
 
-    auto tex = (Texture2D<T>*)_mm_malloc(sizeof(Texture2D<T>) + (size_t)layerStride * numLayers * 4 + 64, 64);
+    auto tex = (Texture2D<T>*)_mm_malloc(sizeof(Texture2D<T>) + (size_t)layerStride * numLayers * 4 + 256, 64);
     tex->Width = width;
     tex->Height = height;
     tex->RowShift = rowShift;

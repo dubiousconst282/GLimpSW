@@ -84,7 +84,7 @@ public:
         _currSceneName = path.filename().string();
     }
     void LoadSkybox(const std::filesystem::path& path) {
-        auto tex = swr::texutil::LoadCubemapFromPanoramaHDR(path.string().c_str());
+        auto tex = swr::texutil::LoadOctahedronFromPanoramaHDR(path.string().c_str());
         _shader->SetSkybox(std::move(tex));
 
         _currSkyboxName = path.filename().string();

@@ -48,7 +48,7 @@ using bitmask = std::conditional_t<width_of<T> <= 8, uint8_t,   //
     SIMD_DEF_BIN_OP(<<) \
     SIMD_DEF_BIN_OP(>>)
 
-template<typename T, uint32_t N>
+template<typename T, int N>
 struct mdvec;
 
 template<typename T>
@@ -62,7 +62,7 @@ struct mdvec<T, 2> {
     SIMD_INLINE explicit constexpr mdvec(const mdvec<T, 3>& v_) : x(v_.x), y(v_.y) {}
     SIMD_INLINE explicit constexpr mdvec(const mdvec<T, 4>& v_) : x(v_.x), y(v_.y) {}
 
-    SIMD_INLINE T& operator[](uint32_t idx) {
+    SIMD_INLINE T& operator[](size_t idx) {
         assert(idx < 2);
         return idx == 0 ? x : y;
     }
@@ -85,7 +85,7 @@ struct mdvec<T, 3> {
     SIMD_INLINE constexpr mdvec(const glm::vec<3, elem_type<T>>& v_) : x(v_.x), y(v_.y), z(v_.z) {}
     SIMD_INLINE explicit constexpr mdvec(const mdvec<T, 4>& v_) : x(v_.x), y(v_.y), z(v_.z) {}
 
-    SIMD_INLINE T& operator[](uint32_t idx) {
+    SIMD_INLINE T& operator[](size_t idx) {
         assert(idx < 3);
         return idx == 0 ? x : idx == 1 ? y : z;
     }
@@ -108,7 +108,7 @@ struct mdvec<T, 4> {
     SIMD_INLINE constexpr mdvec(mdvec<T, 3> v_, T w_ = 0) : x(v_.x), y(v_.y), z(v_.z), w(w_) {}
     SIMD_INLINE constexpr mdvec(const glm::vec<4, elem_type<T>>& v_) : x(v_.x), y(v_.y), z(v_.z), w(v_.w) {}
 
-    SIMD_INLINE T& operator[](uint32_t idx) {
+    SIMD_INLINE T& operator[](size_t idx) {
         assert(idx < 4);
         return idx == 0 ? x : idx == 1 ? y : idx == 2 ? z : w;
     }
@@ -177,14 +177,33 @@ SIMD_TFN_ANY void store(void* ptr, const T& vec) {
 SIMD_TFN_ANY T gather(const void* ptr, mask_vec<T> idx, vec<bool, width_of<T>> mask = true) {
     return __builtin_masked_gather(mask, idx, (const elem_type<T>*)ptr);
 }
-template<typename E, uint32_t N = sizeof(__m512) / sizeof(E)>
+template<typename E, int N = sizeof(__m512) / sizeof(E)>
 SIMD_INLINE vec<E, N> gather(const E* ptr, mask_vec<vec<E, N>> idx, vec<bool, N> mask = true) {
     return __builtin_masked_gather(mask, idx, ptr);
 }
 
+// Gather variants optimized for small arrays
+SIMD_INLINE v_uint gather_preload64(const uint32_t data[64], v_uint idx) {
+    v_uint v0 = _mm512_load_si512(&data[0]);
+    v_uint v1 = _mm512_load_si512(&data[16]);
+    v_uint v2 = _mm512_load_si512(&data[32]);
+    v_uint v3 = _mm512_load_si512(&data[48]);
+    v_uint p01 = _mm512_permutex2var_epi32(v0, idx, v1);
+    v_uint p23 = _mm512_permutex2var_epi32(v2, idx, v3);
+    return idx < 32 ? p01 : p23;
+}
+SIMD_INLINE v_float gather_preload64(const float data[64], v_uint idx) {
+    return __builtin_bit_cast(v_float, gather_preload64((const uint32_t*)data, idx));
+}
+// Gather 64 bytes from 128-byte array
+SIMD_INLINE v_uint gather_preload128(const uint8_t data[128], v_uint idx) {
+    v_uint v0 = _mm512_load_si512(&data[0]);
+    v_uint v1 = _mm512_load_si512(&data[64]);
+    return _mm512_permutex2var_epi8(v0, idx, v1);
+}
+
 // Shuffle by constant indices
-template<auto indices, is_vector T>
-    requires(std::is_integral_v<elem_type<decltype(indices)>>)
+template<auto indices, is_vector T> requires(std::is_integral_v<elem_type<decltype(indices)>>)
 SIMD_INLINE constexpr T shuffle(T values) {
     const auto do_shuffle = [&]<size_t... Idx>(std::index_sequence<Idx...>) {
         return __builtin_shufflevector(values, values, indices[Idx]...);
@@ -203,15 +222,18 @@ SIMD_TFN_MASK constexpr bool any(T mask) { return movemask(mask) != 0; }
 // Checks if all lanes of the given mask vector are true.
 SIMD_TFN_MASK constexpr bool all(T mask) { return movemask(mask) == (unsigned _BitInt(width_of<T>))(-1); }
 
-template<typename T, uint32_t N>
-SIMD_INLINE constexpr mdvec<T, N> select(mdvec<mask_vec<T>, N> cond, mdvec<T, N> ifTrue, mdvec<T, N> ifFalse) {
-    mdvec<T, N> r;
-    for (uint32_t i = 0; i < N; i++) {
-        r[i] = cond[i] ? ifTrue[i] : ifFalse[i];
-    }
-    return r;
+template<is_vector T>
+SIMD_INLINE void cmov(T& dest, T ifTrue, mask_vec<T> cond) {
+    dest = cond ? ifTrue : dest;
 }
-template<typename T, uint32_t N>
+template<typename T, int N>
+SIMD_INLINE void cmov(mdvec<T, N>& dest, mdvec<T, N> ifTrue, mask_vec<T> cond) {
+    for (uint32_t i = 0; i < N; i++) {
+        dest[i] = cond ? ifTrue[i] : dest[i];
+    }
+}
+
+template<typename T, int N>
 SIMD_INLINE constexpr mdvec<T, N> select(mask_vec<T> cond, mdvec<T, N> ifTrue, mdvec<T, N> ifFalse) {
     mdvec<T, N> r;
     for (uint32_t i = 0; i < N; i++) {
@@ -219,14 +241,14 @@ SIMD_INLINE constexpr mdvec<T, N> select(mask_vec<T> cond, mdvec<T, N> ifTrue, m
     }
     return r;
 }
-
-template<typename T, uint32_t N>
-SIMD_INLINE void write_if(mask_vec<T> cond, mdvec<T, N>& dest, mdvec<T, N> ifTrue) {
+template<typename T, int N>
+SIMD_INLINE constexpr mdvec<T, N> select(mdvec<mask_vec<T>, N> cond, mdvec<T, N> ifTrue, mdvec<T, N> ifFalse) {
+    mdvec<T, N> r;
     for (uint32_t i = 0; i < N; i++) {
-        dest[i] = cond ? ifTrue[i] : dest[i];
+        r[i] = cond[i] ? ifTrue[i] : ifFalse[i];
     }
+    return r;
 }
-
 //////////////////////////////////////// Fundamentals ////////////////////////////////////////
 
 // a * b + c
@@ -234,14 +256,6 @@ SIMD_TFN_FLOAT T fma(T a, T b, T c) { return __builtin_elementwise_fma(a, b, c);
 SIMD_TFN_FLOAT T fma(T a, elem_type<T> b, T c) { return __builtin_elementwise_fma(a, T(b), c); }
 SIMD_TFN_FLOAT T fma(T a, T b, elem_type<T> c) { return __builtin_elementwise_fma(a, b, T(c)); }
 SIMD_TFN_FLOAT T fma(T a, elem_type<T> b, elem_type<T> c) { return __builtin_elementwise_fma(a, T(b), T(c)); }
-
-// Linear interpolation between `a` and `b`: `a*(1-t) + b*t`
-// https://fgiesen.wordpress.com/2012/08/15/linear-interpolation-past-present-and-future/
-SIMD_TFN_FLOAT T lerp(T a, T b, T t) { return fma(t, b, fma(-t, a, a)); }
-
-// 16-bit linear interpolation with 15-bit interpolant: a + (b - a) * t
-// mulhrs(a, b) = (a * b + (1 << 14)) >> 15
-SIMD_INLINE v_uint lerp16(v_uint a, v_uint b, v_uint t) { return _mm512_add_epi16(a, _mm512_mulhrs_epi16(_mm512_sub_epi16(b, a), t)); }
 
 SIMD_TFN_FLOAT T sqrt(T x) { return __builtin_elementwise_sqrt(x); }
 SIMD_INLINE v_float approx_rsqrt(v_float x) { return _mm512_rsqrt14_ps(x); }
@@ -383,9 +397,28 @@ SIMD_INLINE v_float length(v_float3 p) { return approx_sqrt(dot(p, p)); }
 
 SIMD_INLINE v_float3 reflect(v_float3 i, v_float3 n) { return i - 2.0f * dot(n, i) * n; }
 
+// Linear interpolation between `a` and `b`: `a*(1-t) + b*t`
+// https://fgiesen.wordpress.com/2012/08/15/linear-interpolation-past-present-and-future/
+SIMD_TFN_FLOAT T lerp(T a, T b, T t) { return fma(t, b, fma(-t, a, a)); }
+
+// 16-bit linear interpolation with 15-bit interpolant: a + (b - a) * t
+// mulhrs(a, b) = (a * b + (1 << 14)) >> 15
+SIMD_INLINE v_uint lerp16(v_uint a, v_uint b, v_uint t) { return _mm512_add_epi16(a, _mm512_mulhrs_epi16(_mm512_sub_epi16(b, a), t)); }
+
 SIMD_INLINE v_float smoothstep(v_float a, v_float b, v_float t) {
     t = clamp((t - a) / (b - a), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
+}
+
+// y < 0 ? -x : x
+SIMD_INLINE v_float mulsign(v_float x, v_float y) {
+    // return as<float>(as<uint32_t>(x) ^ (as<uint32_t>(y) & 0x8000'0000));
+    return _mm512_ternarylogic_epi32(x, y, v_uint(0x7FFF'FFFF), _MM_TERNLOG_A ^ (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
+}
+// s < 0 ? -abs(x) : abs(x)
+SIMD_INLINE v_float copysign(v_float x, v_float s) {
+    // return as<float>((as<uint32_t>(x) & 0x7FFF'FFFF) | (as<uint32_t>(s) & 0x8000'0000));
+    return _mm512_ternarylogic_epi32(x, s, v_uint(0x7FFF'FFFF), (_MM_TERNLOG_A & _MM_TERNLOG_C) | (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
 }
 
 SIMD_INLINE v_float4 mul(const glm::mat4& m, const v_float4& v) {

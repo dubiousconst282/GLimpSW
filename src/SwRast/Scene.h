@@ -31,6 +31,7 @@ struct Meshlet {
 
     uint16_t NumVertices, NumTriangles;
     uint32_t MaterialId;
+    uint8_t AlphaCutoff;
 
     alignas(64) float Positions[3][64];
     uint32_t TexCoords[64];                // float16
