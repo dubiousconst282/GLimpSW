@@ -10,7 +10,14 @@ High performance AVX512 software rasterizer
   <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/0e39e425-102d-4f69-9802-41b654cd6aea" width="49%" alt="Amazon Bistro">
 </div>
 
-_Sample screenshots of the [previous version], rendered at 1080p on a 4-core TigerLake CPU, running at ~3.5GHz_
+_Sample screenshots of the [previous version](https://github.com/dubiousconst282/GLimpSW/tree/old-deferred) (deferred g-buffer), rendered at 1080p on a 4-core TigerLake CPU, running at ~3.5GHz_
+
+<div>
+  <img width="49%" src="https://github.com/user-attachments/assets/8be6debd-9f88-452d-89c9-4880a6c7a3f6" />
+  <img width="49%" src="https://github.com/user-attachments/assets/11c3aa4d-23dc-4f66-a2f2-6fd591ae41f6" />
+</div>
+
+_Sample screenshots of the current version (deferred vis-buffer), showing performance improvements over the same config_
 
 ## Features
 - Programmable mesh and pixel shading via concepts and template specialization
@@ -99,7 +106,9 @@ Both overdraw and the quad utilization issue can be mitigated by moving complexi
 ### Coarse Raster
 The rasterizer uses a basic bounding-box traversal to step over the triangle, which results in many redundant steps over empty space for larger triangles. These could be avoided with [one of the many smarter traversal algorithms]((https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/)), but some profiling shows traversal is also not as problematic as it seems in theory: on a view with a bunch of moderately large tris, only ~14% of time is spent on the edge stepping loop for the vis-buffer shader which writes only the depth and surface ID:
 
-<div align="center"> <img src="./coarse_profile_drawtri.png" width="500"> </div>
+<div align="center"> 
+  <img width="400" alt="coarse_profile_drawtri" src="https://github.com/user-attachments/assets/43e2b3a1-8812-4168-baa6-5b3d235e9231" />
+</div>
 
 Depth testing takes pretty much all drawing time with an awful high cache-miss rate, since at that point all framebuffer data has to come from RAM. Fast clears could help here, but unfortunately there seems to be no way to populate the cache without having the CPU fetch associdated data from RAM, even for aligned and unmasked 512-bit stores that completely overwrite cachelines. Although it might still be possible to save one memory trip by delaying and splitting framebuffer clears to the first bin rasterization step. [TODO]
 
@@ -163,8 +172,8 @@ With the traditional row-major layout `x + y * stride`, texture accesses along t
 In my experiments, tiling provided relatively small improvements outside of artificial throughput benchmarks. After mip-mapping, sampling appears to get bound primarily by compute, rather than memory latency. [TexSwizzle.cpp](./src/SwRast/Benchmarks/TexSwizzle.cpp)
 
 <div align="center">
-  <img src="heatmap_tiling_linear.jpg" width="40%"/>
-  <img src="heatmap_tiling_y8.jpg" width="40%"/>
+  <img width="40%" alt="heatmap_tiling_y8" src="https://github.com/user-attachments/assets/69764904-baa8-4a39-b36e-7067b11546b1" />
+  <img width="40%" alt="heatmap_tiling_linear" src="https://github.com/user-attachments/assets/2991af76-9b49-4c49-9ea2-0d5552adc482" />
   <br><i>Plot of pixel exec timings</i>
 </div>
 
