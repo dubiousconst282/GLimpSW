@@ -9,9 +9,6 @@
 #include <stb_image_write.h>
 
 inline v_int GetOffset_TiledY4(v_int x, v_int y, v_int rowShift) {
-    // Tiles in row-major performs worse
-    // return (y & 3) | (x << 2) | ((y & ~3) << rowShift);
-
     // ternlog prevents clang from duplicating mem load for const(3)
     v_int t1 = _mm512_ternarylogic_epi32(y, y, v_int(3), _MM_TERNLOG_A & ~_MM_TERNLOG_C);
     return (y & 3) | (x << 2) | (t1 << rowShift);
@@ -84,53 +81,55 @@ struct FragmentInfo {
     uint32_t UV[16];
 };
 
-struct VisShader {
+struct ShadingContext {
     glm::mat4 ProjMat;
     glm::mat3 ModelMat;
-    const scene::Meshlet* Meshlets;
-    const scene::Material* Materials;
+    const Meshlet* Meshlets;
+    const Material* Materials;
 
     std::vector<FragmentInfo>* Frags;
-
-    void ShadeMeshlet(uint32_t index, swr::ShadedMeshlet& output) const {
-        auto& mesh = Meshlets[index];
-
-        for (uint32_t i = 0; i < mesh.NumVertices; i += simd::vec_width) {
-            v_float3 worldPos = { simd::load(&mesh.Positions[0][i]), simd::load(&mesh.Positions[1][i]), simd::load(&mesh.Positions[2][i]) };
-            output.SetPosition(i, simd::mul(ProjMat, { worldPos, 1.0f }));
-        }
-        output.PrimCount = mesh.NumTriangles;
-        memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
-    }
-
-    void ShadePixels(swr::Framebuffer& fb, swr::FragmentVars& vars) const {
-        // Depth test
-        v_float oldDepth = simd::load(&fb.DepthBuffer[vars.TileOffset]);
-        vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
-        if (vars.TileMask == 0) return;
-
-        auto& mesh = Meshlets[vars.MeshletId];
-        auto& frag = Frags->emplace_back(FragmentInfo{ .MaterialId = mesh.MaterialId, .TileOffset = vars.TileOffset });
-
-        v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
-        v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
-        v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
-        v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
-        simd::store(frag.UV, swr::pixfmt::RG16f::Pack({ simd::fract(uv.x), simd::fract(uv.y) }));
-
-        _mm512_mask_store_ps(&fb.DepthBuffer[vars.TileOffset], vars.TileMask, vars.Depth);
-    }
-
-    static glm::vec2 UnpackHalf2x16(uint32_t x) {
-        auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
-        return { v[0], v[1] };
-    }
 };
+
+static glm::vec2 UnpackHalf2x16(uint32_t x) {
+    auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
+    return { v[0], v[1] };
+}
+
+void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
+    auto& mesh = ctx.Meshlets[index];
+
+    for (uint32_t i = 0; i < mesh.NumVertices; i += simd::vec_width) {
+        v_float3 worldPos = { simd::load(&mesh.Positions[0][i]), simd::load(&mesh.Positions[1][i]), simd::load(&mesh.Positions[2][i]) };
+        output.SetPosition(i, simd::mul(ctx.ProjMat, { worldPos, 1.0f }));
+    }
+    output.PrimCount = mesh.NumTriangles;
+    memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
+}
+
+void ShadePixels(ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
+    // Depth test
+    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
+    vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
+    if (vars.TileMask == 0) return;
+
+    auto& mesh = ctx.Meshlets[vars.MeshletId];
+    auto& frag = ctx.Frags->emplace_back(FragmentInfo{ .MaterialId = mesh.MaterialId, .TileOffset = (uint32_t)vars.TileOffset });
+
+    v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
+    v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
+    v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
+    v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
+    simd::store(frag.UV, swr::pixfmt::RG16f::Pack({ simd::fract(uv.x), simd::fract(uv.y) }));
+
+    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
+}
 
 #if 1
 // [model path] [(camera) <x> <y> <z> <yaw> <pitch>]
 int main(int argc, const char** args) {
-    auto scene = std::make_unique<scene::Model>(argc > 2 ? args[1] : "assets/models/Sponza/Sponza.gltf");
+    Scene scene;
+    scene.ImportGltf(argc > 2 ? args[1] : "assets/models/Sponza/Sponza.gltf");
+
     auto camera = Camera{ .Position = { -0.46608772755098471, 8.4925445559659511, -1.7022251220187172 }, .Euler = { -3.13643026, -1.4724431 } };
 
     if (argc >= 6) {
@@ -138,26 +137,31 @@ int main(int argc, const char** args) {
         camera.Euler = { atof(args[5]), atof(args[6]) };
     }
 
-    auto fb = swr::Framebuffer(1920, 1080);
+    auto fb = swr::CreateFramebuffer(1920, 1080);
     auto raster = swr::Rasterizer(1);
-    raster.ForceDisableBinning = true;
+    raster.EnableBinning = false;
 
-    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = { fb.Width, fb.Height } }, 0);
+    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = { fb->Width, fb->Height } }, 0);
 
     auto projMat = camera.GetProjMatrix() * camera.GetViewMatrix(true);
-    fb.Clear(0, 0);
+    auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels, ShadingContext>();
+
+    fb->Clear(0, 0);
 
     std::vector<FragmentInfo> fragments;
 
-    scene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
-        auto shader = VisShader{
-            .ProjMat = projMat * modelMat,
-            .Meshlets = &scene->Meshlets[node.MeshletOffset],
-            .Frags = &fragments,
-        };
-        raster.DrawMeshlets(fb, node.MeshletCount, shader);
-        return true;
-    });
+    for (auto& model : scene.Models) {
+        for (auto& node : model->Nodes) {
+            if (node.MeshCount == 0) continue;
+
+            auto shaderCtx = ShadingContext{
+                .ProjMat = projMat * float4x4(node.GlobalTransform),
+                .Meshlets = &scene.Meshlets[node.MeshOffset],
+                .Frags = &fragments,
+            };
+            raster.DrawMeshlets(*fb, node.MeshCount, { shaderDispatch, &shaderCtx });
+        }
+    }
     printf("Fragments: %.3fK\n", fragments.size() / 1e3);
 
     ankerl::nanobench::Bench ctx;
@@ -168,14 +172,14 @@ int main(int argc, const char** args) {
 
     auto bench = [&]<int swizzle>() {
         for (auto& frag : fragments) {
-            auto tex = scene->Materials[frag.MaterialId].Texture;
+            auto tex = scene.Materials[frag.MaterialId].Texture;
             v_float2 uv = swr::pixfmt::RG16f::Unpack(simd::load(frag.UV));
 
             v_uint color = SampleNearestAsIfSwizzled<swizzle>(*tex, uv.x, uv.y);
             v_uint normalMR = SampleNearestAsIfSwizzled<swizzle>(*tex, uv.x, uv.y, 1);
             v_uint finalColor = color ^ (normalMR & 0x1F1F1F1F);
 
-            _mm512_store_epi32(&fb.ColorBuffer[frag.TileOffset], finalColor);
+            _mm512_store_epi32(&fb->GetColorBuffer()[frag.TileOffset], finalColor);
         }
     };
 
@@ -185,9 +189,9 @@ int main(int argc, const char** args) {
     ctx.run("Tiled16X4", [&]() { bench.template operator()<3>(); });
     ctx.run("ZCurve", [&]() { bench.template operator()<4>(); });
 
-    auto pixels = simd::alloc_buffer<uint32_t>(fb.Width * fb.Height);
-    fb.GetPixels(pixels.get(), fb.Width);
-    stbi_write_png("logs/bench_view.png", (int)fb.Width, (int)fb.Height, 4, pixels.get(), (int)fb.Width * 4);
+    auto pixels = simd::alloc_buffer<uint32_t>(fb->Width * fb->Height);
+    fb->GetPixels(0, pixels.get(), fb->Width);
+    stbi_write_png("logs/bench_view.png", (int)fb->Width, (int)fb->Height, 4, pixels.get(), (int)fb->Width * 4);
 
     return 0;
 }

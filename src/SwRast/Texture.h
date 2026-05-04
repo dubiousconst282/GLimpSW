@@ -12,8 +12,6 @@ namespace pixfmt {
 template<typename T, typename... U>
 concept IsAnyOf = (std::same_as<T, U> || ...);
 
-// Represents a SIMD pixel packet in storage form, where the unpacked form consists of floats.
-// NOTE: Packed size is currently restricted to 32-bits as that's the only element size texture sampling supports gathering.
 template<typename T>
 concept Texel = requires(const T& s, const T::UnpackedTy& u, v_uint p) {
     IsAnyOf<typename T::UnpackedTy, v_uint, v_float, v_float2, v_float3, v_float4>;
@@ -34,6 +32,24 @@ struct RGBA8u {
             simd::conv<float>((packed >> 8) & 255) * scale,
             simd::conv<float>((packed >> 16) & 255) * scale,
             simd::conv<float>((packed >> 24) & 255) * scale,
+        };
+    }
+    static v_float4 UnpackSrgb(v_uint packed) {
+        // TODO: maybe use more accurate approx?
+        // https://chilliant.blogspot.com/2012/08/srgb-approximations-for-hlsl.html
+        // x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878)
+
+        v_uint rb1 = ((packed << 8) & 0xFF00'FF00) + 0x00FF'00FF;
+        v_uint ag1 = ((packed << 0) & 0xFF00'FF00) + 0x00FF'00FF;
+        v_uint rb2 = _mm512_mulhi_epu16(rb1, rb1);
+        v_uint ag2 = _mm512_mulhi_epu16(ag1, ag1);
+
+        constexpr float scale = 1.0f / 65535;
+        return {
+            simd::conv<float>(rb2 & 65535) * scale,
+            simd::conv<float>(ag2 & 65535) * scale,
+            simd::conv<float>(rb2 >> 16) * scale,
+            simd::conv<float>(ag1 >> 16) * scale,
         };
     }
     static v_uint Pack(const v_float4& value) {
@@ -92,9 +108,20 @@ struct RG16f {
     using LerpedTy = UnpackedTy;
 
     static v_float2 Unpack(v_uint packed) {
+        constexpr simd::vec<uint8_t, 64> shuf = {
+            0,  1,  4,  5,  8,  9,  12, 13, 16, 17, 20, 21, 24, 25, 28, 29,  //
+            32, 33, 36, 37, 40, 41, 44, 45, 48, 49, 52, 53, 56, 57, 60, 61,  //
+            2,  3,  6,  7,  10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31,  //
+            34, 35, 38, 39, 42, 43, 46, 47, 50, 51, 54, 55, 58, 59, 62, 63,
+        };
+        // permb is faster than vpmovdw. asm to workaround https://github.com/llvm/llvm-project/issues/160348
+        v_uint split;
+        asm("vpermb %2, %1, %0" : "=v"(split) : "v"(shuf), "v"(packed));
+        // split = _mm512_permutexvar_epi8(shuf, packed);
+
         return {
-            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed)),
-            _mm512_cvtph_ps(_mm512_cvtepi32_epi16(packed >> 16)),
+            _mm512_cvtph_ps(_mm512_extracti32x8_epi32(split, 0)),
+            _mm512_cvtph_ps(_mm512_extracti32x8_epi32(split, 1)),
         };
     }
     static v_uint Pack(const v_float2& value) {
@@ -238,9 +265,14 @@ inline v_float dFdy(v_float p) {
 }
 // Calculates mip-level using derivatives from scaled sample UVs (dxu, dxv, dyu, dyv).
 inline v_int CalcMipLevel(v_float4 grad) {
-    v_float maxDeltaSq = simd::max(simd::fma(grad.x, grad.x, grad.y * grad.y), simd::fma(grad.z, grad.z, grad.w * grad.w));
-    return simd::ilog2(maxDeltaSq) >> 1;
-    // return simd::approx_log2(maxDeltaSq) * 0.5f;
+    v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y);
+    v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w);
+    return simd::ilog2(simd::max(dx, dy)) >> 1;
+}
+inline v_int CalcMipLevel(v_float4 grad, v_float2 scale) {
+    v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y) * (scale.x * scale.x);
+    v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w) * (scale.y * scale.y);
+    return simd::ilog2(simd::max(dx, dy)) >> 1;
 }
 
 inline v_float2 MapOctahedron(v_float3 norm) {
@@ -273,7 +305,6 @@ struct SamplerDesc {
     WrapMode Wrap = WrapMode::Repeat;
     FilterMode MagFilter = FilterMode::Linear;
     FilterMode MinFilter = FilterMode::Nearest;
-    bool CalcMipFromDerivs = false;
 };
 
 template<pixfmt::Texel Texel_, TextureLayout Layout_>
@@ -365,8 +396,18 @@ struct Texture2D {
         return simd::gather(Data, offset + GetTexelOffset(x, y, stride));
     }
 
+    // Sample with implicit derivatives.
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy Sample(v_float u, v_float v, v_int layer = 0, v_int mipLevel = 0) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleImplicitLod(v_float u, v_float v, v_int layer = 0) const {
+        v_float su = u * ScaleLerpU, sv = v * ScaleLerpV;
+
+        v_float4 grad = { texutil::dFdx(su), texutil::dFdx(sv), texutil::dFdy(su), texutil::dFdy(sv) };
+        v_int mipLevel = texutil::CalcMipLevel(grad) - LerpFracBits;
+        return SampleLevel<SD>(u, v, layer, mipLevel);
+    }
+
+    template<SamplerDesc SD>
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleLevel(v_float u, v_float v, v_int layer, v_int mipLevel) const {
         // Scale and round UVs 
         v_float su = u * ScaleLerpU, sv = v * ScaleLerpV;
         v_int ix = simd::round2i(su), iy = simd::round2i(sv);
@@ -385,16 +426,10 @@ struct Texture2D {
             static_assert(!"Bad wrap mode");
         }
 
-        // Select mip and filter mode
-        FilterMode filter = SD.MagFilter;
+        FilterMode filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
 
-        if constexpr (SD.CalcMipFromDerivs) {
-            v_float4 grad = { texutil::dFdx(su), texutil::dFdx(sv), texutil::dFdy(su), texutil::dFdy(sv) };
-            mipLevel = texutil::CalcMipLevel(grad) - LerpFracBits;
-            filter = simd::any(mipLevel > 0) ? SD.MinFilter : SD.MagFilter;
-        }
         int maxLevel = (int)MipLevels - 1;
-        [[assume(maxLevel > 0)]];
+        [[assume(maxLevel >= 0)]];
         mipLevel = simd::clamp(mipLevel, 0, maxLevel);
 
         // Calculate offsets and mip position
@@ -421,20 +456,21 @@ struct Texture2D {
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOct(const v_float3& dir, v_float mipLevel = -1.0f) const {
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOctImplicitLod(const v_float3& dir) const {
+        v_float2 uv = texutil::MapOctahedron(dir);
+        return SampleImplicitLod<SD>(uv.x, uv.y);
+    }
+
+    template<SamplerDesc SD>
+    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOctLevel(const v_float3& dir, v_float mipLevel) const {
         v_float2 uv = texutil::MapOctahedron(dir);
 
-        int tmp = mipLevel[0];  // __builtin_constant_p() only works with variables - https://github.com/llvm/llvm-project/issues/65741
-        if (__builtin_constant_p(tmp) && tmp < 0) {
-            return Sample<SD>(uv.x, uv.y);
-        }
-        constexpr SamplerDesc SDNoMip = { WrapMode::MirroredRepeat, SD.MagFilter, SD.MinFilter, false };
         v_int baseMip = simd::conv<int>(mipLevel);
-        auto baseSample = Sample<SDNoMip>(uv.x, uv.y, 0, baseMip);
+        auto baseSample = SampleLevel<SD>(uv.x, uv.y, 0, baseMip);
 
         v_float mipFrac = mipLevel - simd::conv<float>(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
-            auto lowerSample = Sample<SDNoMip>(uv.x, uv.y, 0, baseMip + 1);
+            auto lowerSample = SampleLevel<SD>(uv.x, uv.y, 0, baseMip + 1);
             return baseSample + (lowerSample - baseSample) * mipFrac;
         }
         return baseSample;

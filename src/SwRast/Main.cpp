@@ -1,6 +1,4 @@
 #include <vector>
-#include <format>
-#include <filesystem>
 
 #include "Rasterizer.h"
 #include "Texture.h"
@@ -15,404 +13,282 @@
 #include <ImGuizmo.h>
 #include <tracy/Tracy.hpp>
 
+#include <nfd.h>
+#include <nfd_glfw3.h>
+
 #include "Camera.h"
 
 #include "Scene.h"
-#include "RendererShaders.h"
+#include "Shading.h"
 
-class SwRenderer {
-    std::unique_ptr<swr::Framebuffer> _fb;
-    std::unique_ptr<swr::Rasterizer> _rast;
-    std::unique_ptr<scene::Model> _scene, _shadowScene;
-    std::unique_ptr<renderer::DefaultShader> _shader;
+namespace {
 
-    Camera _cam;
+GLFWwindow* _window;
 
-    GLuint _fbTexture = 0;
-    GLuint _shadowDebugTex = 0;
+swr::FramebufferPtr _fb;
+std::unique_ptr<swr::Rasterizer> _rast;
+GLuint _fbTexture = 0;
 
-    glm::vec3 _lightPos;
-    glm::mat4 _shadowProjMat;
+Camera _cam;
+std::unique_ptr<Scene> _scene;
+swr::HdrTexture2D::Ptr _skyboxTex;
 
-    std::unique_ptr<swr::Framebuffer> _shadowFb;
+GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
+    GLuint handle;
+    glCreateTextures(GL_TEXTURE_2D, 1, &handle);
 
-    std::vector<std::filesystem::path> _scenePaths;
-    std::vector<std::filesystem::path> _skyboxPaths;
-    std::string _currSceneName, _currSkyboxName;
+    glTextureStorage2D(handle, (GLsizei)mipLevels, fmt, (GLsizei)width, (GLsizei)height);
 
-public:
-    SwRenderer() {
-        std::vector<std::string_view> modelExts = { ".gltf", ".glb" };
-        SearchFiles("assets/", _scenePaths, modelExts);
-        SearchFiles("logs/assets/", _scenePaths, modelExts);  // git ignored
+    glTextureParameteri(handle, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(handle, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-        SearchFiles("assets/skyboxes/", _skyboxPaths, { ".hdr", ".jpg", ".png" });
-        SearchFiles("logs/assets/", _skyboxPaths, { ".hdr" });
+    glTextureParameteri(handle, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(handle, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    return handle;
+}
 
-        _shader = std::make_unique<renderer::DefaultShader>();
+void CreateFramebuffer(uint32_t width, uint32_t height) {
+    _fb = swr::CreateFramebuffer(width, height, 3);
 
-        //LoadScene("assets/models/Sponza/Sponza.gltf");
-        LoadScene("/media/win11/Users/dan88/Repos/GraphicsAssets/Bistro_flat.glb");
-        LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
+    if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
+    _fbTexture = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
+}
+void LoadScene(const std::string& path) {
+    _scene = std::make_unique<Scene>();
+    _scene->ImportGltf(path);
+}
+void LoadSkybox(const std::string& path) {
+    _skyboxTex = swr::texutil::LoadOctahedronFromPanoramaHDR(path.c_str()); //
+}
 
-        _cam = Camera{ .Position = { -0.46608772755098471, 8.4925445559659511, -1.7022251220187172 }, .Euler = { -3.13643026, -1.4724431 } };
+void InitRenderer() {
+    //LoadScene("assets/models/Sponza/Sponza.gltf");
+    LoadScene("../GraphicsAssets/Sponza_Lights.glb");
+    LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
 
-        _rast = std::make_unique<swr::Rasterizer>(1);
-        CreateFramebuffer(1920, 1080);
+    _cam = Camera{ .Position = {9.6753334456680022, 1.1288966350423235, -0.48801679478492588}, .Euler = {-1.58308733, -0.608505249}, .MoveSpeed = 5.0f };
+    
+    _rast = std::make_unique<swr::Rasterizer>(4);
+    _rast->EnableBinning = false;
+    CreateFramebuffer(1920, 1080);
+}
 
-        _lightPos = glm::vec3(0.589494, 0.684509, 0.428906) * 18.0f;
+void DrawTranslationGizmo(glm::vec3& pos) {
+    ImGuizmo::BeginFrame();
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+
+    glm::mat4 projMat = _cam.GetProjMatrix();
+    glm::mat4 viewMat = _cam.GetViewMatrix(true);
+    float matrix[16];
+    float temp[3]{ 1.0f, 1.0f, 1.0f };
+    ImGuizmo::RecomposeMatrixFromComponents(&pos.x, temp, temp, matrix);
+
+    if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
+        ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, temp, temp);
     }
-    ~SwRenderer() {
-        if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
+}
+
+void RenderFrame() {
+    FrameMark;
+
+    static bool s_VSync = false;
+
+    static DebugLayer s_Layer = DebugLayer::None;
+    static bool s_EnableVisBuffer = true;
+    static bool s_ShowPerfHeatmap = false;
+    static float s_Exposure = 1.0f;
+
+    ImGui::Begin("Settings");
+    
+    ImGui::SeparatorText("Environment");
+
+    if (ImGui::Button("Import Model")) {
+        nfdu8filteritem_t filters[1] = { { "GLTF models", "gltf,glb" } };
+        nfdopendialogu8args_t args = {
+            .filterList = filters,
+            .filterCount = 1,
+        };
+        NFD_GetNativeWindowFromGLFWWindow(_window, &args.parentWindow);
+        nfdu8char_t* outPath;
+        nfdresult_t result = NFD_OpenDialogU8_With(&outPath, &args);
+
+        if (result == NFD_OKAY) {
+            LoadScene(std::string(outPath));
+            NFD_FreePathU8(outPath);
+        }
     }
 
-    void CreateFramebuffer(uint32_t width, uint32_t height) {
-        _fb = std::make_unique<swr::Framebuffer>(width, height, renderer::DefaultShader::NumFbAttachments);
+    ImGui::SeparatorText("Rasterizer");
 
-        if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
-        _fbTexture = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
-    }
-    void LoadScene(const std::filesystem::path& path) {
-        _scene = std::make_unique<scene::Model>(path.string());
-
-        if (path.filename().compare("Sponza.gltf") == 0) {
-            auto shadowModelPath = path;
-            _shadowScene = std::make_unique<scene::Model>(shadowModelPath.replace_filename("Sponza_LowPoly.gltf").string());
-        } else {
-            _shadowScene = nullptr;
-        }
-        _currSceneName = path.filename().string();
-    }
-    void LoadSkybox(const std::filesystem::path& path) {
-        auto tex = swr::texutil::LoadOctahedronFromPanoramaHDR(path.string().c_str());
-        _shader->SetSkybox(std::move(tex));
-
-        _currSkyboxName = path.filename().string();
+    char currRes[64];
+    snprintf(currRes, sizeof(currRes), "%dx%d", _fb->Width, _fb->Height);
+    if (ImGui::BeginCombo("Resolution", currRes)) {
+        if (ImGui::Selectable("2880x1620")) CreateFramebuffer(2880, 1620);
+        if (ImGui::Selectable("2560x1440")) CreateFramebuffer(2560, 1440);
+        if (ImGui::Selectable("1920x1080")) CreateFramebuffer(1920, 1080);
+        if (ImGui::Selectable("1280x720")) CreateFramebuffer(1280, 720);
+        if (ImGui::Selectable("848x480")) CreateFramebuffer(848, 480);
+        if (ImGui::Selectable("320x240")) CreateFramebuffer(320, 240);
+        ImGui::EndCombo();
     }
 
-    void Render() {
-        FrameMark;
+    int numThreads = (int)_rast->GetThreadCount();
+    if (ImGui::SliderInt("Threads", &numThreads, 1, (int)std::thread::hardware_concurrency())) {
+        _rast->SetThreadCount((uint32_t)numThreads);
+    }
+    ImGui::Checkbox("Binning", &_rast->EnableBinning);
+    ImGui::Checkbox("Clipping", &_rast->EnableClipping);
+    ImGui::Checkbox("Guardband", &_rast->EnableGuardband);
 
-        static bool s_EnableShadows = false;
-        static float s_ShadowRange = 15.0f;
-        static int s_ShadowRes = 1024;
-        static bool s_ShadowFollowCam = false;
+    ImGui::SeparatorText("Renderer");
 
-        static bool s_EnableSSAO = false;
-        static bool s_HzbOcclusion = false;
-        static bool s_AnimateLight = false;
-        static bool s_VSync = false;
+    ImGui::Checkbox("Vis-buffer", &s_EnableVisBuffer);
+    ImGui::Checkbox("Perf Heatmap", &s_ShowPerfHeatmap);
 
-        static renderer::DebugLayer s_Layer = renderer::DebugLayer::BaseColor;
+    ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0MetallicRoughness\0MeshletId\0TriangleId\0Overdraw\0");
+    ImGui::SliderFloat("Exposure", &s_Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
 
-        ImGui::Begin("Settings");
-        
-        ImGui::SeparatorText("Environment");
+    ImGui::SeparatorText("Misc");
+    ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 
-        if (ImGui::BeginCombo("Scene", _currSceneName.c_str())) {
-            for (auto& path : _scenePaths) {
-                if (ImGui::Selectable(path.filename().string().c_str())) {
-                    LoadScene(path);
-                }
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::BeginCombo("Skybox", _currSkyboxName.c_str())) {
-            for (auto& path : _skyboxPaths) {
-                if (ImGui::Selectable(path.filename().string().c_str())) {
-                    LoadSkybox(path);
-                }
-            }
-            ImGui::EndCombo();
-        }
+    ImGui::End();
 
-        ImGui::SeparatorText("Rendering");
+    if (ImGui::IsKeyPressed(ImGuiKey_C)) {
+        _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
+    }
+    _cam.Update(Camera::GetInputsFromImGui());
 
-        std::string currRes = std::format("{}x{}", _fb->Width, _fb->Height);
-        if (ImGui::BeginCombo("Resolution", currRes.c_str())) {
-            if (ImGui::Selectable("1920x1080")) CreateFramebuffer(1920, 1080);
-            if (ImGui::Selectable("1280x720")) CreateFramebuffer(1280, 720);
-            if (ImGui::Selectable("848x480")) CreateFramebuffer(848, 480);
-            if (ImGui::Selectable("320x240")) CreateFramebuffer(320, 240);
-            ImGui::EndCombo();
-        }
+    SWR_PERF_BEGIN(Frame);
 
-        int numThreads = (int)_rast->GetThreadCount();
-        if (ImGui::SliderInt("Threads", &numThreads, 1, (int)std::thread::hardware_concurrency())) {
-            _rast->SetThreadCount((uint32_t)numThreads);
-        }
-        ImGui::Checkbox("Disable Binning", &_rast->ForceDisableBinning);
+    glm::mat4 projMat = _cam.GetProjMatrix();
+    glm::mat4 viewMat = _cam.GetViewMatrix(true);
+    glm::mat4 projViewMat = projMat * viewMat;
 
-        ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0Metallic-Roughness\0Ambient Occlusion\0Emissive Mask\0Overdraw\0");
-        ImGui::SliderFloat("Exposure", &_shader->Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SliderFloat("IBL Intensity", &_shader->IntensityIBL, 0.0f, 1.0f, "%.2f");
-        ImGui::Checkbox("Hier-Z Occlusion", &s_HzbOcclusion);
-        if (ImGui::Checkbox("VSync", &s_VSync)) {
-            glfwSwapInterval(s_VSync ? 1 : 0);
-        }
+    ShadingContext shader = {
+        .Meshlets = _scene->Meshlets.data(),
+        .Materials = _scene->Materials.data(),
+        .Lights = _scene->Lights.data(),
+        .NumLights = _scene->Lights.size(),
+        .SkyboxTex = _skyboxTex.get(),
+        .ViewPos = _cam.ViewPosition,
+        .Exposure = s_Exposure,
+        .ShowPerfHeatmap = s_ShowPerfHeatmap,
+    };
 
-        ImGui::SeparatorText("Effects");
+    if (_scene->Lights.Storage.size() == 0) {
+        static Light light = {
+            .Type = Light::kTypeDirectional,
+            .Direction = glm::normalize(-float3(0.589494, 0.684509, 0.428906)),
+            .Color = float3(1, 1, 1),
+            .Intensity = 1500,
+        };
+        shader.Lights = &light;
+        shader.NumLights = 1;
+    }
 
-        ImGui::Checkbox("Shadow Mapping", &s_EnableShadows);
-        if (s_EnableShadows) {
-            ImGui::Indent();
-            ImGui::InputFloat("Range##Shadow", &s_ShadowRange, 0.5f);
-            if (ImGui::SliderInt("Resolution##Shadow", &s_ShadowRes, 128, 2048)) {
-                s_ShadowRes = (s_ShadowRes + 64) & ~127;
-            }
-            ImGui::Checkbox("Follow Camera", &s_ShadowFollowCam);
-            ImGui::Checkbox("Animate Sun", &s_AnimateLight);
-            ImGui::Unindent();
+    {
+        ZoneScopedN("ClearFb");
+        _fb->Clear(0xFF000000, 0.0f);
+    }
 
-            if (s_AnimateLight) {
-                static float time;
-                _lightPos = { 7.5, 16.5, sinf(time * 0.3f) * 10 };
-                time += ImGui::GetIO().DeltaTime;
-            }
-        }
+    uint32_t drawCalls = 0;
 
-        ImGui::Checkbox("Temporal AA", &_shader->EnableTAA);
-        ImGui::Checkbox("Blur Skybox", &_shader->BlurSkybox);
+    swr::ShaderDispatchTable dispatchTable;
+    if (s_EnableVisBuffer) {
+        dispatchTable = ShadingContext::GetVisBufferShader();
+    } else if (s_Layer == DebugLayer::Overdraw) {
+        dispatchTable = ShadingContext::GetOverdrawShader();
+    } else {
+        dispatchTable = ShadingContext::GetDeferredShader();
+    }
 
-        ImGui::SeparatorText("Misc");
-        ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+    for (auto& model : _scene->Models) {
+        for (auto& node : model->Nodes) {
+            if (node.MeshCount == 0) continue;
 
-        ImGui::End();
-
-        if (ImGui::IsKeyPressed(ImGuiKey_C)) {
-            _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
-        }
-        _cam.Update(Camera::GetInputsFromImGui());
-
-        SWR_PERF_BEGIN(Frame);
-
-        if (s_EnableShadows) {
-            SWR_PERF_BEGIN(Shadow);
-            RenderShadow(s_ShadowRes, s_ShadowRange, s_ShadowFollowCam);
-            SWR_PERF_END(Shadow);
-        }
-
-        glm::mat4 projMat = _cam.GetProjMatrix();
-        glm::mat4 viewMat = _cam.GetViewMatrix(true);
-
-        _shader->UpdateJitter(projMat, *_fb);  // add jitter to `projMat`
-
-        glm::mat4 projViewMat = projMat * viewMat;
-
-        _shader->ShadowBuffer = s_EnableShadows ? _shadowFb.get() : nullptr;
-        _shader->ShadowProjMat = _shadowProjMat;
-        _shader->ViewMat = viewMat;
-        _shader->LightPos = _lightPos;
-        _shader->ViewPos = _cam.ViewPosition;
-        _shader->Materials = _scene->Materials.data();
-
-        {
-            ZoneScopedN("ClearFb");
-
-            _fb->Clear(0xFF000000, 0.0f);
-            if (s_Layer == renderer::DebugLayer::Overdraw) {
-            } else {
-               //p _fb->ClearDepth(0.0f);
-            }
-        }
-
-        uint32_t drawCalls = 0;
-
-        _scene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
             ZoneScopedN("Draw Node");
-            _shader->ProjMat = projViewMat * modelMat;
-            _shader->ModelMat = modelMat;
-            _shader->Meshlets = &_scene->Meshlets[node.MeshletOffset];
+            shader.UpdateProj(projViewMat, node.GlobalTransform);
+            shader.MeshletOffset = node.MeshOffset;
 
-            _rast->DrawMeshlets(*_fb, node.MeshletCount, *_shader);
-
+            _rast->DrawMeshlets(*_fb, node.MeshCount, { dispatchTable, &shader });
             drawCalls++;
-            return true;
-        });
-        SWR_PERF_BEGIN(Compose);
-
-        _shader->ProjMat = projMat * _cam.GetViewMatrix(false);
-
-        if (s_Layer == renderer::DebugLayer::None) {
-            _shader->Compose(*_rast, *_fb, s_EnableSSAO);
-        } else if (s_Layer != renderer::DebugLayer::Overdraw) {
-        //    _shader->ComposeDebug(*_rast, *_fb, s_Layer);
         }
-
-        SWR_PERF_END(Compose);
-
-        {
-            ZoneScopedN("UploadFrameToGPU");
-            
-            GLuint pbo;
-            glCreateBuffers(1, &pbo);
-            glNamedBufferStorage(pbo, _fb->Width * _fb->Height * 4, nullptr, GL_MAP_WRITE_BIT);
-
-            uint32_t* pixels = (uint32_t*)glMapNamedBuffer(pbo, GL_WRITE_ONLY); // spec guarantees align >= 64
-            _fb->GetPixels(pixels, _fb->Width);
-            glUnmapNamedBuffer(pbo);
-
-            // This copy could be avoided by reading buffer data directly from shader, but this is good enough.
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-            glTextureSubImage2D(_fbTexture, 0, 0, 0, (GLsizei)_fb->Width, (GLsizei)_fb->Height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            glDeleteBuffers(1, &pbo);
-        }
-
-        SWR_PERF_END(Frame);
-
-        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
-        drawList->AddImage((ImTextureID)_fbTexture, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 0), ImVec2(1, 1));
-
-        swr::perf::FlushThreadCounters();
-
-        ImGui::Begin("Rasterizer Stats");
-        ImGui::Text("Frame: %.1fms (%.0f FPS), Shadow: %.1fms, Post: %.2fms",   //
-                    swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,   //
-                    1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),   //
-                    swr::perf::GetAverage(swr::PerfCounter::ShadowTime) / 1e6,  //
-                    swr::perf::GetAverage(swr::PerfCounter::ComposeTime) / 1e6);
-
-        ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",         //
-                    swr::perf::GetAverage(swr::PerfCounter::DrawTime) / 1e6,             //
-                    swr::perf::GetCurrent(swr::PerfCounter::TrianglesRasterized) / 1e3,  //
-                    swr::perf::GetCurrent(swr::PerfCounter::TrianglesProcessed) / 1e3,   //
-                    swr::perf::GetCurrent(swr::PerfCounter::TrianglesClipped) / 1e3,     //
-                    swr::perf::GetCurrent(swr::PerfCounter::BinQueueFlushes) / 1e3);
-        ImGui::End();
-
-        swr::perf::Reset();
-
-        // DrawTranslationGizmo(_lightPos);
     }
+    SWR_PERF_BEGIN(Resolve);
 
-    void RenderShadow(int size, float range, bool followCam) {
-        if (_shadowFb == nullptr || _shadowFb->Width != size) {
-            _shadowFb = std::make_unique<swr::Framebuffer>(size, size);
-        }
-
-        glm::vec3 centerPos = followCam ? glm::vec3(_cam.Position.x, 0, _cam.Position.z) : glm::vec3(0.0f);
-
-        _shadowProjMat = glm::ortho(-range, +range, -range, +range, 0.05f, 40.0f) * 
-                         glm::lookAt(centerPos + _lightPos, centerPos, glm::vec3(0, 1, 0));
-
-        _shadowFb->ClearDepth(1.0f);
-
-        auto activeScene = _shadowScene ? _shadowScene.get() : _scene.get();
-        // activeScene->Traverse([&](const scene::Node& node, const glm::mat4& modelMat) {
-        //     for (uint32_t meshId : node.Meshes) {
-        //         scene::Mesh& mesh = activeScene->Meshes[meshId];
-
-        //         _shadowRast->DrawMeshlets(100, renderer::DepthOnlyShader{ .ProjMat = _shadowProjMat * modelMat });
-        //     }
-        //     return true;
-        // });
-
-        ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
-        if (ImGui::Begin("Shadow Debug")) {
-            if (_shadowDebugTex == 0) _shadowDebugTex = CreateTexture(_shadowFb->Width, _shadowFb->Height, 1, GL_RGBA8);
-            auto buf = std::make_unique<uint32_t[]>(_shadowFb->Width * _shadowFb->Height);
-
-            for (uint32_t y = 0; y < _shadowFb->Height; y++) {
-                for (uint32_t x = 0; x < _shadowFb->Width; x++) {
-                    float d = _shadowFb->DepthBuffer[_shadowFb->GetPixelOffset(x, y)];
-                    uint32_t i = x + y * _shadowFb->Width;
-
-                    uint8_t c = (uint8_t)(glm::sqrt(1.0f - d * d) * 255.0f);
-                    buf[i] = c * 0x01'01'01 | 0xFF'000000;
-                }
-            }
-            glTextureSubImage2D(_shadowDebugTex, 0, 0, 0, (GLsizei)_shadowFb->Width, (GLsizei)_shadowFb->Height, GL_RGBA, GL_UNSIGNED_BYTE, buf.get());
-
-            ImGui::Image((ImTextureID)_shadowDebugTex, ImGui::GetContentRegionAvail(), ImVec2(0, 1), ImVec2(1, 0));
-        }
-        ImGui::End();
-    }
-
-    void RenderDebugHzb() {
-        if (ImGui::Begin("Depth Pyramid")) {
-            static int level = 0;
-            ImGui::SliderInt("Level", &level, 0, 12);
-
-            uint32_t w = _fb->Width >> level;
-            uint32_t h = _fb->Height >> level;
-            if (_shadowDebugTex == 0) _shadowDebugTex = CreateTexture(w, h, 1, GL_RGBA8);
-            auto buf = std::make_unique<uint32_t[]>(w * h);
-
-            for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    float d = 0;//  _depthPyramid.GetDepth(x / (float)(w - 1), y / (float)(h - 1), level);
-
-                    uint8_t c = (uint8_t)(glm::sqrt(1.0f - d * d) * 255.0f);
-                    buf[x + y * w] = c * 0x01'01'01 | 0xFF'000000;
-                }
-            }
-            glTextureSubImage2D(_shadowDebugTex, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, buf.get());
-
-            float s = 1.0f / (1 << level);
-            ImGui::Image((ImTextureID)_shadowDebugTex, ImGui::GetContentRegionAvail(), ImVec2(0, s), ImVec2(s, 0));
-        }
-        ImGui::End();
-    }
-
-    static GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
-        GLuint handle;
-        glCreateTextures(GL_TEXTURE_2D, 1, &handle);
-
-        glTextureStorage2D(handle, (GLsizei)mipLevels, fmt, (GLsizei)width, (GLsizei)height);
-
-        glTextureParameteri(handle, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTextureParameteri(handle, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-        glTextureParameteri(handle, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTextureParameteri(handle, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        return handle;
-    }
-
-    void DrawTranslationGizmo(glm::vec3& pos) {
-        ImGuizmo::BeginFrame();
-
-        ImGuiIO& io = ImGui::GetIO();
-        ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
-
-        glm::mat4 projMat = _cam.GetProjMatrix();
-        glm::mat4 viewMat = _cam.GetViewMatrix(true);
-        float matrix[16];
-        float temp[3]{ 1.0f, 1.0f, 1.0f };
-        ImGuizmo::RecomposeMatrixFromComponents(&pos.x, temp, temp, matrix);
-
-        if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
-            ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, temp, temp);
+    if (s_EnableVisBuffer && s_Layer != DebugLayer::Overdraw) {
+        if (s_Layer == DebugLayer::None) {
+            shader.Resolve(*_rast, *_fb);
+        } else {
+            shader.ResolveDebug(*_rast, *_fb, s_Layer);
         }
     }
 
-    static void SearchFiles(std::string_view basePath, std::vector<std::filesystem::path>& dest, const std::vector<std::string_view>& extensions) {
-        for (auto& entry : std::filesystem::recursive_directory_iterator(basePath)) {
-            if (!entry.is_regular_file()) continue;
+    SWR_PERF_END(Resolve);
 
-            for (auto& ext : extensions) {
-                if (entry.path().extension().compare(ext) == 0) {
-                    dest.push_back(entry.path());
-                    break;
-                }
-            }
-        }
+    {
+        ZoneScopedN("UploadFrameToGPU");
+        
+        GLuint pbo;
+        glCreateBuffers(1, &pbo);
+        glNamedBufferStorage(pbo, _fb->Width * _fb->Height * 4, nullptr, GL_MAP_WRITE_BIT);
+
+        uint32_t* pixels = (uint32_t*)glMapNamedBuffer(pbo, GL_WRITE_ONLY); // spec guarantees align >= 64
+        _fb->GetPixels(0, pixels, _fb->Width);
+        glUnmapNamedBuffer(pbo);
+
+        // This copy could be avoided by reading buffer data directly from shader, but this is good enough.
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        glTextureSubImage2D(_fbTexture, 0, 0, 0, (GLsizei)_fb->Width, (GLsizei)_fb->Height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glDeleteBuffers(1, &pbo);
     }
+
+    SWR_PERF_END(Frame);
+
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    drawList->AddImage((ImTextureID)_fbTexture, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 0), ImVec2(1, 1));
+
+    swr::perf::FlushThreadCounters();
+
+    ImGui::Begin("Rasterizer Stats");
+    ImGui::Text("Frame: %.1fms (%.0f FPS), Resolve: %.2fms",   //
+                swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,   //
+                1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),   //
+                // swr::perf::GetAverage(swr::PerfCounter::ShadowTime) / 1e6,  //
+                swr::perf::GetAverage(swr::PerfCounter::ResolveTime) / 1e6);
+
+    ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",         //
+                swr::perf::GetAverage(swr::PerfCounter::DrawTime) / 1e6,             //
+                swr::perf::GetCurrent(swr::PerfCounter::TrianglesRasterized) / 1e3,  //
+                swr::perf::GetCurrent(swr::PerfCounter::TrianglesProcessed) / 1e3,   //
+                swr::perf::GetCurrent(swr::PerfCounter::TrianglesClipped) / 1e3,     //
+                swr::perf::GetCurrent(swr::PerfCounter::BinQueueFlushes) / 1e3);
+    ImGui::End();
+
+    swr::perf::Reset();
+
+    // DrawTranslationGizmo(_lightPos);
+}
+
 };
 
 int main(int argc, char** args) {
     if (!glfwInit()) return -1;
+    NFD_Init();
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
 
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Glimpsw", NULL, NULL);
-    if (!window) {
+    _window = glfwCreateWindow(1280, 720, "Glimpsw", NULL, NULL);
+    if (!_window) {
         glfwTerminate();
         return -1;
     }
 
-    glfwMakeContextCurrent(window);
+    glfwMakeContextCurrent(_window);
     glfwSwapInterval(1); // Enable vsync
 
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
@@ -422,16 +298,16 @@ int main(int argc, char** args) {
     io.IniFilename = "logs/imgui.ini";
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    io.Fonts->AddFontFromFileTTF("assets/Roboto-Medium.ttf", 18.0f);
+    io.Fonts->AddFontFromFileTTF("assets/Roboto-Medium.ttf", 16.0f);
 
     ImGui::StyleColorsDark();
 
-    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplGlfw_InitForOpenGL(_window, true);
     ImGui_ImplOpenGL3_Init();
 
-    SwRenderer renderer;
+    InitRenderer();
 
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(_window)) {
         glfwPollEvents();
 
         // Start the Dear ImGui frame
@@ -443,32 +319,35 @@ int main(int argc, char** args) {
             static int winRect[4];
             GLFWmonitor* monitor = glfwGetPrimaryMonitor();
 
-            if (!glfwGetWindowMonitor(window)) {
-                glfwGetWindowPos(window, &winRect[0], &winRect[1]);
-                glfwGetWindowSize(window, &winRect[2], &winRect[3]);
+            if (!glfwGetWindowMonitor(_window)) {
+                glfwGetWindowPos(_window, &winRect[0], &winRect[1]);
+                glfwGetWindowSize(_window, &winRect[2], &winRect[3]);
 
                 const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-                glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, 0);
+                glfwSetWindowMonitor(_window, monitor, 0, 0, mode->width, mode->height, 0);
             } else {
-                glfwSetWindowMonitor(window, nullptr, winRect[0], winRect[1], winRect[2], winRect[3], 0);
+                glfwSetWindowMonitor(_window, nullptr, winRect[0], winRect[1], winRect[2], winRect[3], 0);
             }
             glfwSwapInterval(1);
         }
 
         int display_w, display_h;
-        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glfwGetFramebufferSize(_window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
         glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        renderer.Render();
+        RenderFrame();
 
         // Rendering
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        glfwSwapBuffers(window);
+        glfwSwapBuffers(_window);
     }
+    glDeleteTextures(1, &_fbTexture);
+
+    NFD_Quit();
     glfwTerminate();
     return 0;
 }

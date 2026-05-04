@@ -1,11 +1,8 @@
 #pragma once
 
-#include <cfloat>
 #include <vector>
 
 #include "Texture.h"
-
-namespace scene {
 
 struct Material {
     // Layer 0: BaseColor
@@ -15,56 +12,136 @@ struct Material {
     bool IsDoubleSided;
     uint8_t AlphaCutoff;
 };
-
-struct Node {
-    std::vector<Node> Children;
-    uint32_t MeshletOffset = 0, MeshletCount = 0;
-    glm::mat4 LocalTransform = glm::mat4(1);
-    glm::mat4 GlobalTransform = glm::mat4(1);
-    glm::vec3 BoundMin = glm::vec3(FLT_MAX);
-    glm::vec3 BoundMax = glm::vec3(-FLT_MAX);
-};
 struct Meshlet {
-    glm::vec4 BoundSphere;
+    glm::vec3 BoundCenter;
+    float BoundRadius;
     glm::vec3 ConeApex, ConeAxis;
     float ConeCutoff;
 
-    uint16_t NumVertices, NumTriangles;
-    uint32_t MaterialId;
+    uint8_t NumVertices, NumTriangles;
     uint8_t AlphaCutoff;
+    uint32_t MaterialId;
+    uint64_t TangentHandedness;
 
     alignas(64) float Positions[3][64];
     uint32_t TexCoords[64];                // float16
-    uint32_t Normals[64];                  // unorm10
-    uint32_t Tangents[64];                 // unorm10, handedness
+    uint32_t NormalTangents[64];           // oct16 x2
     uint8_t Indices[3][128];
 };
 
-struct Model {
-    std::string BasePath;
+struct TransformTRS {
+    float3 Translation = {};
+    float3 Scale = {};
+    float4 Rotation = {};
 
-    std::vector<Material> Materials;
-    std::vector<swr::RgbaTexture2D::Ptr> Textures;
+    bool HasValue() const { return Scale.x != 0; }
+    float4x4 ToMatrix() const;
+};
 
-    std::vector<Meshlet> Meshlets;
+struct ModelNode {
+    uint32_t MeshOffset, MeshCount;
+    uint32_t ParentIdx;
 
-    Node RootNode;
+    std::vector<uint32_t> Joints;
+    std::vector<glm::mat4x3> InverseBindMatrices;
+    TransformTRS LocalTRS;
+    glm::mat4x3 LocalTransform;
+    glm::mat4x3 GlobalTransform;
+};
 
-    Model(const std::string& path);
+struct Light {
+    enum LightType : uint32_t { kTypeDirectional, kTypePoint, kTypeSpot };
 
-    void Traverse(const auto& visitor, const glm::mat4& _parentMat = glm::mat4(1.0f), Node* _node = nullptr) {
-        if (_node == nullptr) {
-            _node = &RootNode;
-        }
+    LightType Type;
+    glm::vec3 Position;
+    glm::vec3 Direction;
+    glm::vec3 Color;
+    float Intensity;  // cd or lux
+    float Radius;
+    float SpotInnerAngle, SpotOuterAngle;
 
-        glm::mat4 localMat = _node->LocalTransform * _parentMat;
+    float InvRadiusSq, SpotScale, SpotOffset;  // Pre-computed
 
-        if (_node->MeshletCount > 0 && !visitor(*_node, localMat)) return;
-
-        for (Node& child : _node->Children) {
-            Traverse(visitor, localMat, &child);
-        }
+    void SetRadius(float radius) {
+        Radius = radius > 0 ? radius : 1e+6; 
+        InvRadiusSq = 1.0f / (Radius * Radius);
+    }
+    void SetSpotAngles(float innerAngle, float outerAngle) {
+        SpotInnerAngle = innerAngle;
+        SpotOuterAngle = outerAngle;
+        SpotScale = 1.0f / std::max(std::cos(innerAngle) - std::cos(outerAngle), 1e-4f);
+        SpotOffset = -std::cos(outerAngle) * SpotScale;
     }
 };
 
-};  // namespace scene
+struct Animation;
+struct Scene;
+
+struct Model {
+    Scene* ParentScene;
+    std::vector<Animation> Animations;
+
+    std::vector<ModelNode> Nodes;
+    std::vector<uint32_t> NodeIndicesPreDFS;
+
+    ModelNode RootNode;
+
+    ~Model();
+};
+
+template<typename T>
+struct FlatPool {
+    std::vector<T> Storage;
+
+    T& operator[](uint32_t i) { return Storage[i]; }
+    const T& operator[](uint32_t i) const { return Storage[i]; }
+
+    FlatPool(size_t initialCap = 4) { Storage.reserve(initialCap); }
+
+    // TODO: do better
+    uint32_t AllocRange(uint32_t count) {
+        uint32_t offset = Storage.size();
+        Storage.resize(offset + count);
+        return offset;
+    }
+    void FreeRange(uint32_t offset, uint32_t count) {
+        if (offset + count == Storage.size()) {
+            Storage.resize(offset);
+        }
+    }
+
+    T* data() { return Storage.data(); }
+    uint32_t size() const { return Storage.size(); }
+};
+
+struct Scene {
+    FlatPool<Meshlet> Meshlets;
+    FlatPool<Light> Lights;
+    FlatPool<Material> Materials;
+    std::vector<swr::RgbaTexture2D::Ptr> Textures;
+
+    std::vector<std::unique_ptr<Model>> Models;
+
+    Scene() : Meshlets(128 * 1024), Lights(1024), Materials(1024) {}
+
+    Model* ImportGltf(const std::string& path);
+};
+
+struct Animation {
+    enum LerpMode : uint8_t { kLerpNearest, kLerpLinear, kLerpSlerp, kLerpCubic };
+    struct Sampler {
+        uint32_t LastFrameIndex;
+        uint32_t FrameCount;
+        uint32_t DataOffset;
+        LerpMode LerpMode;
+    };
+    struct Channel {
+        Sampler SamplerTRS[3] = {};  // one per T/R/S
+    };
+    std::vector<Channel> Channels;
+    std::vector<uint32_t> NodeToChannelMap; // UINT_MAX if empty
+    std::vector<float> KeyframeData;
+    float Duration = 0;
+
+    void Interpolate(float timestamp, uint32_t channelIdx, TransformTRS& transform);
+};

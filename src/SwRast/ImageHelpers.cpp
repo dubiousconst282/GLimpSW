@@ -80,7 +80,6 @@ HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLe
         .Wrap = WrapMode::Repeat,
         .MagFilter = FilterMode::Linear,
         .MinFilter = FilterMode::Linear,
-        .CalcMipFromDerivs = false,
     };
 
     float scaleUV = 1.0f / (faceSize - 1);
@@ -96,7 +95,7 @@ HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLe
                 v[i] = asinf(-dir.y[i]) / simd::pi + 0.5f;
             }
 
-            v_float3 tile = panoTex->Sample<PanoSampler>(u, v);
+            v_float3 tile = panoTex->SampleLevel<PanoSampler>(u, v, 0, 0);
             cubeTex->WriteTile(tile, x, y);
         }
     }
@@ -107,18 +106,19 @@ HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLe
 
 };  // namespace texutil
 
-void Framebuffer::GetPixels(uint32_t* dest, uint32_t stride) const {
+void Framebuffer::GetPixels(uint32_t layerIdx, uint32_t* dest, uint32_t stride) const {
     assert(((uintptr_t)dest % 64) == 0);
 
     for (uint32_t y = 0; y < Height; y += 4) {
         uint32_t x = 0;
+        const uint32_t* src = GetLayerData<uint32_t>(layerIdx) + GetPixelOffset(x, y);
 
         // 30% faster than copying one tile at a time, limited by mem bw
-        for (; x + 15 < Width; x += 16) {
-            __m512i tileA = _mm512_load_si512(&ColorBuffer[GetPixelOffset(x + 0, y)]);
-            __m512i tileB = _mm512_load_si512(&ColorBuffer[GetPixelOffset(x + 4, y)]);
-            __m512i tileC = _mm512_load_si512(&ColorBuffer[GetPixelOffset(x + 8, y)]);
-            __m512i tileD = _mm512_load_si512(&ColorBuffer[GetPixelOffset(x + 12, y)]);
+        for (; x + 15 < Width; x += 16, src += 64) {
+            __m512i tileA = _mm512_load_si512(src + 0);
+            __m512i tileB = _mm512_load_si512(src + 16);
+            __m512i tileC = _mm512_load_si512(src + 32);
+            __m512i tileD = _mm512_load_si512(src + 48);
 
             __m512i AB01 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(1, 0, 1, 0));
             __m512i AB23 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(3, 2, 3, 2));
@@ -135,8 +135,8 @@ void Framebuffer::GetPixels(uint32_t* dest, uint32_t stride) const {
             _mm512_stream_si512(&dest[(y + 2) * stride + x], row2);
             _mm512_stream_si512(&dest[(y + 3) * stride + x], row3);
         }
-        for (; x < Width; x += 4) {
-            __m512i tile = _mm512_load_si512(&ColorBuffer[GetPixelOffset(x, y)]);
+        for (; x < Width; x += 4, src += 16) {
+            __m512i tile = _mm512_load_si512(src);
             _mm_stream_si128(&dest[(y + 0) * stride + x], _mm512_extracti32x4_epi32(tile, 0));
             _mm_stream_si128(&dest[(y + 1) * stride + x], _mm512_extracti32x4_epi32(tile, 1));
             _mm_stream_si128(&dest[(y + 2) * stride + x], _mm512_extracti32x4_epi32(tile, 2));

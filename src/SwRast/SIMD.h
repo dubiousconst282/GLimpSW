@@ -4,7 +4,7 @@
 #include <memory>
 #include <type_traits>
 
-#include <glm/mat4x4.hpp>
+#include <glm/glm.hpp>
 
 #include <immintrin.h>
 
@@ -81,7 +81,7 @@ struct mdvec<T, 3> {
     SIMD_INLINE constexpr mdvec() = default;
     SIMD_INLINE constexpr mdvec(T v_) : x(v_), y(v_), z(v_) {}
     SIMD_INLINE constexpr mdvec(T x_, T y_, T z_) : x(x_), y(y_), z(z_) {}
-    SIMD_INLINE constexpr mdvec(mdvec<T, 2> v_, T z_ = 0) : x(v_.x), y(v_.y), z(z_) {}
+    SIMD_INLINE constexpr mdvec(mdvec<T, 2> v_, T z_) : x(v_.x), y(v_.y), z(z_) {}
     SIMD_INLINE constexpr mdvec(const glm::vec<3, elem_type<T>>& v_) : x(v_.x), y(v_.y), z(v_.z) {}
     SIMD_INLINE explicit constexpr mdvec(const mdvec<T, 4>& v_) : x(v_.x), y(v_.y), z(v_.z) {}
 
@@ -104,8 +104,8 @@ struct mdvec<T, 4> {
     SIMD_INLINE constexpr mdvec() = default;
     SIMD_INLINE constexpr mdvec(T v_) : x(v_), y(v_), z(v_), w(v_) {}
     SIMD_INLINE constexpr mdvec(T x_, T y_, T z_, T w_) : x(x_), y(y_), z(z_), w(w_) {}
-    SIMD_INLINE constexpr mdvec(mdvec<T, 2> v_, T z_ = 0, T w_ = 0) : x(v_.x), y(v_.y), z(z_), w(w_) {}
-    SIMD_INLINE constexpr mdvec(mdvec<T, 3> v_, T w_ = 0) : x(v_.x), y(v_.y), z(v_.z), w(w_) {}
+    SIMD_INLINE constexpr mdvec(mdvec<T, 2> v_, T z_, T w_) : x(v_.x), y(v_.y), z(z_), w(w_) {}
+    SIMD_INLINE constexpr mdvec(mdvec<T, 3> v_, T w_) : x(v_.x), y(v_.y), z(v_.z), w(w_) {}
     SIMD_INLINE constexpr mdvec(const glm::vec<4, elem_type<T>>& v_) : x(v_.x), y(v_.y), z(v_.z), w(v_.w) {}
 
     SIMD_INLINE T& operator[](size_t idx) {
@@ -143,6 +143,20 @@ using v_uint2 = simd::mdvec<v_uint, 2>;
 using v_uint3 = simd::mdvec<v_uint, 3>;
 using v_uint4 = simd::mdvec<v_uint, 4>;
 
+// TODO: maybe nuke GLM with ext_vector_type
+using float2 = glm::vec2;
+using float3 = glm::vec3;
+using float4 = glm::vec4;
+using float4x4 = glm::mat4x4;
+
+using int2 = glm::ivec2;
+using int3 = glm::ivec3;
+using int4 = glm::ivec4;
+
+using uint2 = glm::uvec2;
+using uint3 = glm::uvec3;
+using uint4 = glm::uvec4;
+
 namespace simd {
 
 #define SIMD_TFN_ANY template<is_vector T> SIMD_INLINE
@@ -159,7 +173,8 @@ constexpr T lane_idx = (                              //
 
 //////////////////////////////////////// Memory ////////////////////////////////////////
 
-SIMD_TFN_ANY T load(const void* ptr) {
+template<typename T>
+SIMD_INLINE T load(const void* ptr) {
     // This minimizes spills at -O0 compared to memcpy.
     struct [[gnu::packed, gnu::may_alias]] load_buf { T v; };
     return ((const load_buf*)ptr)->v;
@@ -169,9 +184,10 @@ SIMD_INLINE vec<E, N> load(const E* ptr) {
     return load<vec<E, N>>(ptr);
 }
 
-SIMD_TFN_ANY void store(void* ptr, const T& vec) {
+template<typename T>
+SIMD_INLINE void store(void* ptr, const T& value) {
     struct [[gnu::packed, gnu::may_alias]] load_buf { T v; };
-    ((load_buf*)ptr)->v = vec;
+    ((load_buf*)ptr)->v = value;
 }
 
 SIMD_TFN_ANY T gather(const void* ptr, mask_vec<T> idx, vec<bool, width_of<T>> mask = true) {
@@ -304,6 +320,17 @@ SIMD_INLINE v_float max_abs(v_float x, v_float y) { return _mm512_range_ps(x, y,
 SIMD_TFN_INT T add_sat(T x, T y) { return __builtin_elementwise_add_sat(x, y); }
 SIMD_TFN_INT T sub_sat(T x, T y) { return __builtin_elementwise_sub_sat(x, y); }
 
+// y < 0 ? -x : x
+SIMD_INLINE v_float mulsign(v_float x, v_float y) {
+    // return as<float>(as<uint32_t>(x) ^ (as<uint32_t>(y) & 0x8000'0000));
+    return _mm512_ternarylogic_epi32(x, y, v_uint(0x7FFF'FFFF), _MM_TERNLOG_A ^ (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
+}
+// s < 0 ? -abs(x) : abs(x)
+SIMD_INLINE v_float copysign(v_float x, v_float s) {
+    // return as<float>((as<uint32_t>(x) & 0x7FFF'FFFF) | (as<uint32_t>(s) & 0x8000'0000));
+    return _mm512_ternarylogic_epi32(x, s, v_uint(0x7FFF'FFFF), (_MM_TERNLOG_A & _MM_TERNLOG_C) | (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
+}
+
 template<typename R, is_vector T>
 SIMD_INLINE constexpr vec<R, width_of<T>> conv(T x) {
     return __builtin_convertvector(x, vec<R, width_of<T>>);
@@ -328,7 +355,7 @@ SIMD_INLINE constexpr vec<R, width_of<T>> conv_sat(T x) {
 }
 
 template<typename Dst, typename Src>
-SIMD_INLINE Dst as(Src x) { return __builtin_bit_cast(Dst, x); }
+SIMD_INLINE constexpr Dst as(Src x) { return __builtin_bit_cast(Dst, x); }
 
 template<typename Dst, typename Src, int N>
 SIMD_INLINE vec<Dst, sizeof(Src) * N / sizeof(Dst)> as(vec<Src, N> x) {
@@ -359,7 +386,7 @@ SIMD_INLINE v_float2 sincos_2pi(v_float x) {
 
     v_float r_sin = fma(x2, fma(x2, fma(x2, -70.993433272f, 81.340768887f), -41.337142371f), 6.283164044f) * x1;
     v_float r_cos = fma(x2, fma(x2, fma(x2, -78.216131988f, 64.660541218f), -19.735752060f), 0.999993295f);
-    r_cos = as<float>(as<uint32_t>(r_cos) | (as<uint32_t>(x) & 0x8000'0000u));
+    r_cos = mulsign(r_cos, x);
 
     return v_float2(r_sin, r_cos);
 }
@@ -410,17 +437,6 @@ SIMD_INLINE v_float smoothstep(v_float a, v_float b, v_float t) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-// y < 0 ? -x : x
-SIMD_INLINE v_float mulsign(v_float x, v_float y) {
-    // return as<float>(as<uint32_t>(x) ^ (as<uint32_t>(y) & 0x8000'0000));
-    return _mm512_ternarylogic_epi32(x, y, v_uint(0x7FFF'FFFF), _MM_TERNLOG_A ^ (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
-}
-// s < 0 ? -abs(x) : abs(x)
-SIMD_INLINE v_float copysign(v_float x, v_float s) {
-    // return as<float>((as<uint32_t>(x) & 0x7FFF'FFFF) | (as<uint32_t>(s) & 0x8000'0000));
-    return _mm512_ternarylogic_epi32(x, s, v_uint(0x7FFF'FFFF), (_MM_TERNLOG_A & _MM_TERNLOG_C) | (_MM_TERNLOG_B & ~_MM_TERNLOG_C));
-}
-
 SIMD_INLINE v_float4 mul(const glm::mat4& m, const v_float4& v) {
     return {
         fma(v.x, m[0][0], fma(v.y, m[1][0], fma(v.z, m[2][0], v.w * m[3][0]))),
@@ -444,35 +460,11 @@ SIMD_INLINE v_float4 perspective_div(const v_float4& v) {
 
 //////////////////////////////////////// Bitwise ////////////////////////////////////////
 
-SIMD_TFN_INT T popcnt(T x) { return __builtin_elementwise_popcount(x); }
-
-SIMD_INLINE v_uint lzcnt(v_uint x) {
-#if __AVX512CD__
-    return _mm512_lzcnt_epi32(x);
-#else
-    // https://stackoverflow.com/a/58827596
-    x = x & ~(x >> 8);                              // keep 8 MSB, prevent value from being rounded up to the next power of two
-    x = as<uint32_t>(conv<float>((v_int)x)) >> 23;  // convert to float and get exponent
-    x = (127 + 31) - x;                             // undo bias
-    x = min(x, 32);                                 // clamp at 32
-    return x;
-#endif
-}
-
 // https://en.wikipedia.org/wiki/Find_first_set#Properties_and_relations
-// tzcnt(x) = 31 - lzcnt(x & -x)     (for x != 0)
-//          = popcnt((x & -x) - 1)   (AVX512 popcnt 3c vs lzcnt 4c latency, avoids const load from mem)
-SIMD_INLINE v_uint tzcnt(v_uint x) {
-#if __AVX512VPOPCNTDQ__
-    return popcnt((x & -x) - 1);
-#else
-    x = (x & -x);
-    // rounding does not affect results here because (x & -x) is a power of two
-    x = as<uint32_t>(conv<float>(x)) >> 23;  // convert to float and get exponent
-    x = min(x - 127, 32);                    // clamp at 32. unsigned min handles x==0 -> 32
-    return x;
-#endif
-}
+// https://stackoverflow.com/a/58827596
+SIMD_TFN_INT T popcnt(T x) { return __builtin_elementwise_popcount(x); }
+SIMD_TFN_INT T lzcnt(T x) { return __builtin_elementwise_clzg(x); }
+SIMD_TFN_INT T tzcnt(T x) { return __builtin_elementwise_ctzg(x); }
 
 template<std::integral T>
 SIMD_INLINE constexpr uint32_t popcnt(T value) {

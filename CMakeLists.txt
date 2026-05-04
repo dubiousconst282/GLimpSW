@@ -18,9 +18,12 @@ CPMAddPackage("gh:g-truc/glm#1.0.1")
 CPMAddPackage("gh:nothings/stb#master")
 
 CPMAddPackage("gh:jkuhlmann/cgltf#v1.15")
-CPMAddPackage("gh:zeux/meshoptimizer#v1.0")
+CPMAddPackage("gh:zeux/meshoptimizer#v1.1")
 
 CPMAddPackage("gh:martinus/nanobench#v4.3.11")
+
+set(NFD_PORTAL ON)
+CPMAddPackage("gh:btzy/nativefiledialog-extended#v1.3.0")
 
 set(TRACY_ON_DEMAND ON)
 CPMAddPackage("gh:wolfpld/tracy#v0.13.1")
