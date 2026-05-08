@@ -62,8 +62,7 @@ void LoadSkybox(const std::string& path) {
 }
 
 void InitRenderer() {
-    //LoadScene("assets/models/Sponza/Sponza.gltf");
-    LoadScene("../GraphicsAssets/Sponza_Lights.glb");
+    LoadScene("assets/models/Sponza/Sponza.gltf");
     LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
 
     _cam = Camera{ .Position = {9.6753334456680022, 1.1288966350423235, -0.48801679478492588}, .Euler = {-1.58308733, -0.608505249}, .MoveSpeed = 5.0f };

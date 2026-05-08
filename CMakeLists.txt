@@ -34,7 +34,7 @@ target_include_directories(glad PUBLIC deps/glad/include/)
 
 # ImGui
 CPMAddPackage("gh:ocornut/imgui#v1.92.7")
-CPMAddPackage("gh:CedricGuillemet/ImGuizmo#master")
+CPMAddPackage("gh:CedricGuillemet/ImGuizmo#1.9")
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -46,12 +46,12 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     
-    ${ImGuizmo_SOURCE_DIR}/ImGuizmo.cpp
+    ${ImGuizmo_SOURCE_DIR}/src/ImGuizmo.cpp
 )
 target_include_directories(imgui PUBLIC 
     ${imgui_SOURCE_DIR} 
     ${imgui_SOURCE_DIR}/backends
-    ${ImGuizmo_SOURCE_DIR}
+    ${ImGuizmo_SOURCE_DIR}/src
 )
 target_compile_definitions(imgui PUBLIC -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 target_link_libraries(imgui PRIVATE glfw)

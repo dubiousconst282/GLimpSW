@@ -97,14 +97,14 @@ The rest of the pipeline is pretty traditional, with a few details I find intere
 ### Quad Inefficiency
 The rasterizer maps the 16 SIMD lanes into 4x4 pixel fragments. This works reasonably well, but suffers from the characteristic quad utilization problem, where small triangles will cover very few lanes.
 
-Measuring render times on Bistro after skipping triangles of certain sizes shows that the timings are very much lead by pixel count: 75% of all tris are smaller than 12x12 pixels on either axes, and the overall average is ~28ns per small triangle and ~200ns for larger tris.
+Still, measuring render times on Bistro after skipping triangles of certain sizes shows that the timings are very much lead by pixel count: 75% of all tris are smaller than 12x12 pixels on either axes, and the overall average is ~28ns per small triangle and ~200ns for larger tris.
 
-Fragment lane usage is indeed pretty bad even before the depth test, averaging at 11-14% for small, and 40-60% for large-ish tris. Looking at the floor brings it up to 80-95%. It's unclear whether rasterizing multiple triangles per SIMD would improve efficiency, due to the overhead in gathering and scattering framebuffer data while also handling conflicts.
+Fragment lane usage is indeed pretty bad even before the depth test, averaging at 11-14% for small, and 40-60% for large-ish tris. Looking at the floor brings it up to 80-95%. It's unclear whether rasterizing multiple triangles per SIMD would improve throughput considerably, due to the overhead in gathering and scattering framebuffer data while also handling conflicts.
 
 Both overdraw and the quad utilization issue can be mitigated by moving complexity out of the fragment shader using a vis-buffer. On Sponza, the complete raster+resolve passes take around 0.8-1.2x as long as just the deferred raster pass [TODO: more detailed comparison].
 
 ### Coarse Raster
-The rasterizer uses a basic bounding-box traversal to step over the triangle, which results in many redundant steps over empty space for larger triangles. These could be avoided with [one of the many smarter traversal algorithms]((https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/)), but some profiling shows traversal is also not as problematic as it seems in theory: on a view with a bunch of moderately large tris, only ~14% of time is spent on the edge stepping loop for the vis-buffer shader which writes only the depth and surface ID:
+The rasterizer uses a basic bounding-box traversal to step over the triangle, which results in many redundant steps over empty space for larger triangles. These could be avoided with [one of the many smarter traversal algorithms](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/), but some profiling shows traversal is also not as problematic as it seems in theory: on a view with a bunch of moderately large tris, only ~14% of time is spent on the edge stepping loop for the vis-buffer shader which writes only the depth and surface ID:
 
 <div align="center"> 
   <img width="400" alt="coarse_profile_drawtri" src="https://github.com/user-attachments/assets/43e2b3a1-8812-4168-baa6-5b3d235e9231" />
@@ -207,8 +207,10 @@ Constant folding and other compiler optimizations may introduce redundant consta
 The project uses CMake and CPM for build and dependency management. It depends on Clang's vector type extension and various related intrinsics.
 
 ```
-cmake -S ./src/SwRast -B ./build/ -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
-cmake --build ./build/ --config RelWithDebInfo
+cmake -S . -B ./build/ -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build ./build/
+
+./build/src/SwRast/Playground
 ```
 
 ## Useful/interesting refs

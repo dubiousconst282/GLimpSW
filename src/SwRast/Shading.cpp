@@ -82,7 +82,7 @@ v_float3 PrefilterDiffuseIrradiance(const swr::HdrTexture2D& envTex, v_float3 N)
     float deltaTheta = halfPi / 90.0;
 
 #ifndef NDEBUG
-    deltaPhi = twoPi / 16.0;
+    deltaPhi = simd::tau / 16.0;
     deltaTheta = halfPi / 4.0;
 #endif
 

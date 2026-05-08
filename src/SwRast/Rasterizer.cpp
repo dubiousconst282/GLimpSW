@@ -183,25 +183,25 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
                     v_mask acceptMask = tris.Setup(v0, v1, v2, vpHalfSize, mesh.CullMode);
                     acceptMask &= cc.AcceptMask;
 
-                    if (acceptMask == 0) continue;
+                    if (acceptMask != 0) {
+                        v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                        v_uint extent = boundBox.y - boundBox.x;
 
-                    v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
-                    v_uint extent = boundBox.y - boundBox.x;
+                        TriangleEdgeVars vars;
+                        vars.Setup(tris, vpHalfSize);
 
-                    TriangleEdgeVars vars;
-                    vars.Setup(tris, vpHalfSize);
+                        vars.MeshletId = meshIdx;
+                        vars.BasePrimId = primOffset;
+                        memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                        memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                        memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                    vars.MeshletId = meshIdx;
-                    vars.BasePrimId = primOffset;
-                    memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                    memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                    memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
-
-                    for (uint32_t i : simd::BitIter(acceptMask)) {
-                        uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                        shader.Dispatch.DrawFn(shader.Context, fb, vars, i, boundRect);
+                        for (uint32_t i : simd::BitIter(acceptMask)) {
+                            uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
+                            shader.Dispatch.DrawFn(shader.Context, fb, vars, i, boundRect);
+                        }
+                        SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
                     }
-                    SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
                 }
 
                 if (cc.NonTrivialMask != 0 && EnableClipping) [[unlikely]] {
