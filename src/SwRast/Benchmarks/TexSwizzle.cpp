@@ -144,7 +144,7 @@ int main(int argc, const char** args) {
     camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = { fb->Width, fb->Height } }, 0);
 
     auto projMat = camera.GetProjMatrix() * camera.GetViewMatrix(true);
-    auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels, ShadingContext>();
+    auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels>();
 
     fb->Clear(0, 0);
 

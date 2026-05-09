@@ -88,7 +88,7 @@ int main(int argc, const char** args) {
         auto shaderCtx = ShadingContext{
             .Materials = scene.Materials.data(),
         };
-        auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels, ShadingContext>();
+        auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels>();
 
         fb->Clear(0, 0);
 

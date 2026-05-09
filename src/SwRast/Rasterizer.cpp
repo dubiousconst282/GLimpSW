@@ -158,7 +158,7 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
     _runner->Dispatch([&](uint32_t workerId) {
         for (uint32_t meshIdx = workerId; meshIdx < count; meshIdx += _runner->GetThreadCount()) {
             ShadedMeshlet mesh;
-            shader.Dispatch.MeshFn(shader.Context, meshIdx, mesh);
+            shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
             if (mesh.PrimCount == 0) continue;
 
             SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
@@ -196,9 +196,11 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
                         memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
                         memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
+                        auto drawFn = shader.Dispatch.DrawTriangle[mesh.FragmentShaderId];
+
                         for (uint32_t i : simd::BitIter(acceptMask)) {
                             uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                            shader.Dispatch.DrawFn(shader.Context, fb, vars, i, boundRect);
+                            drawFn(shader.Context, fb, vars, i, boundRect);
                         }
                         SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
                     }
@@ -236,10 +238,11 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
                         memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
                         v_mask drawMask = clipValidMask[i / simd::vec_width];
+                        auto drawFn = shader.Dispatch.DrawClippedTriangle[mesh.FragmentShaderId];
 
                         for (uint32_t i : simd::BitIter(drawMask)) {
                             uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                            shader.Dispatch.DrawClippedFn(shader.Context, fb, vars, i, boundRect);
+                            drawFn(shader.Context, fb, vars, i, boundRect);
                         }
                         SWR_PERF_INC(TrianglesRasterized, simd::popcnt(drawMask));
                     }
@@ -536,7 +539,7 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, ShaderBinding
                 nextMeshIdx += _queue->NumWorkers;
                 meshJobs++;
 
-                shader.Dispatch.MeshFn(shader.Context, meshIdx, mesh);
+                shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
                 if (mesh.PrimCount == 0) continue;
 
                 SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
@@ -577,6 +580,7 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, ShaderBinding
 
                     tris.MeshletId = meshIdx;
                     tris.BasePrimId = primOffset;
+                    tris.FragmentShaderId = mesh.FragmentShaderId;
                     memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
                     memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
                     memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
@@ -722,10 +726,12 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t bi
                 assert((simd::movemask(x0 > x1 || y0 > y1) & acceptMask) == 0);
             }
 
+            auto drawFn = shader.Dispatch.DrawTriangle[tris.FragmentShaderId];
+
             for (uint32_t j : simd::BitIter(acceptMask)) {
                 // clang sometimes emits full vector reload when indexing (only for local vars?)
                 uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
-                shader.Dispatch.DrawFn(shader.Context, fb, edges, j, boundRect);
+                drawFn(shader.Context, fb, edges, j, boundRect);
             }
         }
         bin.Count = 0;

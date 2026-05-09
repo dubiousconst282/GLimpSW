@@ -84,6 +84,7 @@ struct ShadedMeshlet {
 
     uint8_t PrimCount = 0;
     FaceCullMode CullMode = FaceCullMode::FrontCCW;
+    uint8_t FragmentShaderId = 0;       // Index of fragment shader entry point in dispatch table
 
     alignas(64) uint8_t Indices[3][MaxPrims];
     alignas(64) float Position[4][MaxVertices];
@@ -149,6 +150,7 @@ struct TrianglePacket {
 
     uint8_t VertexId[3][simd::vec_width];
     uint8_t BasePrimId;
+    uint8_t FragmentShaderId;
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
 
@@ -173,20 +175,20 @@ struct TriangleEdgeVars {
     void Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize);
 };
 
-template<typename TContext, auto MeshFn, auto FragFn>
-concept ShaderEntryPoints = requires(TContext& ctx, ShadedMeshlet& meshlet, Framebuffer& fb, FragmentVars& vars) {
-    // { (ctx.*MeshFn)(0u, meshlet) } -> std::same_as<void>;
-    // { (ctx.*FragFn)(fb, vars) } -> std::same_as<void>;
-    { (*MeshFn)(ctx, 0u, meshlet) } -> std::same_as<void>;
-    { (*FragFn)(ctx, fb, vars) } -> std::same_as<void>;
-};
-
 struct ShaderDispatchTable {
-    void (*MeshFn)(void* ctx, uint32_t idx, ShadedMeshlet& meshlet) = nullptr;
-    void (*DrawFn)(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) = nullptr;
-    void (*DrawClippedFn)(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) = nullptr;
+    static constexpr uint32_t MaxFragmentEntryPoints = 4;
+
+    using MeshFnPtr = void (*)(void* ctx, uint32_t idx, ShadedMeshlet& meshlet);
+    using DrawFnPtr = void (*)(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect);
+
+    MeshFnPtr ShadeMeshlet = nullptr;
+    DrawFnPtr DrawTriangle[MaxFragmentEntryPoints] = {};
+    DrawFnPtr DrawClippedTriangle[MaxFragmentEntryPoints] = {};
 
     ShaderDispatchTable() = default;
+
+    template<typename T, typename R, typename... Types>
+    static std::remove_reference_t<T> GetContextType(R (*fn)(T, Types...));
 };
 struct ShaderBinding {
     const ShaderDispatchTable& Dispatch;
@@ -245,8 +247,8 @@ struct Rasterizer {
     static constexpr v_int FragPixelOffsetsX = simd::lane_idx<v_int> & 3;
     static constexpr v_int FragPixelOffsetsY = simd::lane_idx<v_int> >> 2;
 
-    template<auto FragFn, typename TContext, bool IsClipped>
-    static void DrawTriangle(TContext& ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
+    template<auto FragFn, bool IsClipped>
+    static void DrawTriangle(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
         [[assume(i < simd::vec_width)]];  // avoids masking on vector indexing
 
         uint16_t minX = boundRect >> 0, minY = boundRect >> 16;
@@ -316,7 +318,8 @@ struct Rasterizer {
                     }
                     vars.Bary = { 1 - u - v, u, v };
 
-                    [[clang::always_inline]] FragFn(ctx, fb, vars);
+                    using TContext = decltype(ShaderDispatchTable::GetContextType(FragFn));
+                    [[clang::always_inline]] FragFn(*(TContext*)ctx, fb, vars);
                 }
                 edge += edgeStepX;
             }
@@ -336,18 +339,27 @@ private:
     void WorkerFn(uint32_t workerId);
 };
 
-template<auto MeshFn, auto FragFn, typename TContext> requires(ShaderEntryPoints<TContext, MeshFn, FragFn>)
+template<auto MeshFn, auto... FragFn>
 ShaderDispatchTable GetDispatchTable() {
+    using TContext = decltype(ShaderDispatchTable::GetContextType(MeshFn));
+    using DrawFnPtr = ShaderDispatchTable::DrawFnPtr;
+    constexpr int numEP = sizeof...(FragFn);
+
+    static_assert(std::is_invocable_v<decltype(MeshFn), TContext&, uint32_t, ShadedMeshlet&>);
+    static_assert((std::is_invocable_v<decltype(FragFn), TContext&, Framebuffer&, FragmentVars&> && ...));
+    static_assert(numEP < ShaderDispatchTable::MaxFragmentEntryPoints);
+
+    DrawFnPtr drawFns[] = { &Rasterizer::DrawTriangle<FragFn, false>... };
+    DrawFnPtr drawClippedFns[] = { &Rasterizer::DrawTriangle<FragFn, true>... };
+
     ShaderDispatchTable d;
-    d.MeshFn = [](void* ctx, uint32_t idx, ShadedMeshlet& meshlet) {  //
-        MeshFn(*(TContext*)ctx, idx, meshlet);
-    };
-    d.DrawFn = [](void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {  //
-        Rasterizer::DrawTriangle<FragFn, TContext, false>(*(TContext*)ctx, fb, tri, i, boundRect);
-    };
-    d.DrawClippedFn = [](void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {  //
-        Rasterizer::DrawTriangle<FragFn, TContext, true>(*(TContext*)ctx, fb, tri, i, boundRect);
-    };
+    d.ShadeMeshlet = (ShaderDispatchTable::MeshFnPtr)MeshFn;
+
+    // Populate all slots, to simplify reuse of mesh shader across different fragment shaders
+    for (int i = 0; i < ShaderDispatchTable::MaxFragmentEntryPoints; i++) {
+        d.DrawTriangle[i] = drawFns[i % numEP];
+        d.DrawClippedTriangle[i] = drawClippedFns[i % numEP];
+    }
     return d;
 }
 

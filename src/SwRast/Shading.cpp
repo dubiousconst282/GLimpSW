@@ -267,8 +267,9 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
     memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
 
     if (mesh.MaterialId != UINT_MAX) {
-        auto& material = ctx.Materials[mesh.MaterialId];
+        const Material& material = ctx.Materials[mesh.MaterialId];
         output.CullMode = material.IsDoubleSided ? swr::FaceCullMode::None : swr::FaceCullMode::FrontCCW;
+        output.FragmentShaderId = material.AlphaCutoff < 255 ? 1 : 0;
     }
 }
 
@@ -294,32 +295,6 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
     v_uint surfaceId = (ctx.MeshletOffset + vars.MeshletId) * swr::ShadedMeshlet::MaxPrims + vars.PrimId;
     vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
     vars.StoreTile(fb.GetColorBuffer(), surfaceId);
-}
-
-void FS_EncodeBaseColor(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
-    // Depth test
-    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
-    vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
-    if (vars.TileMask == 0) return;
-
-    const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + vars.MeshletId];
-    v_uint color;
-
-    if (mesh.MaterialId != UINT_MAX) {
-        const Material& material = ctx.Materials[mesh.MaterialId];
-
-        v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
-        v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
-        v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
-        v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
-
-        color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv.x, uv.y);
-        vars.TileMask &= simd::movemask(color >= uint32_t(material.AlphaCutoff << 24));
-    } else {
-        color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
-    }
-    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
-    vars.StoreTile(fb.GetColorBuffer(), color);
 }
 
 void FS_Overdraw(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
@@ -744,12 +719,11 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb,
     });
 }
 
-swr::ShaderDispatchTable ShadingContext::GetVisBufferShader() {
-    return swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeSurfaceId<false>, ShadingContext>();
-}
-swr::ShaderDispatchTable ShadingContext::GetDeferredShader() {
-    return swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeGBuffer, ShadingContext>();
-}
-swr::ShaderDispatchTable ShadingContext::GetOverdrawShader() {
-    return swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw, ShadingContext>();
-}
+const swr::ShaderDispatchTable &       //
+    ShadingContext::VisBufferShader =  //
+    swr::GetDispatchTable<&ShadeMeshlet,
+                          &FS_EncodeSurfaceId<false>,  // 0
+                          &FS_EncodeSurfaceId<true>    // 1
+                          >(),
+    ShadingContext::DeferredShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeGBuffer>(),  //
+    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();       //

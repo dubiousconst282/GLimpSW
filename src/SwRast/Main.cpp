@@ -194,14 +194,10 @@ void RenderFrame() {
 
     uint32_t drawCalls = 0;
 
-    swr::ShaderDispatchTable dispatchTable;
-    if (s_EnableVisBuffer) {
-        dispatchTable = ShadingContext::GetVisBufferShader();
-    } else if (s_Layer == DebugLayer::Overdraw) {
-        dispatchTable = ShadingContext::GetOverdrawShader();
-    } else {
-        dispatchTable = ShadingContext::GetDeferredShader();
-    }
+    const swr::ShaderDispatchTable& dispatchTable =  //
+        s_Layer == DebugLayer::Overdraw ? ShadingContext::OverdrawShader :
+        s_EnableVisBuffer               ? ShadingContext::VisBufferShader :
+                                          ShadingContext::DeferredShader;
 
     for (auto& model : _scene->Models) {
         for (auto& node : model->Nodes) {
