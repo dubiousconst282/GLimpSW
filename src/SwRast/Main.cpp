@@ -27,6 +27,7 @@ GLFWwindow* _window;
 
 swr::FramebufferPtr _fb;
 std::unique_ptr<swr::Rasterizer> _rast;
+swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
 GLuint _fbTexture = 0;
 
 Camera _cam;
@@ -49,6 +50,10 @@ GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint
 
 void CreateFramebuffer(uint32_t width, uint32_t height) {
     _fb = swr::CreateFramebuffer(width, height, 3);
+
+    uint32_t halfW = 1 << (32 - simd::lzcnt((width - 1) / 2));
+    uint32_t halfH = 1 << (32 - simd::lzcnt((height - 1) / 2));
+    _prevDepthMap = swr::CreateTexture2D<swr::pixfmt::R32f>(halfW, halfH, 16);
 
     if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
     _fbTexture = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
@@ -97,6 +102,7 @@ void RenderFrame() {
     static DebugLayer s_Layer = DebugLayer::None;
     static bool s_EnableVisBuffer = true;
     static bool s_ShowPerfHeatmap = false;
+    static bool s_OcclusionCulling = true;
     static float s_Exposure = 1.0f;
 
     ImGui::Begin("Settings");
@@ -145,6 +151,7 @@ void RenderFrame() {
 
     ImGui::Checkbox("Vis-buffer", &s_EnableVisBuffer);
     ImGui::Checkbox("Perf Heatmap", &s_ShowPerfHeatmap);
+    ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
 
     ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0MetallicRoughness\0MeshletId\0TriangleId\0Overdraw\0");
     ImGui::SliderFloat("Exposure", &s_Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -170,6 +177,8 @@ void RenderFrame() {
         .Materials = _scene->Materials.data(),
         .Lights = _scene->Lights.data(),
         .NumLights = _scene->Lights.size(),
+        .FramebufferSize = float2(_fb->Width, _fb->Height),
+        .OcclDepthMap = s_OcclusionCulling ? _prevDepthMap.get() : nullptr,
         .SkyboxTex = _skyboxTex.get(),
         .ViewPos = _cam.ViewPosition,
         .Exposure = s_Exposure,
@@ -204,7 +213,7 @@ void RenderFrame() {
             if (node.MeshCount == 0) continue;
 
             ZoneScopedN("Draw Node");
-            shader.UpdateProj(projViewMat, node.GlobalTransform);
+            shader.UpdateProj(projMat, viewMat, node.GlobalTransform);
             shader.MeshletOffset = node.MeshOffset;
 
             _rast->DrawMeshlets(*_fb, node.MeshCount, { dispatchTable, &shader });
@@ -223,6 +232,10 @@ void RenderFrame() {
 
     SWR_PERF_END(Resolve);
 
+    {
+        ZoneScopedN("DepthDownsample");
+        swr::texutil::DownsampleDepth(*_fb, *_prevDepthMap);
+    }
     {
         ZoneScopedN("UploadFrameToGPU");
         

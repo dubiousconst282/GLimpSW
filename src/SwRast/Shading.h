@@ -12,17 +12,24 @@ enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, MeshletId, 
 struct ShadingContext {
     static constexpr uint32_t NumFbLayers = 3;
 
-    // Uniform: Per instance
-    glm::mat4 WorldToClipMat, ObjectToClipMat;
-    glm::mat3 ObjectToWorldMat;
-    float4 FrustumPlanes[6];
-    uint32_t MeshletOffset;
-
     // Uniform: Per scene
     const Meshlet* Meshlets;
     const Material* Materials;
     const Light* Lights;
     uint32_t NumLights;
+
+    // Uniform: Per instance
+    uint32_t MeshletOffset;
+
+    glm::mat4 WorldToClipMat, ObjectToClipMat, ObjectToViewMat;
+    glm::mat3 ObjectToWorldMat;
+    float4 FrustumPlanes[6];
+
+    // Occlusion culling
+    float3 SphereProjFactors;  // znear, f/ar, -f
+    float ObjectToWorldScale;
+    float2 FramebufferSize;
+    swr::Texture2D<swr::pixfmt::R32f>* OcclDepthMap = nullptr;
 
     // Uniform: Resolve pass
     swr::HdrTexture2D* SkyboxTex;
@@ -31,10 +38,14 @@ struct ShadingContext {
     float Exposure = 1.0f;
     bool ShowPerfHeatmap = false;
 
-    void UpdateProj(const glm::mat4& projView, const glm::mat4& model) {
-        ObjectToClipMat = projView * model;
-        WorldToClipMat = projView;
+    void UpdateProj(const glm::mat4& proj, glm::mat4& view, const glm::mat4& model) {
+        WorldToClipMat = proj * view;
+        ObjectToClipMat = WorldToClipMat * model;
+        ObjectToViewMat = view * model;
         ObjectToWorldMat = model;
+
+        ObjectToWorldScale = glm::length(float3(model[0]));
+        SphereProjFactors = float3(proj[3][2], proj[0][0], proj[1][1]);
 
         // Gribb & Hartmann
         glm::mat4 M = glm::transpose(ObjectToClipMat);

@@ -1,6 +1,9 @@
 #include "Shading.h"
 #include "Camera.h"
 
+#define IMGUI_DEFINE_MATH_OPERATORS
+#include "imgui.h"
+
 namespace {
 
 constexpr swr::SamplerDesc SurfaceSampler = {
@@ -245,6 +248,24 @@ v_uint AlphaBlendU8(v_uint bg, v_uint fg) {
     return rb | (ag << 8);
 }
 
+// 2D Polyhedral Bounds of a Clipped, Perspective - Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
+// proj = znear, P00, P11
+bool ProjectSphere(float3 c, float r, float3 proj, float2& minPos, float2& maxPos) {
+    c.z *= -1;
+    if (c.z < r + proj.x) return false;
+
+    float3 cr = c * r;
+    float vx = glm::sqrt(c.x * c.x + c.z * c.z - r * r);
+    float vy = glm::sqrt(c.y * c.y + c.z * c.z - r * r);
+
+    minPos.x = (vx * c.x - cr.z) / (vx * c.z + cr.x) * (proj.y * 0.5f) + 0.5f;
+    minPos.y = (vy * c.y + cr.z) / (vy * c.z - cr.y) * (proj.z * 0.5f) + 0.5f;
+    maxPos.x = (vx * c.x + cr.z) / (vx * c.z - cr.x) * (proj.y * 0.5f) + 0.5f;
+    maxPos.y = (vy * c.y - cr.z) / (vy * c.z + cr.y) * (proj.z * 0.5f) + 0.5f;
+
+    return true;
+}
+
 void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
     const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + index];
 
@@ -254,6 +275,60 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
     for (uint32_t i = 0; i < 5; i++) {
         float dist = glm::dot(mesh.BoundCenter, float3(ctx.FrustumPlanes[i])) + ctx.FrustumPlanes[i].w;
         if (dist < -mesh.BoundRadius) return;
+    }
+
+    if (ctx.OcclDepthMap != nullptr) {
+        float3 boundCenterVS = float3(ctx.ObjectToViewMat * float4(mesh.BoundCenter, 1));
+        float boundRadiusVS = mesh.BoundRadius * ctx.ObjectToWorldScale;
+
+        float2 screenMin, screenMax;
+        if (ProjectSphere(boundCenterVS, boundRadiusVS, ctx.SphereProjFactors, screenMin, screenMax)) {
+            // It is very worth picking the finer mip and testing more samples here,
+            // since our raster is still slow as fuck compared to hardware (though that
+            // may be true in general, since culling is so ridiculously cheap).
+            float2 bbSize = (screenMax - screenMin) * ctx.FramebufferSize;
+            int mipLevel = (simd::as<int>(glm::max(bbSize.x, bbSize.y)) >> 23) - 127;
+            mipLevel = glm::clamp(mipLevel, 1, (int)ctx.OcclDepthMap->MipLevels - 1);
+
+            int2 texMin = glm::max(int2(screenMin * ctx.FramebufferSize), 0) >> mipLevel;
+            int2 texMax = glm::min(int2(screenMax * ctx.FramebufferSize), int2(ctx.FramebufferSize) - 1) >> mipLevel;
+
+            uint32_t mipOffset = ctx.OcclDepthMap->MipOffsets[mipLevel - 1];
+            uint32_t stride = ctx.OcclDepthMap->RowShift - (mipLevel - 1);
+
+            float depthSphere = ctx.SphereProjFactors.x / (-boundCenterVS.z - boundRadiusVS);
+            float depthVisible = FLT_MAX;
+
+            for (int y = texMin.y; y <= texMax.y; y++) {
+                for (int x = texMin.x; x <= texMax.x; x++) {
+                    uint32_t texelOffset = ctx.OcclDepthMap->GetTexelOffset((uint32_t)x, (uint32_t)y, stride);
+                    float value = simd::as<float>(ctx.OcclDepthMap->Data[mipOffset + texelOffset]);
+                    depthVisible = glm::min(depthVisible, value);
+                }
+            }
+
+#if 0
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            ImVec2 dp = ImGui::GetIO().DisplaySize;
+            dl->AddRect(ImVec2(screenMin.x, screenMin.y) * dp, ImVec2(screenMax.x, screenMax.y) * dp, 0xFF0000FF);
+
+            ImVec2 scale = dp / ImVec2(ctx.FramebufferSize.x, ctx.FramebufferSize.y);
+            int texelSize = (1 << mipLevel);
+
+            for (int y = texMin.y; y <= texMax.y; y++) {
+                for (int x = texMin.x; x <= texMax.x; x++) {
+                    ImVec2 p0 = ImVec2(x << mipLevel, y << mipLevel);
+                    ImVec2 p1 = p0 + ImVec2(texelSize, texelSize);
+                    dl->AddRect(p0 * scale, p1 * scale, 0xFF00FF00);
+                }
+            }
+            char text[128];
+            snprintf(text, sizeof(text), "bb=%.0fx%.0f mip=%d", bbSize.x, bbSize.y, mipLevel);
+            dl->AddText(ImVec2(screenMin.x, screenMin.y) * dp, 0xFFFFFFFF, text);
+#endif
+
+            if (depthSphere < depthVisible) return;
+        }
     }
 
     // TODO: meshlet compression, the mem loads take longest here (>65%)
@@ -305,6 +380,7 @@ void FS_Overdraw(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentV
 
     vars.TileMask = 0xFFFF;
     vars.StoreTile(buffer, color);
+    vars.StoreTile(fb.GetDepthBuffer(), simd::max(vars.Depth, vars.LoadTile(fb.GetDepthBuffer())));
 }
 
 void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {

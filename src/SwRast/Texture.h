@@ -229,6 +229,8 @@ struct StbImage {
     static StbImage Load(const char* path, PixelType type = PixelType::RGBA_U8);
 };
 
+struct Framebuffer;
+
 namespace texutil {
 
 TexturePtr2D<pixfmt::RGBA8u> LoadImage(const char* path, uint32_t mipLevels = 8);
@@ -237,6 +239,8 @@ TexturePtr2D<pixfmt::R11G11B10f> LoadImageHDR(const char* path, uint32_t mipLeve
 
 // Loads a equirectangular panorama into a cubemap.
 TexturePtr2D<pixfmt::R11G11B10f> LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
+
+void DownsampleDepth(Framebuffer& fb, swr::Texture2D<swr::pixfmt::R32f>& dest);
 
 // Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
 inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
@@ -600,7 +604,7 @@ private:
 
 template<pixfmt::Texel T>
 inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
-    assert(std::has_single_bit(width) && std::has_single_bit(height) && maxLevels < simd::vec_width);
+    assert(std::has_single_bit(width) && std::has_single_bit(height) && maxLevels <= simd::vec_width);
     uint32_t rowShift = (uint32_t)std::countr_zero(std::max(width, 8u));
     uint32_t mipOffsets[16] = {};
     uint32_t layerStride = 0;
