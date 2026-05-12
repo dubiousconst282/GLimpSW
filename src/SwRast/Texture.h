@@ -389,11 +389,10 @@ struct Texture2D {
 
     // Fetch raw texels from storage. All coordinates must be in-bounds.
     [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int x, v_int y, v_int layer = 0, v_int mipLevel = 0) const {
-        v_int stride = (int32_t)RowShift;
+        v_int stride = (int)RowShift;
         v_int offset = layer * (int)LayerStride;
 
         if (simd::any(mipLevel > 0)) {
-            x >>= mipLevel, y >>= mipLevel;
             stride -= mipLevel;
             offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
         }
@@ -519,27 +518,22 @@ private:
         if constexpr (Layout_ == TextureLayout::Linear) {
             v_int indices00 = offset + ix + (iy << stride);
             v_int indices01 = indices00 + (inboundY ? (1 << stride) : 0);
-            v_uint row0_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 0), Data, 4);
-            v_uint row0_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices00, 1), Data, 4);
-            v_uint row1_lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 0), Data, 4);
-            v_uint row1_hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(indices01, 1), Data, 4);
-
-            data00 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 0, row0_hi);
-            data10 = _mm512_permutex2var_epi32(row0_lo, simd::lane_idx<v_int> * 2 + 1, row0_hi);
-            data01 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 0, row1_hi);
-            data11 = _mm512_permutex2var_epi32(row1_lo, simd::lane_idx<v_int> * 2 + 1, row1_hi);
+            v_uint2 lo = simd::gather2(Data, indices00);
+            v_uint2 hi = simd::gather2(Data, indices01);
+            data00 = lo.x, data10 = lo.y;
+            data01 = hi.x, data11 = hi.y;
         } else if constexpr (Layout_ == TextureLayout::TiledY8) {
             v_int indices00 = offset + GetTexelOffset(ix, iy, stride);
-            data00 = _mm512_i32gather_epi32(indices00, Data + 0, 4);
-            data10 = _mm512_i32gather_epi32(indices00, Data + 8, 4);
+            data00 = simd::gather(Data + 0, indices00);
+            data10 = simd::gather(Data + 8, indices00);
             v_int indices01 = offset + GetTexelOffset(ix, iy + (inboundY ? 1 : 0), stride);
-            data01 = _mm512_i32gather_epi32(indices01, Data + 0, 4);
-            data11 = _mm512_i32gather_epi32(indices01, Data + 8, 4);
+            data01 = simd::gather(Data + 0, indices01);
+            data11 = simd::gather(Data + 8, indices01);
         } else {
-            data00 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 0, iy + 0, stride), Data, 4);
-            data10 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 1, iy + 0, stride), Data, 4);
-            data01 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 0, iy + 1, stride), Data, 4);
-            data11 = _mm512_i32gather_epi32(offset + GetTexelOffset(ix + 1, iy + 1, stride), Data, 4);
+            data00 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 0, stride));
+            data10 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 0, stride));
+            data01 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 1, stride));
+            data11 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 1, stride));
         }
 
         if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {

@@ -1,9 +1,6 @@
 #include "Shading.h"
 #include "Camera.h"
 
-#define IMGUI_DEFINE_MATH_OPERATORS
-#include "imgui.h"
-
 namespace {
 
 constexpr swr::SamplerDesc SurfaceSampler = {
@@ -248,88 +245,49 @@ v_uint AlphaBlendU8(v_uint bg, v_uint fg) {
     return rb | (ag << 8);
 }
 
-// 2D Polyhedral Bounds of a Clipped, Perspective - Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
+// https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization
+v_float3 ColormapTurbo(v_float x) {
+    static constexpr float c[] = {
+        0.13572138, 4.61539260,  -42.66032258, 132.13108234, -152.94239396, 59.28637943,  //
+        0.09140261, 2.19418839,  4.84296658,   -14.18503333, 4.27729857,    2.82956604,   //
+        0.10667330, 12.64194608, -60.58204836, 110.36276771, -89.90310912,  27.34824973,  //
+    };
+    return {
+        x * (x * (x * (x * (x * c[5] + c[4]) + c[3]) + c[2]) + c[1]) + c[0],
+        x * (x * (x * (x * (x * c[11] + c[10]) + c[9]) + c[8]) + c[7]) + c[6],
+        x * (x * (x * (x * (x * c[17] + c[16]) + c[15]) + c[14]) + c[13]) + c[12],
+    };
+}
+
+// 2D Polyhedral Bounds of a Clipped, Perspective Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
 // proj = znear, P00, P11
-bool ProjectSphere(float3 c, float r, float3 proj, float2& minPos, float2& maxPos) {
+v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
     c.z *= -1;
-    if (c.z < r + proj.x) return false;
+    v_int mask = c.z >= r + proj.x;
+    if (!simd::any(mask)) return 0;
 
-    float3 cr = c * r;
-    float vx = glm::sqrt(c.x * c.x + c.z * c.z - r * r);
-    float vy = glm::sqrt(c.y * c.y + c.z * c.z - r * r);
+    v_float3 cr = c * r;
+    v_float vx = simd::approx_sqrt(c.x * c.x + c.z * c.z - r * r);
+    v_float vy = simd::approx_sqrt(c.y * c.y + c.z * c.z - r * r);
 
-    minPos.x = (vx * c.x - cr.z) / (vx * c.z + cr.x) * (proj.y * 0.5f) + 0.5f;
-    minPos.y = (vy * c.y + cr.z) / (vy * c.z - cr.y) * (proj.z * 0.5f) + 0.5f;
-    maxPos.x = (vx * c.x + cr.z) / (vx * c.z - cr.x) * (proj.y * 0.5f) + 0.5f;
-    maxPos.y = (vy * c.y - cr.z) / (vy * c.z + cr.y) * (proj.z * 0.5f) + 0.5f;
+    bb.x = (vx * c.x - cr.z) * simd::approx_rcp(vx * c.z + cr.x) * (proj.y * 0.5f) + 0.5f;
+    bb.y = (vy * c.y + cr.z) * simd::approx_rcp(vy * c.z - cr.y) * (proj.z * 0.5f) + 0.5f;
+    bb.z = (vx * c.x + cr.z) * simd::approx_rcp(vx * c.z - cr.x) * (proj.y * 0.5f) + 0.5f;
+    bb.w = (vy * c.y - cr.z) * simd::approx_rcp(vy * c.z + cr.y) * (proj.z * 0.5f) + 0.5f;
 
-    return true;
+    return mask;
 }
 
 void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
-    const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + index];
+    if (ctx.MeshletCullBitmap != nullptr) {
+        v_mask mask = ctx.MeshletCullBitmap[index / simd::vec_width];
 
-    output.PrimCount = 0;
-
-    // Frustum culling
-    for (uint32_t i = 0; i < 5; i++) {
-        float dist = glm::dot(mesh.BoundCenter, float3(ctx.FrustumPlanes[i])) + ctx.FrustumPlanes[i].w;
-        if (dist < -mesh.BoundRadius) return;
-    }
-
-    if (ctx.OcclDepthMap != nullptr) {
-        float3 boundCenterVS = float3(ctx.ObjectToViewMat * float4(mesh.BoundCenter, 1));
-        float boundRadiusVS = mesh.BoundRadius * ctx.ObjectToWorldScale;
-
-        float2 screenMin, screenMax;
-        if (ProjectSphere(boundCenterVS, boundRadiusVS, ctx.SphereProjFactors, screenMin, screenMax)) {
-            // It is very worth picking the finer mip and testing more samples here,
-            // since our raster is still slow as fuck compared to hardware (though that
-            // may be true in general, since culling is so ridiculously cheap).
-            float2 bbSize = (screenMax - screenMin) * ctx.FramebufferSize;
-            int mipLevel = (simd::as<int>(glm::max(bbSize.x, bbSize.y)) >> 23) - 127;
-            mipLevel = glm::clamp(mipLevel, 1, (int)ctx.OcclDepthMap->MipLevels - 1);
-
-            int2 texMin = glm::max(int2(screenMin * ctx.FramebufferSize), 0) >> mipLevel;
-            int2 texMax = glm::min(int2(screenMax * ctx.FramebufferSize), int2(ctx.FramebufferSize) - 1) >> mipLevel;
-
-            uint32_t mipOffset = ctx.OcclDepthMap->MipOffsets[mipLevel - 1];
-            uint32_t stride = ctx.OcclDepthMap->RowShift - (mipLevel - 1);
-
-            float depthSphere = ctx.SphereProjFactors.x / (-boundCenterVS.z - boundRadiusVS);
-            float depthVisible = FLT_MAX;
-
-            for (int y = texMin.y; y <= texMax.y; y++) {
-                for (int x = texMin.x; x <= texMax.x; x++) {
-                    uint32_t texelOffset = ctx.OcclDepthMap->GetTexelOffset((uint32_t)x, (uint32_t)y, stride);
-                    float value = simd::as<float>(ctx.OcclDepthMap->Data[mipOffset + texelOffset]);
-                    depthVisible = glm::min(depthVisible, value);
-                }
-            }
-
-#if 0
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            ImVec2 dp = ImGui::GetIO().DisplaySize;
-            dl->AddRect(ImVec2(screenMin.x, screenMin.y) * dp, ImVec2(screenMax.x, screenMax.y) * dp, 0xFF0000FF);
-
-            ImVec2 scale = dp / ImVec2(ctx.FramebufferSize.x, ctx.FramebufferSize.y);
-            int texelSize = (1 << mipLevel);
-
-            for (int y = texMin.y; y <= texMax.y; y++) {
-                for (int x = texMin.x; x <= texMax.x; x++) {
-                    ImVec2 p0 = ImVec2(x << mipLevel, y << mipLevel);
-                    ImVec2 p1 = p0 + ImVec2(texelSize, texelSize);
-                    dl->AddRect(p0 * scale, p1 * scale, 0xFF00FF00);
-                }
-            }
-            char text[128];
-            snprintf(text, sizeof(text), "bb=%.0fx%.0f mip=%d", bbSize.x, bbSize.y, mipLevel);
-            dl->AddText(ImVec2(screenMin.x, screenMin.y) * dp, 0xFFFFFFFF, text);
-#endif
-
-            if (depthSphere < depthVisible) return;
+        if ((mask >> (index % simd::vec_width) & 1) == 0) {
+            output.PrimCount = 0;
+            return;
         }
     }
+    const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + index];
 
     // TODO: meshlet compression, the mem loads take longest here (>65%)
     // https://liamtyler.github.io/posts/meshlet_compression/
@@ -373,13 +331,13 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
 }
 
 void FS_Overdraw(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
-    uint32_t* buffer = fb.GetColorBuffer();
-    v_uint color = vars.LoadTile(buffer);
+    v_uint counter = vars.LoadTile(fb.GetColorBuffer());
+
     v_int isActive = _mm512_movm_epi32(vars.TileMask);
-    color = _mm512_adds_epu8(color, isActive ? v_uint(0xFF'301010) : v_uint(0xFF'101030));
+    counter = _mm512_adds_epu16(counter, isActive ? v_uint(0x0001'0000) : v_uint(0x0000'0001));
 
     vars.TileMask = 0xFFFF;
-    vars.StoreTile(buffer, color);
+    vars.StoreTile(fb.GetColorBuffer(), counter);
     vars.StoreTile(fb.GetDepthBuffer(), simd::max(vars.Depth, vars.LoadTile(fb.GetDepthBuffer())));
 }
 
@@ -688,6 +646,15 @@ v_float3 EvalLighting(const SurfaceData& surf, const Light* lights, uint32_t num
 
 };  // namespace
 
+const swr::ShaderDispatchTable&        //
+    ShadingContext::VisBufferShader =  //
+    swr::GetDispatchTable<&ShadeMeshlet,
+                          &FS_EncodeSurfaceId<false>,  // 0
+                          &FS_EncodeSurfaceId<true>    // 1
+                          >(),
+    ShadingContext::DeferredShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeGBuffer>(),  //
+    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();       //
+
 void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
     glm::mat4 invProj = GetInverseScreenProjMatrix(WorldToClipMat, glm::ivec2(fb.Width, fb.Height));
 
@@ -770,22 +737,32 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb,
         v_float tileDepth = simd::load(&fb.GetDepthBuffer()[tileOffset]);
         v_int skyMask = tileDepth <= 0.0f;
 
-        uint32_t* tileData = &fb.GetColorBuffer()[tileOffset];
-        SurfaceData data = ResolveSurface(*this, tileData, simd::movemask(~skyMask), tileUV, float2(fb.Width, fb.Height));
+        uint32_t* tilePtr = &fb.GetColorBuffer()[tileOffset];
+        v_uint tileData = simd::load(tilePtr);
+        SurfaceData surface;
+
+        if (layer == DebugLayer::BaseColor || layer == DebugLayer::Normals || layer == DebugLayer::MetallicRoughness) {
+            surface = ResolveSurface(*this, tilePtr, simd::movemask(~skyMask), tileUV, float2(fb.Width, fb.Height));
+        }
 
         v_float3 finalColor = 0.0f;
         if (layer == DebugLayer::BaseColor) {
-            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(data.Albedo));
+            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(surface.Albedo));
         } else if (layer == DebugLayer::Normals) {
-            finalColor = data.Normal * 0.5 + 0.5;
+            finalColor = surface.Normal * 0.5 + 0.5;
         } else if (layer == DebugLayer::MetallicRoughness) {
-            finalColor = v_float3(data.Metallic, data.Roughness, 0);
+            finalColor = v_float3(surface.Metallic, surface.Roughness, 0);
         } else if (layer == DebugLayer::MeshletId) {
-            v_uint meshletId = simd::load(tileData) / swr::ShadedMeshlet::MaxPrims;
-            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(meshletId * 123456789));
+            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack((tileData / swr::ShadedMeshlet::MaxPrims) * 123456789));
         } else if (layer == DebugLayer::TriangleId) {
-            v_uint meshletId = simd::load(tileData);
-            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(meshletId * 123456789));
+            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(tileData * 123456789));
+        } else if (layer == DebugLayer::OverdrawPixel) {
+            v_float countPix = simd::conv<float>(tileData >> 16);
+            finalColor = ColormapTurbo(countPix / 30.0f);
+        } else if (layer == DebugLayer::OverdrawQuad) {
+            v_float countPix = simd::conv<float>(tileData >> 16);
+            v_float countFrag = simd::conv<float>(tileData & 0xFFFF);
+            finalColor = ColormapTurbo((countPix + countFrag * 0.5) / 30.0f);
         }
 
         uint32_t backgroundRGB = ((tileBasePos.x ^ tileBasePos.y) & 4) ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
@@ -795,11 +772,98 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb,
     });
 }
 
-const swr::ShaderDispatchTable &       //
-    ShadingContext::VisBufferShader =  //
-    swr::GetDispatchTable<&ShadeMeshlet,
-                          &FS_EncodeSurfaceId<false>,  // 0
-                          &FS_EncodeSurfaceId<true>    // 1
-                          >(),
-    ShadingContext::DeferredShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeGBuffer>(),  //
-    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();       //
+uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count,  //
+                                      const float4x4& projMat, const float4x4& viewMat, const float4x4& modelMat,
+                                      const float4x4& prevViewMat,  //
+                                      float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap) {
+    float4 frustumPlanes[6];
+    float4x4 objectToPrevViewMat = prevViewMat * modelMat;
+    float4x4 objectToClipMatT = glm::transpose(projMat * viewMat * modelMat);
+
+    // Gribb & Hartmann
+    for (int i = 0; i < 3; i++) {
+        float4 planeA = objectToClipMatT[3] + objectToClipMatT[i];  // Left,  Bottom, Near
+        float4 planeB = objectToClipMatT[3] - objectToClipMatT[i];  // Right, Top,    Far
+        planeA /= glm::length(float3(planeA));
+        planeB /= glm::length(float3(planeB));
+        frustumPlanes[i * 2 + 0] = planeA;
+        frustumPlanes[i * 2 + 1] = planeB;
+    }
+
+    float objectToWorldScale = glm::length(float3(modelMat[0])); // assuming uniform
+    float3 projFactors = float3(projMat[3][2], projMat[0][0], projMat[1][1]);  // znear, f/ar, -f
+    uint32_t visibleCount = 0;
+
+    for (uint32_t offset = 0; offset < count; offset += simd::vec_width) {
+        v_int visible = (simd::lane_idx<v_uint> + offset) < count;
+
+        // TODO-PERF: split meshlet bound spheres into SoA? 65% of time is spent here, we're wasting 3/4 of cachelines
+        v_float4 boundSphere = simd::gather4(&meshlets[offset].BoundCenter.x, simd::lane_idx<v_int> * sizeof(Meshlet) / 4, visible);
+        v_float3 boundCenter = v_float3(boundSphere);
+        v_float boundRadius = boundSphere.w;
+
+        // Frustum culling
+        for (uint32_t i = 0; i < 5; i++) {
+            v_float dist = simd::dot(boundCenter, float3(frustumPlanes[i])) + frustumPlanes[i].w;
+            visible &= dist > -boundRadius;
+        }
+
+        if (depthMap != nullptr && simd::any(visible)) {
+            v_float3 boundCenterVS = v_float3(mul(objectToPrevViewMat, v_float4(boundCenter, 1)));
+            v_float boundRadiusVS = boundRadius * objectToWorldScale;
+
+            v_float4 screenBB;
+            v_int projMask = visible & ProjectSphere(boundCenterVS, boundRadiusVS, projFactors, screenBB);
+
+            if (simd::any(projMask)) {
+                v_float2 bbSize = v_float2(screenBB.z - screenBB.x, screenBB.w - screenBB.y) * frameSize;
+                v_int mipLevel = simd::ilog2(simd::max(bbSize.x, bbSize.y));
+                mipLevel = simd::clamp(mipLevel, 1, (int)depthMap->MipLevels - 1);
+
+                v_int x0 = simd::max(simd::conv<int>(screenBB.x * frameSize.x), 0) >> mipLevel;
+                v_int y0 = simd::max(simd::conv<int>(screenBB.y * frameSize.y), 0) >> mipLevel;
+                v_int x1 = simd::min(simd::conv<int>(screenBB.z * frameSize.x), int(frameSize.x) - 1) >> mipLevel;
+                v_int y1 = simd::min(simd::conv<int>(screenBB.w * frameSize.y), int(frameSize.y) - 1) >> mipLevel;
+
+                v_float depthSphere = projFactors.x / (-boundCenterVS.z - boundRadiusVS);
+                v_float depthVisible = FLT_MAX;
+
+                for (v_int y = y0; simd::any(y <= y1); y += 1) {
+                    for (v_int x = x0; simd::any(x <= x1); x += 1) {
+                        v_int activeMask = projMask && x <= x1 && y <= y1;
+                        v_uint value = depthMap->Fetch(activeMask ? x : 0, activeMask ? y : 0, 0, mipLevel - 1);
+                        simd::cmov(depthVisible, simd::min(depthVisible, simd::as<v_float>(value)), activeMask);
+                    }
+                }
+                visible &= !projMask || depthSphere > depthVisible;
+
+#if 0
+                for (uint32_t i = 0; i < 16; i++) {
+                    if (!projMask[i]) continue;
+
+                    ImDrawList* dl = ImGui::GetForegroundDrawList();
+                    ImVec2 dp = ImGui::GetIO().DisplaySize;
+                    dl->AddRect(ImVec2(screenBB.x[i], screenBB.y[i]) * dp, ImVec2(screenBB.z[i], screenBB.w[i]) * dp, 0xFF0000FF);
+
+                    ImVec2 scale = dp / ImVec2(frameSize.x, frameSize.y);
+                    int texelSize = (1 << mipLevel[i]);
+
+                    for (int y = y0[i]; y <= y1[i]; y++) {
+                        for (int x = x0[i]; x <= x1[i]; x++) {
+                            ImVec2 p0 = ImVec2(x << mipLevel[i], y << mipLevel[i]);
+                            ImVec2 p1 = p0 + ImVec2(texelSize, texelSize);
+                            dl->AddRect(p0 * scale, p1 * scale, 0xFF00FF00);
+                        }
+                    }
+                    char text[128];
+                    snprintf(text, sizeof(text), "bb=%.0fx%.0f mip=%d", bbSize.x[i], bbSize.y[i], mipLevel[i]);
+                    dl->AddText(ImVec2(screenBB.x[i], screenBB.y[i]) * dp, 0xFFFFFFFF, text);
+                }
+#endif
+            }
+        }
+        bitmap[offset / simd::vec_width] = simd::movemask(visible);
+        visibleCount += simd::popcnt(simd::movemask(visible));
+    }
+    return visibleCount;
+}

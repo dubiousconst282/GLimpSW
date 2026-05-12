@@ -190,12 +190,29 @@ SIMD_INLINE void store(void* ptr, const T& value) {
     ((load_buf*)ptr)->v = value;
 }
 
-SIMD_TFN_ANY T gather(const void* ptr, mask_vec<T> idx, vec<bool, width_of<T>> mask = true) {
-    return __builtin_masked_gather(mask, idx, (const elem_type<T>*)ptr);
+SIMD_TFN_ANY T gather(const void* ptr, mask_vec<T> idx, mask_vec<T> mask = -1) {
+    return __builtin_masked_gather(vec<bool>(mask < 0), idx, (const elem_type<T>*)ptr);
 }
 template<typename E, int N = sizeof(__m512) / sizeof(E)>
-SIMD_INLINE vec<E, N> gather(const E* ptr, mask_vec<vec<E, N>> idx, vec<bool, N> mask = true) {
-    return __builtin_masked_gather(mask, idx, ptr);
+SIMD_INLINE vec<E, N> gather(const E* ptr, mask_vec<vec<E, N>> idx, mask_vec<vec<E, N>> mask = -1) {
+    return __builtin_masked_gather(vec<bool, N>(mask < 0), idx, ptr);
+}
+
+// Strided gather
+template<typename T> requires(sizeof(T) == 4)
+SIMD_INLINE mdvec<vec<T>, 2> gather2(const T* ptr, v_int idx, v_int mask = -1) {
+    uint16_t k_mask = _mm512_movepi32_mask(mask);
+    auto lo = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask, _mm512_extracti32x8_epi32(idx, 0), ptr, 4);
+    auto hi = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask, _mm512_extracti32x8_epi32(idx, 1), ptr, 4);
+    auto x = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 0, hi);
+    auto y = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 1, hi);
+    return { x, y };
+}
+template<typename T> requires(sizeof(T) == 4)
+SIMD_INLINE mdvec<vec<T>, 4> gather4(const T* ptr, v_int idx, v_int mask = -1) {
+    auto a = gather2((const T*)ptr + 0, idx, mask);
+    auto b = gather2((const T*)ptr + 2, idx, mask);
+    return { a.x, a.y, b.x, b.y };
 }
 
 // Gather variants optimized for small arrays
@@ -501,12 +518,11 @@ AlignedBuffer<T> alloc_buffer(size_t count, size_t align = 64) {
     return AlignedBuffer<T>(ptr);
 }
 
-template<typename T = uint32_t>
 class BitIter {
-    T mask;
+    uint64_t mask;
 
 public:
-    BitIter(T mask_) : mask(mask_) {}
+    BitIter(uint64_t mask_) : mask(mask_) {}
 
     BitIter& operator++() {
         mask &= (mask - 1);

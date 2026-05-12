@@ -26,6 +26,13 @@ _Sample screenshots of the current version (deferred vis-buffer), showing perfor
 - Multi-threaded tiled rasterizer (binning)
 - Guard-band clipping
 
+### Missing/broken features
+- Vis-buffer resolve pass does not handle models with more than one node properly (need to support per-node transform matrices, maybe difficult)
+- Clipping not implemented in binned rasterizer (to be rewritten)
+- Non-binned rasterizer does not synchronize, artifacts when multi-threading
+- Occlusion culling uses prev frame's depth map + reprojection, does not account for newly visible objects (should be easy to fix but doesn't bother me)
+- IBL, SSAO, TAA not yet ported to meshlet branch
+
 ## Implementation Notes
 Some things I have and haven't tried.
 
@@ -137,11 +144,18 @@ static v_float GatherPreload64(const float data[64], v_int idx) {
 
 ---
 
-Bilinear filtering requires 4 gather instructions to needed to fetch neighboring pixels (P00, P10, P01, P11). For textures that are indexed linearly as `x + y * stride`, the two pixels neighboring across the X axis can be fetched at once for ~half the cost using 64-bit gather instructions, combined with 2-input permutes for unpacking. This improves raw throughput by ~1.3x on benchmarks, and by ~8% when sampling once in fragment shader. Unfortunately, this optimization cannot be applied to tiled layouts. [TexGather64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
+For strided accesses multiple of 2 x 32-bit components, 64-bit gathers can be used in combination with permutes. This runs at nearly double throughput for the reason above. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp) [TexGather64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
+
+```cpp
+auto lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(idx, 0), ptr, 4);
+auto hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(idx, 1), ptr, 4);
+auto x = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 0, hi);
+auto y = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 1, hi);
+```
 
 ---
 
-When the Gather Data Sampling vulnerability mitigation is enabled on TigerLake and older Intel CPUs, gather throughput is reduced by over 3x, which slows down the renderer noticeably. On Linux, it can be disabled by booting with kernel parameter `mitigations=off` or `gather_data_sampling=off`. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp)
+When the Gather Data Sampling vulnerability mitigation is enabled on TigerLake, gather throughput is reduced by over 3x, which slows down the renderer noticeably. On Linux, it can be disabled by booting with kernel parameter `mitigations=off` or `gather_data_sampling=off`. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp)
 
 default
 |               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC | benchmark
@@ -158,6 +172,7 @@ mitigations=off
 |               30.60 |       32,684,184.90 |    0.7% |          171.00 |           76.03 |  2.249 | `Load_AVX2`
 |               18.66 |       53,602,141.29 |    0.3% |           97.00 |           46.34 |  2.093 | `Load_AVX512`
 |              135.25 |        7,393,699.75 |    0.5% |          294.00 |          336.43 |  0.874 | `Gather32_AVX512`
+|               78.83 |       12,685,063.34 |    0.7% |          295.00 |          196.10 |  1.504 | `Gather64_AVX512`
 
 ### Texture Sampling
 Mip-mapping improves sampling performance significantly thanks to better cache locality and reduced memory bandwidth. In the fragment shader, screen-space derivatives can be easily approximated through finite difference of SIMD lanes, exactly as done by GPUs.
@@ -230,6 +245,7 @@ Meshlets:
 - [Modernizing Granite’s mesh rendering – Maister's Graphics Adventures](https://themaister.net/blog/2024/01/17/modernizing-granites-mesh-rendering/)
 - [Basic Meshlet Compression | Liam's Graphics Blog](https://liamtyler.github.io/posts/meshlet_compression/)
 - https://github.com/zeux/meshoptimizer?tab=readme-ov-file#mesh-shading
+- https://github.com/zeux/niagara
 
 Other:
 - [Algorithms for Modern Hardware - Algorithmica](https://en.algorithmica.org/hpc/)

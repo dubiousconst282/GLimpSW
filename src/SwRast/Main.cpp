@@ -153,7 +153,10 @@ void RenderFrame() {
     ImGui::Checkbox("Perf Heatmap", &s_ShowPerfHeatmap);
     ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
 
-    ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0MetallicRoughness\0MeshletId\0TriangleId\0Overdraw\0");
+    ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0MetallicRoughness\0MeshletId\0TriangleId\0OverdrawPixel\0OverdrawQuad\0");
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) s_Layer = (DebugLayer)(((uint32_t)s_Layer - 1) % 8);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) s_Layer = (DebugLayer)(((uint32_t)s_Layer + 1) % 8);
+
     ImGui::SliderFloat("Exposure", &s_Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
 
     ImGui::SeparatorText("Misc");
@@ -164,21 +167,22 @@ void RenderFrame() {
     if (ImGui::IsKeyPressed(ImGuiKey_C)) {
         _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
     }
+
+    float4x4 prevViewMat = _cam.GetViewMatrix(true);
+
     _cam.Update(Camera::GetInputsFromImGui());
 
-    SWR_PERF_BEGIN(Frame);
+    float4x4 projMat = _cam.GetProjMatrix();
+    float4x4 viewMat = _cam.GetViewMatrix(true);
+    float4x4 projViewMat = projMat * viewMat;
 
-    glm::mat4 projMat = _cam.GetProjMatrix();
-    glm::mat4 viewMat = _cam.GetViewMatrix(true);
-    glm::mat4 projViewMat = projMat * viewMat;
+    SWR_PERF_BEGIN(Frame);
 
     ShadingContext shader = {
         .Meshlets = _scene->Meshlets.data(),
         .Materials = _scene->Materials.data(),
         .Lights = _scene->Lights.data(),
         .NumLights = _scene->Lights.size(),
-        .FramebufferSize = float2(_fb->Width, _fb->Height),
-        .OcclDepthMap = s_OcclusionCulling ? _prevDepthMap.get() : nullptr,
         .SkyboxTex = _skyboxTex.get(),
         .ViewPos = _cam.ViewPosition,
         .Exposure = s_Exposure,
@@ -196,45 +200,64 @@ void RenderFrame() {
         shader.NumLights = 1;
     }
 
-    {
-        ZoneScopedN("ClearFb");
-        _fb->Clear(0xFF000000, 0.0f);
-    }
-
     uint32_t drawCalls = 0;
+    bool debugOverdraw = s_Layer == DebugLayer::OverdrawPixel || s_Layer == DebugLayer::OverdrawQuad;
 
     const swr::ShaderDispatchTable& dispatchTable =  //
-        s_Layer == DebugLayer::Overdraw ? ShadingContext::OverdrawShader :
-        s_EnableVisBuffer               ? ShadingContext::VisBufferShader :
-                                          ShadingContext::DeferredShader;
+        debugOverdraw     ? ShadingContext::OverdrawShader :
+        s_EnableVisBuffer ? ShadingContext::VisBufferShader :
+                            ShadingContext::DeferredShader;
+
+    {
+        ZoneScopedN("ClearFb");
+        _fb->Clear(debugOverdraw ? 0 : 0xFF000000, 0.0f);
+    }
 
     for (auto& model : _scene->Models) {
         for (auto& node : model->Nodes) {
             if (node.MeshCount == 0) continue;
 
             ZoneScopedN("Draw Node");
-            shader.UpdateProj(projMat, viewMat, node.GlobalTransform);
-            shader.MeshletOffset = node.MeshOffset;
 
-            _rast->DrawMeshlets(*_fb, node.MeshCount, { dispatchTable, &shader });
-            drawCalls++;
+            constexpr uint32_t maxBatchSize = 65536;
+            v_mask cullBitmap[maxBatchSize / simd::vec_width];
+
+            for (uint32_t i = 0; i < node.MeshCount; i += maxBatchSize) {
+                uint32_t meshCount = std::min(node.MeshCount - i, maxBatchSize);
+
+                SWR_PERF_BEGIN(Culling);
+                uint32_t visibleCount =
+                    ShadingContext::CullMeshlets(cullBitmap, &shader.Meshlets[node.MeshOffset + i], meshCount,  //
+                                                 projMat, viewMat, node.GlobalTransform, prevViewMat,           //
+                                                 float2(_fb->Width, _fb->Height), s_OcclusionCulling ? _prevDepthMap.get() : nullptr);
+                SWR_PERF_END(Culling);
+
+                if (visibleCount > 0) {
+                    shader.MeshletOffset = node.MeshOffset + i;
+                    shader.MeshletCullBitmap = cullBitmap;
+                    shader.UpdateProj(projMat, viewMat, node.GlobalTransform);
+
+                    _rast->DrawMeshlets(*_fb, meshCount, { dispatchTable, &shader });
+                    drawCalls++;
+                }
+            }
         }
     }
     SWR_PERF_BEGIN(Resolve);
 
-    if (s_EnableVisBuffer && s_Layer != DebugLayer::Overdraw) {
-        if (s_Layer == DebugLayer::None) {
-            shader.Resolve(*_rast, *_fb);
-        } else {
-            shader.ResolveDebug(*_rast, *_fb, s_Layer);
-        }
+    if (s_EnableVisBuffer && s_Layer == DebugLayer::None) {
+        shader.Resolve(*_rast, *_fb);
+    } else {
+        shader.ResolveDebug(*_rast, *_fb, s_Layer);
     }
 
     SWR_PERF_END(Resolve);
 
-    {
-        ZoneScopedN("DepthDownsample");
+    if (s_OcclusionCulling) {
+        ZoneScopedN("BuildHiZ");
+        SWR_PERF_BEGIN(Culling);
         swr::texutil::DownsampleDepth(*_fb, *_prevDepthMap);
+        SWR_PERF_END(Culling);
     }
     {
         ZoneScopedN("UploadFrameToGPU");
@@ -262,10 +285,10 @@ void RenderFrame() {
     swr::perf::FlushThreadCounters();
 
     ImGui::Begin("Rasterizer Stats");
-    ImGui::Text("Frame: %.1fms (%.0f FPS), Resolve: %.2fms",   //
+    ImGui::Text("Frame: %.1fms (%.0f FPS), Cull: %.2fms, Resolve: %.2fms",   //
                 swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,   //
                 1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),   //
-                // swr::perf::GetAverage(swr::PerfCounter::ShadowTime) / 1e6,  //
+                swr::perf::GetAverage(swr::PerfCounter::CullingTime) / 1e6,  //
                 swr::perf::GetAverage(swr::PerfCounter::ResolveTime) / 1e6);
 
     ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",         //
