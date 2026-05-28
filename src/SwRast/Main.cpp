@@ -210,7 +210,7 @@ void RenderFrame() {
 
     {
         ZoneScopedN("ClearFb");
-        _fb->Clear(debugOverdraw ? 0 : 0xFF000000, 0.0f);
+        _fb->Clear(0, 0.0f);
     }
 
     for (auto& model : _scene->Models) {
@@ -247,7 +247,7 @@ void RenderFrame() {
 
     if (s_EnableVisBuffer && s_Layer == DebugLayer::None) {
         shader.Resolve(*_rast, *_fb);
-    } else {
+    } else if (s_Layer != DebugLayer::None) {
         shader.ResolveDebug(*_rast, *_fb, s_Layer);
     }
 

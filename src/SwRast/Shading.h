@@ -46,5 +46,5 @@ struct ShadingContext {
     void Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb);
     void ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb, DebugLayer layer);
 
-    static const swr::ShaderDispatchTable& VisBufferShader, DeferredShader, OverdrawShader;
+    static const swr::ShaderDispatchTable VisBufferShader, DeferredShader, OverdrawShader;
 };

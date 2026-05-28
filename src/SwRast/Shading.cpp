@@ -260,20 +260,20 @@ v_float3 ColormapTurbo(v_float x) {
 }
 
 // 2D Polyhedral Bounds of a Clipped, Perspective Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
-// proj = znear, P00, P11
+// proj = P00, P11, znear
 v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
     c.z *= -1;
-    v_int mask = c.z >= r + proj.x;
+    v_int mask = c.z >= r + proj.z;
     if (!simd::any(mask)) return 0;
 
     v_float3 cr = c * r;
     v_float vx = simd::approx_sqrt(c.x * c.x + c.z * c.z - r * r);
     v_float vy = simd::approx_sqrt(c.y * c.y + c.z * c.z - r * r);
 
-    bb.x = (vx * c.x - cr.z) * simd::approx_rcp(vx * c.z + cr.x) * (proj.y * 0.5f) + 0.5f;
-    bb.y = (vy * c.y + cr.z) * simd::approx_rcp(vy * c.z - cr.y) * (proj.z * 0.5f) + 0.5f;
-    bb.z = (vx * c.x + cr.z) * simd::approx_rcp(vx * c.z - cr.x) * (proj.y * 0.5f) + 0.5f;
-    bb.w = (vy * c.y - cr.z) * simd::approx_rcp(vy * c.z + cr.y) * (proj.z * 0.5f) + 0.5f;
+    bb.x = (vx * c.x - cr.z) * simd::approx_rcp(vx * c.z + cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.y = (vy * c.y + cr.z) * simd::approx_rcp(vy * c.z - cr.y) * (proj.y * 0.5f) + 0.5f;
+    bb.z = (vx * c.x + cr.z) * simd::approx_rcp(vx * c.z - cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.w = (vy * c.y - cr.z) * simd::approx_rcp(vy * c.z + cr.y) * (proj.y * 0.5f) + 0.5f;
 
     return mask;
 }
@@ -415,7 +415,7 @@ void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Frag
 
 // http://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/
 void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenUV, float2 screenSize,  //
-                              v_float3& bary, v_float3& ddx, v_float3& ddy) {
+                       v_float3& bary, v_float3& ddx, v_float3& ddy) {
     v_float3 invW = 1.0f / v_float3(v0.w, v1.w, v2.w);
 
     v_float2 p0 = v_float2(v0) * invW.x;
@@ -646,7 +646,7 @@ v_float3 EvalLighting(const SurfaceData& surf, const Light* lights, uint32_t num
 
 };  // namespace
 
-const swr::ShaderDispatchTable&        //
+const swr::ShaderDispatchTable         //
     ShadingContext::VisBufferShader =  //
     swr::GetDispatchTable<&ShadeMeshlet,
                           &FS_EncodeSurfaceId<false>,  // 0
@@ -791,7 +791,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
     }
 
     float objectToWorldScale = glm::length(float3(modelMat[0])); // assuming uniform
-    float3 projFactors = float3(projMat[3][2], projMat[0][0], projMat[1][1]);  // znear, f/ar, -f
+    float3 projFactors = float3(projMat[0][0], projMat[1][1], projMat[3][2]);  // f/ar, -f, znear
     uint32_t visibleCount = 0;
 
     for (uint32_t offset = 0; offset < count; offset += simd::vec_width) {
@@ -808,6 +808,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
             visible &= dist > -boundRadius;
         }
 
+        // Occlusion culling
         if (depthMap != nullptr && simd::any(visible)) {
             v_float3 boundCenterVS = v_float3(mul(objectToPrevViewMat, v_float4(boundCenter, 1)));
             v_float boundRadiusVS = boundRadius * objectToWorldScale;
@@ -825,7 +826,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
                 v_int x1 = simd::min(simd::conv<int>(screenBB.z * frameSize.x), int(frameSize.x) - 1) >> mipLevel;
                 v_int y1 = simd::min(simd::conv<int>(screenBB.w * frameSize.y), int(frameSize.y) - 1) >> mipLevel;
 
-                v_float depthSphere = projFactors.x / (-boundCenterVS.z - boundRadiusVS);
+                v_float depthSphere = projFactors.z / (-boundCenterVS.z - boundRadiusVS);
                 v_float depthVisible = FLT_MAX;
 
                 for (v_int y = y0; simd::any(y <= y1); y += 1) {

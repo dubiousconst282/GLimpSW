@@ -54,7 +54,7 @@ struct ClipCodes {
     uint8_t OutCodes[16];   // Planes that need to be clipped against (per-triangle).
 };
 struct Clipper {
-    glm::vec2 GuardBandFactor;
+    float2 GuardBandFactor;
     uint32_t OutIdx, OutMaxIdx;
     
     TrianglePacket* OutTris;
@@ -65,12 +65,12 @@ struct Clipper {
     alignas(64) float OutVertices[3][4][simd::vec_width];
 
     // Compute Cohen-Sutherland clip codes
-    static ClipCodes ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, glm::vec2 guardBandFactor);
+    static ClipCodes ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, float2 guardBandFactor);
 
     // Clip non-trivial triangles into output buffer.
-    void ClipTriangles(v_float4 v0, v_float4 v1, v_float4 v2, ClipCodes cc, glm::ivec2 vpHalfSize, FaceCullMode cullMode);
+    void ClipTriangles(v_float4 v0, v_float4 v1, v_float4 v2, ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode);
 
-    void FlushPacket(glm::ivec2 vpHalfSize, FaceCullMode cullMode, bool isLast);
+    void FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast);
 
     // dot(pos[i].xyz, plane.norm) + pos[i].w * scale
     float GetIntersectDist(uint8_t i, uint32_t planeId, float scale) const {
@@ -96,7 +96,11 @@ struct ThreadedRunner {
     }
 
     template<typename TCallback>
-    void Dispatch(TCallback&& cb);
+    void Dispatch(TCallback&& cb) {
+        Dispatch([](void* pData, uint32_t workerId) { (*(TCallback*)pData)(workerId); }, &cb);
+    }
+
+    void Dispatch(void (*cb)(void* pData, uint32_t workerId), void* pData);
 
     uint32_t GetThreadCount() const { return _threads.size() + 1; }
 
@@ -151,9 +155,9 @@ static v_float4 GatherPos(const ShadedMeshlet& mesh, v_uint idx) {
 }
 
 void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding shader) {
-    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
-    glm::vec2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
-    if (!EnableGuardband) guardBandFactor = glm::vec2(1.0f);
+    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
+    float2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
+    if (!EnableGuardband) guardBandFactor = float2(1.0f);
 
     _runner->Dispatch([&](uint32_t workerId) {
         for (uint32_t meshIdx = workerId; meshIdx < count; meshIdx += _runner->GetThreadCount()) {
@@ -254,7 +258,7 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
 }
 
 // https://fgiesen.wordpress.com/2013/02/08/triangle-rasterization-in-practice
-v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode) {
+v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfSize, FaceCullMode cullMode) {
     v0 = simd::perspective_div(v0);
     v1 = simd::perspective_div(v1);
     v2 = simd::perspective_div(v2);
@@ -269,7 +273,7 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 v
     v_mask mask = simd::movemask(det > 0);
     if (mask == 0) return 0;
 
-    glm::vec2 fixScale = vpHalfSize * 16;
+    float2 fixScale = vpHalfSize * 16;
     v_int x0 = simd::round2i(v0.x * fixScale.x), y0 = simd::round2i(v0.y * fixScale.y);
     v_int x1 = simd::round2i(v1.x * fixScale.x), y1 = simd::round2i(v1.y * fixScale.y);
     v_int x2 = simd::round2i(v2.x * fixScale.x), y2 = simd::round2i(v2.y * fixScale.y);
@@ -293,7 +297,7 @@ static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
     w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1;  // top-left rule bias
     return w >> 4;                               // normalize fixed point
 }
-void TriangleEdgeVars::Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize) {
+void TriangleEdgeVars::Setup(const TrianglePacket& tris, int2 vpHalfSize) {
     v_int x0 = tris.Pos0 << 16 >> 16, y0 = tris.Pos0 >> 16;
     v_int x1 = tris.Pos1 << 16 >> 16, y1 = tris.Pos1 >> 16;
     v_int x2 = tris.Pos2 << 16 >> 16, y2 = tris.Pos2 >> 16;
@@ -337,7 +341,7 @@ v_int2 TrianglePacket::GetBoundingBox() const {
 
     return { minPos, maxPos };
 }
-v_uint2 TrianglePacket::GetRenderBoundingBox(glm::ivec2 vpHalfSize) const {
+v_uint2 TrianglePacket::GetRenderBoundingBox(int2 vpHalfSize) const {
     v_int2 packed = GetBoundingBox();
 
     v_int vpSize = vpHalfSize.x | (vpHalfSize.y << 16);
@@ -350,7 +354,7 @@ v_uint2 TrianglePacket::GetRenderBoundingBox(glm::ivec2 vpHalfSize) const {
     return v_uint2((v_uint)packed.x, (v_uint)packed.y);
 }
 
-ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, glm::vec2 guardBandFactor) {
+ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, float2 guardBandFactor) {
     using v_byte = uint8_t [[clang::ext_vector_type(16)]];
     using v_bool = bool [[clang::ext_vector_type(16)]];
 
@@ -395,7 +399,7 @@ ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, glm::
     memcpy(codes.OutCodes, &partialOutcodes, 16);
     return codes;
 }
-void Clipper::ClipTriangles(v_float4 v0, v_float4 v1, v_float4 v2, ClipCodes cc, glm::ivec2 vpHalfSize, FaceCullMode cullMode) {
+void Clipper::ClipTriangles(v_float4 v0, v_float4 v1, v_float4 v2, ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode) {
     for (uint32_t i = 0; i < 3; i++) {
         v_float4 vi = i == 0 ? v0 : i == 1 ? v1 : v2;
         uint32_t j = i * simd::vec_width;
@@ -476,7 +480,7 @@ void Clipper::ClipTriangles(v_float4 v0, v_float4 v1, v_float4 v2, ClipCodes cc,
         FlushPacket(vpHalfSize, cullMode, true);
     }
 }
-void Clipper::FlushPacket(glm::ivec2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
+void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
     uint32_t i = OutIdx / simd::vec_width;
     TrianglePacket& tri = OutTris[i];
     tri.ClipData = &OutData[i];
@@ -505,8 +509,8 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, ShaderBinding
     for (uint32_t i = 0; i < 64; i += _queue->NumWorkers) {
         workerBinElectMask |= 1ull << i;
     }
-    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
-    glm::vec2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
+    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
+    float2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
 
     auto readyBarrier = Barrier(_queue->NumWorkers);
     std::atomic<uint32_t> doneMeshCount = 0;
@@ -698,7 +702,7 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t bi
     uint32_t binX = binId - binY * _queue->BinsPerRow;
     binX *= BinSize, binY *= BinSize;
 
-    glm::ivec2 vpHalfSize = glm::ivec2(fb.Width, fb.Height) / 2;
+    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
 
     // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
     volatile uint32_t binPosMin = binX | binY << 16;
@@ -819,47 +823,22 @@ void BinQueue::Commit() {
     // }
 }
 
-void Rasterizer::Dispatch(uint32_t countX, uint32_t countY, void (*cb)(void* pUser, uint32_t x, uint32_t y), void* pUser) {
-    const uint32_t BlockSize = 4;
-    uint32_t numBlocksX = (countX + BlockSize - 1) / BlockSize;
-    uint32_t numBlocksY = (countY + BlockSize - 1) / BlockSize;
-    uint32_t numBlocks = numBlocksX * numBlocksY;
-    std::atomic<uint32_t> nextBlockId = 0;
+void Rasterizer::Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser) { _runner->Dispatch(cb, pUser); }
 
-    _runner->Dispatch([&](uint32_t workerId) {
-        while (true) {
-            uint32_t i = nextBlockId.fetch_add(1, std::memory_order::relaxed);
-            if (i >= numBlocks) break;
-
-            uint32_t x0 = (i % numBlocksX) * BlockSize;
-            uint32_t y0 = (i / numBlocksX) * BlockSize;
-            uint32_t x1 = std::min(x0 + BlockSize, countX);
-            uint32_t y1 = std::min(y0 + BlockSize, countY);
-
-            for (uint32_t y = y0; y < y1; y++) {
-                for (uint32_t x = x0; x < x1; x++) {
-                    cb(pUser, x, y);
-                }
-            }
-        }
-    });
-}
-
-template<typename TCallback>
-void ThreadedRunner::Dispatch(TCallback&& cb) {
-    if (_threads.empty()) { cb(0); return; }
+void ThreadedRunner::Dispatch(void (*cb)(void* pData, uint32_t workerId), void* pData) {
+    if (_threads.empty()) { cb(pData, 0); return; }
 
     assert(_numBusy.load(std::memory_order::acquire) == 0);
 
-    _jobData = &cb;
-    _jobCallback = [](void* pData, uint32_t workerId) { (*(TCallback*)pData)(workerId); };
+    _jobData = pData;
+    _jobCallback = cb;
 
     // Notify workers of a new job
     _numBusy.store(_threads.size(), std::memory_order::release);
     _timestamp.fetch_add(1, std::memory_order::release);
     _timestamp.notify_all();
 
-    cb(0);
+    cb(pData, 0);
 
     // Wait idle
     while (_numBusy.load(std::memory_order::acquire) > 0) _mm_pause();

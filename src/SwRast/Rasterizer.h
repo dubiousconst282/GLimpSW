@@ -107,8 +107,8 @@ SIMD_INLINE T BaryLerp(v_float3 bary, T v0, T v1, T v2) {
     T result;
     result.x = BaryLerp(bary, v0.x, v1.x, v2.x);
     result.y = BaryLerp(bary, v0.y, v1.y, v2.y);
-    if constexpr (sizeof(T) == sizeof(v_float) * 3) result.z = BaryLerp(bary, v0.z, v1.z, v2.z);
-    if constexpr (sizeof(T) == sizeof(v_float) * 4) result.w = BaryLerp(bary, v0.w, v1.w, v2.w);
+    if constexpr (sizeof(T) >= sizeof(v_float) * 3) result.z = BaryLerp(bary, v0.z, v1.z, v2.z);
+    if constexpr (sizeof(T) >= sizeof(v_float) * 4) result.w = BaryLerp(bary, v0.w, v1.w, v2.w);
     return result;
 }
 
@@ -138,8 +138,8 @@ struct FragmentVars {
 };
 
 struct TriangleClipData {
-    glm::vec3 ClippedU[simd::vec_width];
-    glm::vec3 ClippedV[simd::vec_width];
+    float3 ClippedU[simd::vec_width];
+    float3 ClippedV[simd::vec_width];
     uint8_t PrimId[simd::vec_width];
 };
 struct TrianglePacket {
@@ -154,10 +154,10 @@ struct TrianglePacket {
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
 
-    v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, glm::ivec2 vpHalfSize, FaceCullMode cullMode);
+    v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfSize, FaceCullMode cullMode);
 
     v_int2 GetBoundingBox() const;
-    v_uint2 GetRenderBoundingBox(glm::ivec2 vpHalfSize) const;
+    v_uint2 GetRenderBoundingBox(int2 vpHalfSize) const;
 };
 struct TriangleEdgeVars {
     uint8_t VertexId[3][simd::vec_width];
@@ -172,7 +172,7 @@ struct TriangleEdgeVars {
     v_float Z0, Z10, Z20;       // Z0, ((Z1, Z2) - Z0) * rcpArea 
     v_float W0, W0S, W1S, W2S;  // W0, (W0, W1, W2) * rcpArea
 
-    void Setup(const TrianglePacket& tris, glm::ivec2 vpHalfSize);
+    void Setup(const TrianglePacket& tris, int2 vpHalfSize);
 };
 
 struct ShaderDispatchTable {
@@ -203,39 +203,53 @@ struct Rasterizer {
     static constexpr uint32_t MaxRenderSize = 2896;  // Determined by integer overflow bound around edge equations. 2**(31/2 - 4)
 
     // Debug
-    bool EnableBinning = true;    // Force use of unbinned rasterizer (may artifact with multi threads)
-    bool EnableClipping = true;   // Disable non-trivial clipping
-    bool EnableGuardband = true;  // Disable clipping guardband
+    bool EnableBinning = true;    // Use binned rasterizer (if disabled, may artifact due to thread racing)
+    bool EnableClipping = true;   // Enable non-trivial clipping
+    bool EnableGuardband = true;  // Enable guardband clipping
 
     Rasterizer(uint32_t numThreads = 0);
     ~Rasterizer();
 
     void DrawMeshlets(Framebuffer& fb, uint32_t count, ShaderBinding shader);
 
-    // Dispatch a number of invocations to callback in parallel.
+    // Dispatch work to the thread pool. `cb(uint32_t workerId)`
     template<typename TCallback>
-    void Dispatch(uint32_t countX, uint32_t countY, TCallback&& cb) {
-        Dispatch(countX, countY, [](void* pUser, uint32_t x, uint32_t y) { (*(TCallback*)pUser)(x, y); }, &cb);
+    [[gnu::nodebug]] void Dispatch(TCallback&& cb) {
+        Dispatch([](void* pUser, uint32_t workerId) { (*(TCallback*)pUser)(workerId); }, &cb);
     }
 
-    void Dispatch(uint32_t countX, uint32_t countY, void (*cb)(void* pUser, uint32_t x, uint32_t y), void* pUser);
+    void Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser);
 
-    // Iterates over framebuffer tiles in parallel. `cb(uint2 tileBasePos, v_int tilePos, v_float2 tileUV)`
+    // Iterates over framebuffer tiles in parallel. `cb(uint2 tileBasePos, v_int tilePos, v_float2 tileNdc)`
     template<typename TCallback>
-    void DispatchPass(Framebuffer& fb, TCallback&& cb) {
-        glm::vec2 scaleUV = 2.0f / glm::vec2(fb.Width, fb.Height);
-        glm::vec2 centerUV = 0.5f * scaleUV - 1.0f;
+    [[gnu::nodebug]] void DispatchPass(Framebuffer& fb, TCallback&& cb) {
+        DispatchPass(uint2(fb.Width, fb.Height), cb);
+    }
 
-        Dispatch((fb.Width + 31) / 32, (fb.Height + 31) / 32, [&](uint32_t x, uint32_t y) {
-            for (int sy = 0; sy < 32; sy += 4) {
-                for (int sx = 0; sx < 32; sx += 4) {
-                    int x0 = (int)x * 32 + sx;
-                    int y0 = (int)y * 32 + sy;
-                    if (x0 >= fb.Width || y0 >= fb.Height) continue;
+    template<typename TCallback>
+    void DispatchPass(uint2 numInvocs, TCallback&& cb) {
+        float2 scaleNdc = 2.0f / float2(numInvocs);
+        float2 centerNdc = 0.5f * scaleNdc - 1.0f;
 
-                    v_int2 tilePos = v_int2(x0 + FragPixelOffsetsX, y0 + FragPixelOffsetsY);
-                    v_float2 tileUV = conv<float>(tilePos) * scaleUV + centerUV;
-                    [[clang::always_inline]] cb(glm::uvec2(x0, y0), tilePos, tileUV);
+        const uint32_t GroupSize = 128;
+        uint32_t numGroupsX = (numInvocs.x + GroupSize - 1) / GroupSize;
+        uint32_t numGroupsY = (numInvocs.y + GroupSize - 1) / GroupSize;
+        uint32_t numGroups = numGroupsX * numGroupsY;
+        uint32_t nextGroupId = GetThreadCount();
+
+        Dispatch([&](uint32_t workerId) {
+            for (uint32_t i = workerId; i < numGroups; i = __atomic_fetch_add(&nextGroupId, 1, __ATOMIC_RELAXED)) {
+                uint32_t x0 = (i % numGroupsX) * GroupSize;
+                uint32_t y0 = (i / numGroupsX) * GroupSize;
+                uint32_t x1 = std::min(x0 + GroupSize, numInvocs.x);
+                uint32_t y1 = std::min(y0 + GroupSize, numInvocs.y);
+
+                for (uint32_t y = y0; y < y1; y += 4) {
+                    for (uint32_t x = x0; x < x1; x += 4) {
+                        v_int2 tilePos = v_int2((int)x + FragPixelOffsetsX, (int)y + FragPixelOffsetsY);
+                        v_float2 tileNdc = conv<float>(tilePos) * scaleNdc + centerNdc;
+                        [[clang::always_inline]] cb(uint2(x, y), tilePos, tileNdc);
+                    }
                 }
             }
         });
@@ -310,8 +324,8 @@ struct Rasterizer {
                     v *= pw2 * rcpW;
 
                     if (IsClipped) {
-                        glm::vec3 ru = tri.ClipData->ClippedU[i];
-                        glm::vec3 rv = tri.ClipData->ClippedV[i];
+                        float3 ru = tri.ClipData->ClippedU[i];
+                        float3 rv = tri.ClipData->ClippedV[i];
                         v_float cu = simd::fma(u, ru.y, simd::fma(v, ru.z, ru.x));
                         v_float cv = simd::fma(u, rv.y, simd::fma(v, rv.z, rv.x));
                         u = cu, v = cv;
@@ -369,6 +383,7 @@ enum class PerfCounter {
     TrianglesClipped,
     BinQueueFlushes,  // Number of bins rasterized
 
+    CullingTime,
     DrawTime,
     ResolveTime,
 
