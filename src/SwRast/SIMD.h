@@ -122,6 +122,8 @@ struct mdvec<T, 4> {
 #undef SIMD_DEF_BIN_OP
 #undef SIMD_DEF_OPS
 
+template<typename T, int N> SIMD_INLINE constexpr mdvec<T, N> operator-(mdvec<T, N> v) { return 0 - v; }
+
 };  // namespace simd
 
 // Type aliases
@@ -148,6 +150,7 @@ using float2 = glm::vec2;
 using float3 = glm::vec3;
 using float4 = glm::vec4;
 using float4x4 = glm::mat4x4;
+using float3x3 = glm::mat3x3;
 
 using int2 = glm::ivec2;
 using int3 = glm::ivec3;
@@ -257,6 +260,10 @@ SIMD_TFN_MASK constexpr bool all(T mask) { return movemask(mask) == (unsigned _B
 
 template<is_vector T>
 SIMD_INLINE void cmov(T& dest, T ifTrue, mask_vec<T> cond) {
+    dest = cond ? ifTrue : dest;
+}
+template<is_vector T>
+SIMD_INLINE void cmov(T& dest, elem_type<T> ifTrue, mask_vec<T> cond) {
     dest = cond ? ifTrue : dest;
 }
 template<typename T, int N>
@@ -468,7 +475,15 @@ SIMD_INLINE v_float3 mul(const glm::mat3& m, const v_float3& n) {
         fma(n.x, m[0][1], fma(n.y, m[1][1], n.z * m[2][1])),
         fma(n.x, m[0][2], fma(n.y, m[1][2], n.z * m[2][2])),
     };
-};
+}
+
+SIMD_INLINE v_float3 mul(const v_float m[4][3], const v_float4& v) {
+    return {
+        fma(v.x, m[0][0], fma(v.y, m[1][0], fma(v.z, m[2][0], v.w * m[3][0]))),
+        fma(v.x, m[0][1], fma(v.y, m[1][1], fma(v.z, m[2][1], v.w * m[3][1]))),
+        fma(v.x, m[0][2], fma(v.y, m[1][2], fma(v.z, m[2][2], v.w * m[3][2]))),
+    };
+}
 
 SIMD_INLINE v_float4 perspective_div(const v_float4& v) {
     v_float rw = 1.0f / v.w;
@@ -536,3 +551,13 @@ public:
 };
 
 };  // namespace simd
+
+//////////////////////////////////////// Questionable Utility Macros ////////////////////////////////////////
+
+// Notes:
+// - Widening mask to uint32 saves redundant trunc/moves
+// - Ptr cast avoids redundant re-spills, https://github.com/llvm/llvm-project/issues/190725)
+#define simd_foreach_unique_lane(i, v, activeMask)                                                                             \
+    for (auto [pendingMask, iterMask, i] = std::tuple{ uint32_t(v_mask(activeMask)), v == v, simd::elem_type<decltype(v)>{} }; \
+         (i = ((simd::elem_type<decltype(v)>*)&v)[simd::tzcnt(pendingMask)], iterMask = v == i, pendingMask != 0);             \
+         pendingMask &= ~(uint32_t)simd::movemask(iterMask))

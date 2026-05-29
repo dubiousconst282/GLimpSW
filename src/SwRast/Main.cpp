@@ -49,7 +49,7 @@ GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint
 }
 
 void CreateFramebuffer(uint32_t width, uint32_t height) {
-    _fb = swr::CreateFramebuffer(width, height, 3);
+    _fb = swr::CreateFramebuffer(width, height, ShadingContext::NumFbLayers);
 
     uint32_t halfW = 1 << (32 - simd::lzcnt((width - 1) / 2));
     uint32_t halfH = 1 << (32 - simd::lzcnt((height - 1) / 2));
@@ -179,10 +179,10 @@ void RenderFrame() {
     SWR_PERF_BEGIN(Frame);
 
     ShadingContext shader = {
-        .Meshlets = _scene->Meshlets.data(),
         .Materials = _scene->Materials.data(),
         .Lights = _scene->Lights.data(),
         .NumLights = _scene->Lights.size(),
+        .WorldToClipMat = projMat * viewMat,
         .SkyboxTex = _skyboxTex.get(),
         .ViewPos = _cam.ViewPosition,
         .Exposure = s_Exposure,
@@ -200,7 +200,6 @@ void RenderFrame() {
         shader.NumLights = 1;
     }
 
-    uint32_t drawCalls = 0;
     bool debugOverdraw = s_Layer == DebugLayer::OverdrawPixel || s_Layer == DebugLayer::OverdrawQuad;
 
     const swr::ShaderDispatchTable& dispatchTable =  //
@@ -213,37 +212,44 @@ void RenderFrame() {
         _fb->Clear(0, 0.0f);
     }
 
+    auto instances = std::vector<InstanceData>();
+    instances.reserve(1024);
+
     for (auto& model : _scene->Models) {
+        ZoneScopedN("Draw Model");
+
         for (auto& node : model->Nodes) {
             if (node.MeshCount == 0) continue;
 
-            ZoneScopedN("Draw Node");
+            constexpr uint32_t batchSize = std::min(16384u, ShadingContext::MaxMeshletsPerDraw);
+            v_mask cullBitmap[batchSize / simd::vec_width];
 
-            constexpr uint32_t maxBatchSize = 65536;
-            v_mask cullBitmap[maxBatchSize / simd::vec_width];
-
-            for (uint32_t i = 0; i < node.MeshCount; i += maxBatchSize) {
-                uint32_t meshCount = std::min(node.MeshCount - i, maxBatchSize);
+            for (uint32_t i = 0; i < node.MeshCount; i += batchSize) {
+                uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
 
                 SWR_PERF_BEGIN(Culling);
                 uint32_t visibleCount =
-                    ShadingContext::CullMeshlets(cullBitmap, &shader.Meshlets[node.MeshOffset + i], meshCount,  //
+                    ShadingContext::CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount,  //
                                                  projMat, viewMat, node.GlobalTransform, prevViewMat,           //
                                                  float2(_fb->Width, _fb->Height), s_OcclusionCulling ? _prevDepthMap.get() : nullptr);
                 SWR_PERF_END(Culling);
 
                 if (visibleCount > 0) {
-                    shader.MeshletOffset = node.MeshOffset + i;
-                    shader.MeshletCullBitmap = cullBitmap;
-                    shader.UpdateProj(projMat, viewMat, node.GlobalTransform);
+                    shader.InstanceMeshlets = &_scene->Meshlets[node.MeshOffset + i];
+                    shader.InstanceCullBitmap = cullBitmap;
+                    shader.InstanceId = instances.size();
+                    shader.ObjectToWorldMat = node.GlobalTransform;
+                    shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform);
 
                     _rast->DrawMeshlets(*_fb, meshCount, { dispatchTable, &shader });
-                    drawCalls++;
+                    instances.push_back({ .Meshlets = shader.InstanceMeshlets, .Transform = node.GlobalTransform });
                 }
             }
         }
     }
     SWR_PERF_BEGIN(Resolve);
+
+    shader.Instances = instances.data();
 
     if (s_EnableVisBuffer && s_Layer == DebugLayer::None) {
         shader.Resolve(*_rast, *_fb);

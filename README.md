@@ -27,10 +27,9 @@ _Sample screenshots of the current version (deferred vis-buffer), showing perfor
 - Guard-band clipping
 
 ### Missing/broken features
-- Vis-buffer resolve pass does not handle models with more than one node properly (need to support per-node transform matrices, maybe difficult)
 - Clipping not implemented in binned rasterizer (to be rewritten)
-- Non-binned rasterizer does not synchronize, artifacts when multi-threading
-- Occlusion culling uses prev frame's depth map + reprojection, does not account for newly visible objects (should be easy to fix but doesn't bother me)
+- Non-binned rasterizer does not synchronize, artifacts with multi-threading
+- Occlusion culling uses reprojection only, results in occasional disocclusion artifacts
 - IBL, SSAO, TAA not yet ported to meshlet branch
 
 ## Implementation Notes
@@ -108,7 +107,20 @@ Still, measuring render times on Bistro after skipping triangles of certain size
 
 Fragment lane usage is indeed pretty bad even before the depth test, averaging at 11-14% for small, and 40-60% for large-ish tris. Looking at the floor brings it up to 80-95%. It's unclear whether rasterizing multiple triangles per SIMD would improve throughput considerably, due to the overhead in gathering and scattering framebuffer data while also handling conflicts.
 
+### Vis-buffer
 Both overdraw and the quad utilization issue can be mitigated by moving complexity out of the fragment shader using a vis-buffer. On Sponza, the complete raster+resolve passes take around 0.8-1.2x as long as just the deferred raster pass [TODO: more detailed comparison].
+
+The resolve pass is very expansive, but the overall cost is quite consistent. It is largely compute bound.
+
+Bistro rendering profile summary (680k tris, 1080p, single thread):
+- 37.4ms raster, 34.3ms resolve
+- 80.7%: ResolveSurface
+  - 17.6%: Gather vertex attribs
+  - ~>17.0%: Transform, project, intersect triangles
+  - ~>24.9%: Sample textures (albedo + packed normal_mr)
+  - 18.3%: Unpack normal+tangent, texture remapping
+    - TODO: 6x oct unmap, ~5% alone. Maybe best to use 2x RGB10 instead?
+- 11.1%: EvalLighting (for one directional light)
 
 ### Coarse Raster
 The rasterizer uses a basic bounding-box traversal to step over the triangle, which results in many redundant steps over empty space for larger triangles. These could be avoided with [one of the many smarter traversal algorithms](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/), but some profiling shows traversal is also not as problematic as it seems in theory: on a view with a bunch of moderately large tris, only ~14% of time is spent on the edge stepping loop for the vis-buffer shader which writes only the depth and surface ID:
@@ -124,7 +136,7 @@ The `tileMask != 0` branch also has a pretty high misprediction rate, which make
 TODO: write about how old benchmark was subtly broken due to stupidity, new results, and impl difficulties (buffering, vpmulld). [CoarseRaster.cpp](./src/SwRast/Benchmarks/CoarseRaster.cpp).
 
 ### Memory Gathers
-Memory gathers are fundamental for general SIMT-style programming, but they are not well accelerated on current x86 CPUs and always scalarized to one memory access micro-op per lane (plus other overhead), providing significantly lower throughput compared to sequential vector loads. In some cases, they can be avoided in place of more efficient in-register permutes.
+Memory gathers are fundamental for general SIMT-style programming, but they are not well accelerated on current x86 CPUs and always scalarized to one memory access per lane, providing significantly lower throughput compared to sequential vector loads. In some cases, they can be avoided in place of more efficient sequences like in-register permutes.
 
 ---
 
@@ -152,6 +164,36 @@ auto hi = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(idx, 1), ptr, 4);
 auto x = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 0, hi);
 auto y = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 1, hi);
 ```
+
+---
+
+For gathering multiple fields where duplicate indices are common, fetching unique lanes one at a time using a "waterfall/cascade" loop can be more efficient, since gathers have a significant and constant minimum cost. On Bistro, the vis-buffer resolve pass peaks at an average of 3.7 different triangles per 4x4 pixels, which shows this approach is effective even for reasonably detailed scenes. [GatherMany.cpp](./src/SwRast/Benchmarks/GatherMany.cpp)
+
+```cpp
+v_int surfaceId = simd::load(tileData);
+
+for (v_mask pendingMask = activeMask; pendingMask != 0;) {
+    uint32_t surfaceId_i = tileData[simd::tzcnt(pendingMask)];
+
+    v_int iterMask = (surfaceId == surfaceId_i);
+    pendingMask &= ~simd::movemask(iterMask);
+
+    const Meshlet& mesh = ctx.Meshlets[surfaceId_i / swr::ShadedMeshlet::MaxPrims];
+    uint32_t i0 = mesh.Indices[0][surfaceId_i % swr::ShadedMeshlet::MaxPrims];
+    simd::cmov(pos[0].x, mesh.Positions[0][i0], iterMask);  // `vbroadcastss zmm {k}, [mem]`
+    simd::cmov(pos[0].y, mesh.Positions[1][i0], iterMask);
+    simd::cmov(pos[0].z, mesh.Positions[2][i0], iterMask);
+}
+```
+
+Time(ns) to gather Y fields from X unique indices:
+
+| Method     | 1   | 2   | 3   | 4   | 5   |**6**| 7   | 8   | 9   | 10  | 11  | 12  | 13  | 14  | 15  |
+| ------     |-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| Gather x4  |21.67|21.64|21.66|21.58|21.59|21.60|21.60|21.58|21.61|21.60|21.64|21.71|21.70|21.72|21.73|
+| Cascade x4 |4.50 |6.62 |9.46 |13.01|16.80|21.15|28.38|32.88|38.06|43.86|48.93|55.66|63.15|69.65|79.88|
+| Gather x8  |37.12|37.11|37.15|37.15|37.08|36.95|36.90|36.98|37.03|36.91|36.94|36.93|37.00|36.95|36.93|
+| Cascade x8 |7.06 |11.17|15.70|19.88|25.08|31.07|38.34|46.75|56.64|64.52|73.25|81.55|89.81|100.13|110.46|
 
 ---
 
@@ -214,9 +256,9 @@ Benchmark: Sampling a 4096x4096 texture, row by row, with some fixed rotation an
 
 The TiledY4 and TiledY8 layouts swizzle across 4x4 and 8x8 pixel tiles respectively. Tiled16X4 swizzles across two-levels, 16x16 and 4x4. The indexing formula has been simplified by placing pixels in column-major order, as described in [fatmap.txt](https://www.flipcode.com/documents/fatmap.txt): `(y & 7) | (x << 3) | ((y & ~7) << stride)` (3 cycles latency).
 
-It is a bit surprising that 8x8 tiling outperforms 4x4, considering each 4x4 tile maps into exactly one cacheline. This appears to be largely related to the hardware prefetcher and TLB misses (perf stat reports ~36% fewer unused prefetches, ~32% fewer TLB misses). The wider 16x4 swizzle slightly reduces TLB and prefetch misses further, but increases "cycle_activity.stalls_mem_any" by 12% for some unknown reason.
+It is a bit surprising that 8x8 tiling outperforms 4x4, considering each 4x4 tile maps into exactly one cacheline. This appears to be largely related to the hardware prefetcher and TLB misses (perf stat reports ~36% fewer unused prefetches, ~32% fewer TLB misses). The wider 16x4 swizzle slightly reduces TLB and prefetch misses further, but increases "cycle_activity.stalls_mem_any" by 12% for some undetermined reason.
 
-Constant folding and other compiler optimizations may introduce redundant constants, which can be harmful since vector constants need to be loaded from memory. Ternlog is mostly opaque to Clang and can be used to avoid some of this, e.g. `y & 7` and `ternlog<A & ~C>(y, y, 7)` need only one constant slot.
+TODO: Measure impact of huge pages. Seems like texture allocs are implicitly promoted to 2MB pages via THP, but only on a fresh boot
 
 ## Building
 The project uses CMake and CPM for build and dependency management. It depends on Clang's vector type extension and various related intrinsics.

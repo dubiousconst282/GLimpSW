@@ -20,7 +20,7 @@ static void CombineNormalMR(swr::StbImage& normalMap, const swr::StbImage& mrMap
     uint8_t* mrPixels = mrMap.Data.get();
 
     for (uint32_t i = 0; i < count; i += 4) {
-        glm::vec3 N = glm::vec3(pixels[i + 0], pixels[i + 1], pixels[i + 2]);
+        float3 N = float3(pixels[i + 0], pixels[i + 1], pixels[i + 2]);
         N = glm::normalize(N / 127.0f - 1.0f) * 127.0f + 127.0f;
 
         pixels[i + 0] = (uint8_t)roundf(N.x);
@@ -71,12 +71,14 @@ static swr::StbImage LoadImage(const std::string& basePath, const cgltf_texture_
         .Data = { pixels, stbi_image_free },
     };
 }
-
 static swr::RgbaTexture2D::Ptr LoadTextures(const std::string& basePath, const cgltf_material* mat) {
     swr::StbImage baseColorImg = LoadImage(basePath, mat->pbr_metallic_roughness.base_color_texture);
 
     if (!baseColorImg.Width) {
-        return swr::CreateTexture<swr::RgbaTexture2D>(4, 4, 1, 1);
+        const float* baseColor = mat->pbr_metallic_roughness.base_color_factor;
+        auto tex = swr::CreateTexture<swr::RgbaTexture2D>(4, 4, 1, 1);
+        tex->WriteTile(swr::pixfmt::RGBA8u::Pack({ baseColor[0], baseColor[1], baseColor[2], baseColor[3] }), 0, 0);
+        return tex;
     }
     swr::StbImage normalImg = LoadImage(basePath, mat->normal_texture);
     swr::StbImage metalRoughImg = LoadImage(basePath, mat->pbr_metallic_roughness.metallic_roughness_texture);
@@ -179,17 +181,17 @@ Model* Scene::ImportGltf(const std::string& path) {
         Materials[materialOffset + i] = {
             .Texture = Textures[i].get(),
             .IsDoubleSided = mat->double_sided != 0,
-            .AlphaCutoff = (uint8_t)(mat->alpha_mode == cgltf_alpha_mode_mask ? mat->alpha_cutoff * 255.0f + 0.5f : 255),
+            .AlphaCutoff = (uint8_t)(mat->alpha_mode == cgltf_alpha_mode_mask  ? mat->alpha_cutoff * 255.0f + 0.5f : 255),
         };
     }
 
     std::vector<uint32_t> indices;
-    std::vector<glm::vec3> positions;
-    std::vector<glm::vec3> normals;
-    std::vector<glm::vec3> tangents;
+    std::vector<float3> positions;
+    std::vector<float3> normals;
+    std::vector<float3> tangents;
 
     std::vector<glm::uvec2> primMeshletRanges;
-    
+
     for (uint32_t meshIdx = 0; meshIdx < gltf->meshes_count; meshIdx++) {
         cgltf_mesh* mesh = &gltf->meshes[meshIdx];
 
@@ -212,7 +214,7 @@ Model* Scene::ImportGltf(const std::string& path) {
             positions.resize(positionsAcc->count);
             cgltf_accessor_unpack_floats(positionsAcc, &positions[0].x, positionsAcc->count * 3);
 
-            const float cone_weight = 0.25f;
+            const float cone_weight = 0.0f;
 
             size_t maxMeshlets = meshopt_buildMeshletsBound(indices.size(), swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims);
             std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
@@ -220,7 +222,7 @@ Model* Scene::ImportGltf(const std::string& path) {
             std::vector<uint8_t> meshletTriangles(indices.size());
 
             size_t numMeshlets = meshopt_buildMeshlets(meshlets.data(), meshletVertices.data(), meshletTriangles.data(), indices.data(),
-                                                       indices.size(), &positions[0].x, positions.size(), sizeof(glm::vec3),
+                                                       indices.size(), &positions[0].x, positions.size(), sizeof(float3),
                                                        swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims, cone_weight);
 
             const cgltf_accessor* texcoordAcc = cgltf_find_accessor(prim, cgltf_attribute_type_texcoord, 0);
@@ -234,14 +236,12 @@ Model* Scene::ImportGltf(const std::string& path) {
 
                 meshopt_Bounds bounds =
                     meshopt_computeMeshletBounds(&meshletVertices[m.vertex_offset], &meshletTriangles[m.triangle_offset], m.triangle_count,
-                                                 &positions[0].x, positions.size(), sizeof(glm::vec3));
+                                                 &positions[0].x, positions.size(), sizeof(float3));
 
                 Meshlet& om = Meshlets[nextMeshletOffset++];
-                om.BoundCenter = glm::vec3(bounds.center[0], bounds.center[1], bounds.center[2]);
+                om.BoundCenter = float3(bounds.center[0], bounds.center[1], bounds.center[2]);
                 om.BoundRadius = bounds.radius;
-                om.ConeApex = { bounds.cone_apex[0], bounds.cone_apex[1], bounds.cone_apex[2] };
-                om.ConeAxis = { bounds.cone_axis[0], bounds.cone_axis[1], bounds.cone_axis[2] };
-                om.ConeCutoff = bounds.cone_cutoff;
+                om.CullingCone = bounds.cone_axis_s8[0] | bounds.cone_axis_s8[1] << 8 | bounds.cone_axis_s8[2] << 16 | bounds.cone_cutoff_s8 << 24;
 
                 om.NumVertices = m.vertex_count;
                 om.NumTriangles = m.triangle_count;
@@ -251,24 +251,24 @@ Model* Scene::ImportGltf(const std::string& path) {
                 for (uint32_t i = 0; i < m.vertex_count; i++) {
                     uint32_t vertIdx = meshletVertices[m.vertex_offset + i];
 
-                    glm::vec3 pos = positions[vertIdx];
+                    float3 pos = positions[vertIdx];
                     om.Positions[0][i] = pos.x;
                     om.Positions[1][i] = pos.y;
                     om.Positions[2][i] = pos.z;
 
                     if (texcoordAcc) {
-                        glm::vec2 texcoord;
+                        float2 texcoord;
                         cgltf_accessor_read_float(texcoordAcc, vertIdx, &texcoord.x, 2);
                         om.TexCoords[i] = glm::packHalf2x16(texcoord);
                     }
                     if (normalAcc) {
-                        glm::vec3 normal;
-                        glm::vec4 tangent = glm::vec4(0);
+                        float3 normal;
+                        float4 tangent = float4(0);
                         cgltf_accessor_read_float(normalAcc, vertIdx, &normal.x, 3);
                         if (tangentAcc) cgltf_accessor_read_float(tangentAcc, vertIdx, &tangent.x, 4);
 
                         v_float2 normalOct = swr::texutil::MapOctahedron(normal);
-                        v_float2 tangentOct = swr::texutil::MapOctahedron(glm::vec3(tangent));
+                        v_float2 tangentOct = swr::texutil::MapOctahedron(float3(tangent));
                         om.NormalTangents[i] = glm::packUnorm4x8({ normalOct.x[0], normalOct.y[0], tangentOct.x[0], tangentOct.y[0] });
                         om.TangentHandedness |= (tangent.w < 0 ? (1ull << i) : 0);
                     }

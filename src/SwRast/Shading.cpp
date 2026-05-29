@@ -279,15 +279,15 @@ v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
 }
 
 void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
-    if (ctx.MeshletCullBitmap != nullptr) {
-        v_mask mask = ctx.MeshletCullBitmap[index / simd::vec_width];
+    if (ctx.InstanceCullBitmap != nullptr) {
+        v_mask mask = ctx.InstanceCullBitmap[index / simd::vec_width];
 
         if ((mask >> (index % simd::vec_width) & 1) == 0) {
             output.PrimCount = 0;
             return;
         }
     }
-    const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + index];
+    const Meshlet& mesh = ctx.InstanceMeshlets[index];
 
     // TODO: meshlet compression, the mem loads take longest here (>65%)
     // https://liamtyler.github.io/posts/meshlet_compression/
@@ -314,7 +314,7 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
     if (vars.TileMask == 0) return;
 
     if constexpr (EnableAlphaTest) {
-        const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + vars.MeshletId];
+        const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
         const Material& material = ctx.Materials[mesh.MaterialId];
 
         v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
@@ -325,7 +325,9 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
 
         vars.TileMask &= simd::movemask(color >= uint32_t(material.AlphaCutoff << 24));
     }
-    v_uint surfaceId = (ctx.MeshletOffset + vars.MeshletId) * swr::ShadedMeshlet::MaxPrims + vars.PrimId;
+    v_uint surfaceId = vars.MeshletId * swr::ShadedMeshlet::MaxPrims + vars.PrimId;
+    surfaceId |= ctx.InstanceId << ShadingContext::VisbDrawShift;
+
     vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
     vars.StoreTile(fb.GetColorBuffer(), surfaceId);
 }
@@ -347,7 +349,7 @@ void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Frag
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
     if (vars.TileMask == 0) return;
 
-    const Meshlet& mesh = ctx.Meshlets[ctx.MeshletOffset + vars.MeshletId];
+    const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
 
     if (mesh.MaterialId == UINT_MAX) {
         vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
@@ -462,7 +464,6 @@ void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenUV,
     ddx = interpW_ddx * (bary * interpInvW + ddx) - bary;
     ddy = interpW_ddy * (bary * interpInvW + ddy) - bary;
 }
-
 struct SurfaceData {
     v_uint Albedo;
     v_float3 Normal;
@@ -473,42 +474,56 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     v_float3 pos[3];
     v_uint packedTexCoord[3];
     v_uint packedNormalTangent[3];
-    v_uint tangentHandedness = 0;
+    v_mask tangentHandedness = 0;
     v_uint materialId = 0;
 
     v_uint surfaceId = simd::load(tileData);
 
-    // Waterfall loop appears to be faster than gathers, almost always
-    for (v_mask pendingMask = activeMask; pendingMask != 0;) {
-        uint32_t surfaceId_i = tileData[simd::tzcnt(pendingMask)];
-        uint32_t meshletId_i = surfaceId_i / swr::ShadedMeshlet::MaxPrims;
-        uint32_t triangle_i = surfaceId_i % swr::ShadedMeshlet::MaxPrims;
+    simd_foreach_unique_lane(i, surfaceId, activeMask) {
+        const InstanceData& instance = ctx.Instances[i >> ShadingContext::VisbDrawShift];
+        const Meshlet& mesh = instance.Meshlets[i / swr::ShadedMeshlet::MaxPrims % ShadingContext::MaxMeshletsPerDraw];
+        uint32_t triangleId = i % swr::ShadedMeshlet::MaxPrims;
 
-        v_int iterMask = (surfaceId == surfaceId_i);
-        pendingMask &= ~simd::movemask(iterMask);
-
-        const Meshlet& mesh = ctx.Meshlets[meshletId_i];
+        simd::cmov(materialId, mesh.MaterialId, iterMask);
 
         #pragma unroll
         for (uint32_t vi = 0; vi < 3; vi++) {
-            uint32_t idx = mesh.Indices[vi][triangle_i];
+            uint32_t idx = mesh.Indices[vi][triangleId];
 
-            simd::cmov(pos[vi].x, v_float(mesh.Positions[0][idx]), iterMask);
-            simd::cmov(pos[vi].y, v_float(mesh.Positions[1][idx]), iterMask);
-            simd::cmov(pos[vi].z, v_float(mesh.Positions[2][idx]), iterMask);
-            simd::cmov(packedTexCoord[vi], v_uint(mesh.TexCoords[idx]), iterMask);
-            simd::cmov(packedNormalTangent[vi], v_uint(mesh.NormalTangents[idx]), iterMask);
+            simd::cmov(pos[vi].x, mesh.Positions[0][idx], iterMask);
+            simd::cmov(pos[vi].y, mesh.Positions[1][idx], iterMask);
+            simd::cmov(pos[vi].z, mesh.Positions[2][idx], iterMask);
+            simd::cmov(packedTexCoord[vi], mesh.TexCoords[idx], iterMask);
+            simd::cmov(packedNormalTangent[vi], mesh.NormalTangents[idx], iterMask);
 
             if (vi == 0 && (mesh.TangentHandedness >> idx & 1)) {
-                simd::cmov(tangentHandedness, v_uint(1u << 31), iterMask);
+                tangentHandedness |= simd::movemask(iterMask);
             }
         }
-        simd::cmov(materialId, v_uint(mesh.MaterialId), iterMask);
     }
 
-    v_float4 ndc0 = simd::mul(ctx.ObjectToClipMat, v_float4(pos[0], 1.0f));
-    v_float4 ndc1 = simd::mul(ctx.ObjectToClipMat, v_float4(pos[1], 1.0f));
-    v_float4 ndc2 = simd::mul(ctx.ObjectToClipMat, v_float4(pos[2], 1.0f));
+    v_float transform[4][3];
+    v_uint instanceId = surfaceId >> ShadingContext::VisbDrawShift;
+
+    simd_foreach_unique_lane(i, instanceId, activeMask) {
+        const InstanceData& instance = ctx.Instances[i];
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            simd::cmov(transform[j][0], instance.Transform[j].x, iterMask);
+            simd::cmov(transform[j][1], instance.Transform[j].y, iterMask);
+            simd::cmov(transform[j][2], instance.Transform[j].z, iterMask);
+        }
+    }
+
+    // For 3 vectors, (M1 * (M2 * V)) is slightly cheaper than ((M1 * M2) * V)  (64 vs 54 FLOPs)
+    pos[0] = simd::mul(transform, v_float4(pos[0], 1));
+    pos[1] = simd::mul(transform, v_float4(pos[1], 1));
+    pos[2] = simd::mul(transform, v_float4(pos[2], 1));
+
+    v_float4 ndc0 = simd::mul(ctx.WorldToClipMat, v_float4(pos[0], 1));
+    v_float4 ndc1 = simd::mul(ctx.WorldToClipMat, v_float4(pos[1], 1));
+    v_float4 ndc2 = simd::mul(ctx.WorldToClipMat, v_float4(pos[2], 1));
 
     v_float3 bary, ddx, ddy;
     IntersectTriangle(ndc0, ndc1, ndc2, screenUV, screenSize, bary, ddx, ddy);
@@ -527,15 +542,11 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     };
 
     v_uint packedAlbedo = 0;
-    v_uint packedNMR = 0;
+    v_uint packedNMR = 0xFF00'8080; // 100% roughness, norm(0,0,+1)
 
-    for (v_mask pendingMask = activeMask & simd::movemask(materialId != UINT_MAX); pendingMask != 0;) {
-        uint32_t id = ((uint32_t*)&materialId)[simd::tzcnt(pendingMask)];
-
-        v_int iterMask = materialId == id;
-        pendingMask &= ~simd::movemask(iterMask);
-
-        const swr::RgbaTexture2D& tex = *ctx.Materials[id].Texture;
+    simd_foreach_unique_lane(i, materialId, activeMask & simd::movemask(materialId != UINT_MAX)) {
+        // TODO: should probably add access mask to texture sampling, since UVs might vary wildly across different tris/lanes
+        const swr::RgbaTexture2D& tex = *ctx.Materials[i].Texture;
         v_int mipLevel = swr::texutil::CalcMipLevel(texGrad, v_float2(tex.ScaleU, tex.ScaleV));
         simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texU, texV, 0, mipLevel), iterMask);
 
@@ -549,26 +560,21 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     UnpackNormalTangent(packedNormalTangent[1], normal1, tangent1);
     UnpackNormalTangent(packedNormalTangent[2], normal2, tangent2);
 
-    v_float3 normalWS = simd::normalize(simd::mul(ctx.ObjectToWorldMat, swr::BaryLerp(bary, normal0, normal1, normal2)));
-    v_float3 normalRemapped = normalWS;
+    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(swr::BaryLerp(bary, normal0, normal1, normal2), 0)));
+    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(swr::BaryLerp(bary, tangent0, tangent1, tangent2), 0)));
+    v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
+    simd::cmov(bitangentWS, -bitangentWS, _mm512_movm_epi32(tangentHandedness));
 
-    if (simd::any((packedNMR & 0xFFFF) != 0)) {
-        v_float3 tangentWS = simd::normalize(simd::mul(ctx.ObjectToWorldMat, swr::BaryLerp(bary, tangent0, tangent1, tangent2)));
+    // Reconstruct Z from 2-channel normap map https://aras-p.info/texts/CompactNormalStorage.html
+    v_float3 normalTS = v_float3(simd::conv<float>(packedNMR >> v_uint2(0, 8) & 255) * (1.0f / 127.5f) - 1.0f, 0);
+    normalTS.z = simd::approx_sqrt(1.0f - (normalTS.x * normalTS.x + normalTS.y * normalTS.y));
 
-        v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
-        bitangentWS = simd::as<v_float3>(simd::as<v_uint3>(bitangentWS) ^ tangentHandedness);
-
-        // Reconstruct Z from 2-channel normap map https://aras-p.info/texts/CompactNormalStorage.html
-        v_float3 normalTS = v_float3(simd::conv<float>(packedNMR >> v_uint2(0, 8) & 255) * (1.0f / 127.5f) - 1.0f, 0);
-        normalTS.z = simd::approx_sqrt(1.0f - (normalTS.x * normalTS.x + normalTS.y * normalTS.y));
-
-        // simd::normalize(simd::mul(normalTS, float3x3(tangentWS, bitangentWS, normalWS)));
-        normalRemapped = simd::normalize({
-            normalTS.x * tangentWS.x + normalTS.y * bitangentWS.x + normalTS.z * normalWS.x,
-            normalTS.x * tangentWS.y + normalTS.y * bitangentWS.y + normalTS.z * normalWS.y,
-            normalTS.x * tangentWS.z + normalTS.y * bitangentWS.z + normalTS.z * normalWS.z,
-        });
-    }
+    // simd::normalize(simd::mul(normalTS, float3x3(tangentWS, bitangentWS, normalWS)));
+    v_float3 normalRemapped = simd::normalize({
+        normalTS.x * tangentWS.x + normalTS.y * bitangentWS.x + normalTS.z * normalWS.x,
+        normalTS.x * tangentWS.y + normalTS.y * bitangentWS.y + normalTS.z * normalWS.y,
+        normalTS.x * tangentWS.z + normalTS.y * bitangentWS.z + normalTS.z * normalWS.z,
+    });
 
     return {
         .Albedo = packedAlbedo,
@@ -639,7 +645,7 @@ v_float3 EvalLighting(const SurfaceData& surf, const Light* lights, uint32_t num
 
         finalColor += (Fd + Fr) * light.Color * simd::max(NoL * attenuation, 0.0f);
     }
-    finalColor += baseColor * 0.05;  // ambient
+    finalColor += baseColor * (30 * exposure);  // ambient
 
     return finalColor;
 }
@@ -677,7 +683,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
             v_float3 skyColor = SkyboxTex->SampleOctLevel<EnvSampler>(worldPos - ViewPos, 1);
             cmov(finalColor, skyColor, skyMask);
         }
-        finalColor = Tonemap_Unreal(finalColor * Exposure);
+        finalColor = Tonemap_Unreal(finalColor);
 
         if (ShowPerfHeatmap) {
             uint64_t t2 = __rdtsc();

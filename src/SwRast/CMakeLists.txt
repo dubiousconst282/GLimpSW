@@ -24,7 +24,8 @@ add_executable(BenchmarkApp
     Benchmarks/RasterBench.cpp
     # Benchmarks/CoarseRaster.cpp
     # Benchmarks/TexGather64.cpp
-    # Benchmarks/GatherSmall.cpp
     # Benchmarks/TexSwizzle.cpp
+    # Benchmarks/GatherSmall.cpp
+    # Benchmarks/GatherMany.cpp
 )
 target_link_libraries(BenchmarkApp PRIVATE SwRast nanobench)

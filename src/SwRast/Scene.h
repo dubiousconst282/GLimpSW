@@ -13,10 +13,9 @@ struct Material {
     uint8_t AlphaCutoff;
 };
 struct Meshlet {
-    glm::vec3 BoundCenter;
+    float3 BoundCenter;
     float BoundRadius;
-    glm::vec3 ConeApex, ConeAxis;
-    float ConeCutoff;
+    int32_t CullingCone; // s8 axis[3], s8 cutoff 
 
     uint8_t NumVertices, NumTriangles;
     uint8_t AlphaCutoff;
@@ -39,8 +38,8 @@ struct TransformTRS {
 };
 
 struct ModelNode {
-    uint32_t MeshOffset, MeshCount;
-    uint32_t ParentIdx;
+    uint32_t MeshOffset = 0, MeshCount = 0;
+    uint32_t ParentIdx = UINT_MAX;
 
     std::vector<uint32_t> Joints;
     std::vector<glm::mat4x3> InverseBindMatrices;
@@ -53,9 +52,9 @@ struct Light {
     enum LightType : uint32_t { kTypeDirectional, kTypePoint, kTypeSpot };
 
     LightType Type;
-    glm::vec3 Position;
-    glm::vec3 Direction;
-    glm::vec3 Color;
+    float3 Position;
+    float3 Direction;
+    float3 Color;
     float Intensity;  // cd or lux
     float Radius;
     float SpotInnerAngle, SpotOuterAngle;

@@ -7,36 +7,42 @@
 
 enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, MeshletId, TriangleId, OverdrawPixel, OverdrawQuad };
 
+struct InstanceData {
+    const Meshlet* Meshlets;
+    glm::mat4x3 Transform;
+};
+
 // https://google.github.io/filament/Filament.html
 // https://bruop.github.io/ibl/
 struct ShadingContext {
-    static constexpr uint32_t NumFbLayers = 3;
+    static constexpr uint32_t  //
+        NumFbLayers = 3,       //
+
+        VisbMeshletBits = 11,  //
+        VisbDrawShift = VisbMeshletBits + std::countr_zero(swr::ShadedMeshlet::MaxPrims),
+        MaxMeshletsPerDraw = 1 << VisbMeshletBits,  //
+        MaxDrawCalls = 1 << (32 - VisbDrawShift);
 
     // Uniform: Per scene
-    const Meshlet* Meshlets;
     const Material* Materials;
     const Light* Lights;
     uint32_t NumLights;
 
     // Uniform: Per instance
-    uint32_t MeshletOffset;
-    const v_mask* MeshletCullBitmap;
+    const Meshlet* InstanceMeshlets;
+    const v_mask* InstanceCullBitmap;
+    uint32_t InstanceId;
 
     glm::mat4 WorldToClipMat, ObjectToClipMat;
     glm::mat3 ObjectToWorldMat;
 
     // Uniform: Resolve pass
+    const InstanceData* Instances;
     swr::HdrTexture2D* SkyboxTex;
     glm::vec3 ViewPos;
 
     float Exposure = 1.0f;
     bool ShowPerfHeatmap = false;
-
-    void UpdateProj(const glm::mat4& proj, glm::mat4& view, const glm::mat4& model) {
-        WorldToClipMat = proj * view;
-        ObjectToClipMat = WorldToClipMat * model;
-        ObjectToWorldMat = model;
-    }
 
     static uint32_t CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count,  //
                                  const float4x4& projMat, const float4x4& viewMat, const float4x4& modelMat,
