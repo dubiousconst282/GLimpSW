@@ -321,7 +321,7 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
         v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
         v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
         v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
-        v_uint color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv.x, uv.y);
+        v_uint color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
 
         vars.TileMask &= simd::movemask(color >= uint32_t(material.AlphaCutoff << 24));
     }
@@ -363,7 +363,7 @@ void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Frag
     v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
     v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
 
-    v_uint baseColor = material.Texture->SampleImplicitLod<SurfaceSampler>(uv.x, uv.y);
+    v_uint baseColor = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
     vars.TileMask &= simd::movemask(baseColor >= uint32_t(material.AlphaCutoff << 24));
     if (vars.TileMask == 0) return;
 
@@ -371,7 +371,7 @@ void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Frag
 
     if (material.Texture->NumLayers >= 2) {
         // Nx Ny M R
-        v_uint packedNMR = material.Texture->SampleImplicitLod<SurfaceSampler>(uv.x, uv.y, 1);
+        v_uint packedNMR = material.Texture->SampleImplicitLod<SurfaceSampler>(uv, 1);
 
         // Reconstruct Z from 2-channel normap map https://aras-p.info/texts/CompactNormalStorage.html
         v_float3 normalTS = v_float3(simd::conv<float>(packedNMR >> v_uint2(0, 8) & 255) * (1.0f / 127.5f) - 1.0f, 0);
@@ -532,8 +532,7 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     v_float2 texCoord10 = swr::pixfmt::RG16f::Unpack(packedTexCoord[1]) - texCoord0;
     v_float2 texCoord20 = swr::pixfmt::RG16f::Unpack(packedTexCoord[2]) - texCoord0;
 
-    v_float texU = texCoord0.x + texCoord10.x * bary.y + texCoord20.x * bary.z;
-    v_float texV = texCoord0.y + texCoord10.y * bary.y + texCoord20.y * bary.z;
+    v_float2 texCoord = texCoord0 + texCoord10 * bary.y + texCoord20 * bary.z;
     v_float4 texGrad = {
         texCoord10.x * ddx.y + texCoord20.x * ddx.z,
         texCoord10.y * ddx.y + texCoord20.y * ddx.z,
@@ -548,10 +547,10 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
         // TODO: should probably add access mask to texture sampling, since UVs might vary wildly across different tris/lanes
         const swr::RgbaTexture2D& tex = *ctx.Materials[i].Texture;
         v_int mipLevel = swr::texutil::CalcMipLevel(texGrad, v_float2(tex.ScaleU, tex.ScaleV));
-        simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texU, texV, 0, mipLevel), iterMask);
+        simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texCoord, 0, mipLevel), iterMask);
 
         if (tex.NumLayers >= 2) {
-            simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texU, texV, 1, mipLevel), iterMask);
+            simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texCoord, 1, mipLevel), iterMask);
         }
     }
     v_float3 normal0, normal1, normal2;
@@ -838,7 +837,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
                 for (v_int y = y0; simd::any(y <= y1); y += 1) {
                     for (v_int x = x0; simd::any(x <= x1); x += 1) {
                         v_int activeMask = projMask && x <= x1 && y <= y1;
-                        v_uint value = depthMap->Fetch(activeMask ? x : 0, activeMask ? y : 0, 0, mipLevel - 1);
+                        v_uint value = depthMap->Fetch(v_int2(x, y), 0, mipLevel - 1, activeMask);
                         simd::cmov(depthVisible, simd::min(depthVisible, simd::as<v_float>(value)), activeMask);
                     }
                 }

@@ -95,7 +95,7 @@ HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLe
                 v[i] = asinf(-dir.y[i]) / simd::pi + 0.5f;
             }
 
-            v_float3 tile = panoTex->SampleLevel<PanoSampler>(u, v, 0, 0);
+            v_float3 tile = panoTex->SampleLevel<PanoSampler>(v_float2(u, v), 0, 0);
             cubeTex->WriteTile(tile, x, y);
         }
     }
@@ -176,8 +176,7 @@ struct Downsampler {
     }
     void Store8x8(uint32_t x, uint32_t y, uint32_t level, v_float data[4]) {
         if (Dst.Layout == TextureLayout::TiledY8) {
-            uint32_t stride = Dst.RowShift - level;
-            uint32_t* dst = &Dst.Data[Dst.MipOffsets[level] + Dst.GetTexelOffset(x, y, stride)];
+            uint32_t* dst = &Dst.Data[Dst.MipOffsets[level] + Dst.GetTexelOffset(x, y, level)];
 
             constexpr v_uint idx0 = { 0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29 };
             constexpr v_uint idx1 = { 2, 6, 10, 14, 18, 22, 26, 30, 3, 7, 11, 15, 19, 23, 27, 31 };

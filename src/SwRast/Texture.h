@@ -13,7 +13,7 @@ template<typename T, typename... U>
 concept IsAnyOf = (std::same_as<T, U> || ...);
 
 template<typename T>
-concept Texel = requires(const T& s, const T::UnpackedTy& u, v_uint p) {
+concept TexelFormat = requires(const T& s, const T::UnpackedTy& u, v_uint p) {
     IsAnyOf<typename T::UnpackedTy, v_uint, v_float, v_float2, v_float3, v_float4>;
     IsAnyOf<typename T::LerpedTy, v_uint, typename T::UnpackedTy>;
     { T::Unpack(p) } -> std::same_as<typename T::UnpackedTy>;
@@ -202,15 +202,18 @@ private:
 };  // namespace pixfmt
 
 enum class TextureLayout {
-    Linear,   // Row-major
-    TiledY8,  // 8x8 tiling (optimal for texture sampling)
+    Linear,   // Row-major                  (optimal for sequential access)
+    TiledX4,  // 4x4 tiling, row-major      (optimal for rendering)
+    TiledY8,  // 8x8 tiling, POT-only sizes (optimal for sampling)
+
+    Default = TiledY8,
 };
 
-template<pixfmt::Texel Texel, TextureLayout Layout = TextureLayout::TiledY8>
+template<pixfmt::TexelFormat Format, TextureLayout Layout = TextureLayout::Default>
 struct Texture2D;
 
-template<pixfmt::Texel T>
-using TexturePtr2D = std::unique_ptr<Texture2D<T>, simd::AlignedDeleter>;
+template<pixfmt::TexelFormat Format, TextureLayout Layout = TextureLayout::Default>
+using TexturePtr2D = std::unique_ptr<Texture2D<Format, Layout>, simd::AlignedDeleter>;
 
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
@@ -311,10 +314,11 @@ struct SamplerDesc {
     FilterMode MinFilter = FilterMode::Nearest;
 };
 
-template<pixfmt::Texel Texel_, TextureLayout Layout_>
+template<pixfmt::TexelFormat Fmt_, TextureLayout Layout_>
 struct Texture2D {
-    using Ptr = TexturePtr2D<Texel_>;
-    using Texel = Texel_;
+    using Ptr = TexturePtr2D<Fmt_, Layout_>;
+    using Format = Fmt_;
+
     static constexpr TextureLayout Layout = Layout_;
 
     static constexpr int LerpFracBits = 8;  // Number of fractional bits in pixel coords for bilinear interpolation
@@ -341,13 +345,13 @@ struct Texture2D {
 
         if constexpr (Layout_ == TextureLayout::Linear) {
             for (uint32_t y = 0; y < Height; y++) {
-                memcpy(&dst[y << RowShift], &src[y * stride], Width * 4);
+                memcpy(&dst[y * Width], &src[y * stride], Width * 4);
             }
         } else {
             // TODO: optimize
             for (uint32_t y = 0; y < Height; y++) {
                 for (uint32_t x = 0; x < Width; x++) {
-                    dst[GetTexelOffset(x, y, RowShift)] = src[x + y * stride];
+                    dst[GetTexelOffset(x, y, mipLevel)] = src[x + y * stride];
                 }
             }
         }
@@ -359,24 +363,28 @@ struct Texture2D {
         assert(x % 4 == 0 && y % 4 == 0);
         assert(layer < NumLayers && mipLevel < MipLevels);
 
-        uint32_t stride = RowShift - mipLevel;
-        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel] + GetTexelOffset(x, y, stride)];
+        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel] + GetTexelOffset(x, y, mipLevel)];
 
         if constexpr (Layout_ == TextureLayout::Linear) {
-            _mm_storeu_epi32(&dst[0 << stride], _mm512_extracti32x4_epi32(value, 0));
-            _mm_storeu_epi32(&dst[1 << stride], _mm512_extracti32x4_epi32(value, 1));
-            _mm_storeu_epi32(&dst[2 << stride], _mm512_extracti32x4_epi32(value, 2));
-            _mm_storeu_epi32(&dst[3 << stride], _mm512_extracti32x4_epi32(value, 3));
+            uint32_t stride = Width >> mipLevel;
+            _mm_storeu_epi32(&dst[0 * stride], _mm512_extracti32x4_epi32(value, 0));
+            _mm_storeu_epi32(&dst[1 * stride], _mm512_extracti32x4_epi32(value, 1));
+            _mm_storeu_epi32(&dst[2 * stride], _mm512_extracti32x4_epi32(value, 2));
+            _mm_storeu_epi32(&dst[3 * stride], _mm512_extracti32x4_epi32(value, 3));
         } else if constexpr (Layout_ == TextureLayout::TiledY8) {
             value = _mm512_permutexvar_epi32(v_uint{ 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 }, value);
             _mm_storeu_epi32(&dst[0], _mm512_extracti32x4_epi32(value, 0));
             _mm_storeu_epi32(&dst[8], _mm512_extracti32x4_epi32(value, 1));
             _mm_storeu_epi32(&dst[16], _mm512_extracti32x4_epi32(value, 2));
             _mm_storeu_epi32(&dst[24], _mm512_extracti32x4_epi32(value, 3));
+        } else if constexpr (Layout_ == TextureLayout::TiledX4) {
+            _mm512_store_epi32(dst, value);
+        } else {
+            static_assert(!"Bad layout");
         }
     }
-    void WriteTile(const Texel::UnpackedTy& value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
-        WriteTile(Texel::Pack(value), x, y, layer, mipLevel);
+    void WriteTile(const Format::UnpackedTy& value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
+        WriteTile(Format::Pack(value), x, y, layer, mipLevel);
     }
 
     void GenerateMips() {
@@ -388,32 +396,33 @@ struct Texture2D {
     }
 
     // Fetch raw texels from storage. All coordinates must be in-bounds.
-    [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int x, v_int y, v_int layer = 0, v_int mipLevel = 0) const {
-        v_int stride = (int)RowShift;
+    [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int2 pos, v_int layer = 0, v_int mipLevel = 0, v_int laneMask = -1) const {
         v_int offset = layer * (int)LayerStride;
 
         if (simd::any(mipLevel > 0)) {
-            stride -= mipLevel;
             offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
         }
-        return simd::gather(Data, offset + GetTexelOffset(x, y, stride));
+        return simd::gather(Data, offset + GetTexelOffset(pos.x, pos.y, mipLevel), laneMask);
     }
 
     // Sample with implicit derivatives.
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleImplicitLod(v_float u, v_float v, v_int layer = 0) const {
-        v_float su = u * ScaleLerpU, sv = v * ScaleLerpV;
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleImplicitLod(v_float2 pos, v_int layer = 0) const {
+        v_float su = pos.x * ScaleLerpU, sv = pos.y * ScaleLerpV;
 
         v_float4 grad = { texutil::dFdx(su), texutil::dFdx(sv), texutil::dFdy(su), texutil::dFdy(sv) };
         v_int mipLevel = texutil::CalcMipLevel(grad) - LerpFracBits;
-        return SampleLevel<SD>(u, v, layer, mipLevel);
+        return SampleLevel<SD>(pos, layer, mipLevel);
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleLevel(v_float u, v_float v, v_int layer, v_int mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLevel(v_float2 pos, v_int layer, v_int mipLevel) const {
         // Scale and round UVs 
-        v_float su = u * ScaleLerpU, sv = v * ScaleLerpV;
+        v_float su = pos.x * ScaleLerpU, sv = pos.y * ScaleLerpV;
         v_int ix = simd::round2i(su), iy = simd::round2i(sv);
+
+        // TODO: support repeat wrap modes for non-POT textures
+        static_assert(Layout_ == TextureLayout::TiledY8 || SD.Wrap == WrapMode::ClampToEdge);
 
         // Wrap
         if constexpr (SD.Wrap == WrapMode::ClampToEdge) {
@@ -437,65 +446,78 @@ struct Texture2D {
 
         // Calculate offsets and mip position
         v_int offset = layer * (int)LayerStride;
-        v_int stride = (int)RowShift;
 
         if (simd::any(mipLevel > 0)) {
             ix >>= mipLevel, iy >>= mipLevel;
-            stride -= mipLevel;
             offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
         }
 
         // Sample
         if (filter == FilterMode::Nearest) [[likely]] {
-            v_uint res = simd::gather(Data, offset + GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, stride));
+            v_uint res = simd::gather(Data, offset + GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, mipLevel));
 
-            if constexpr (std::is_same<typename Texel::LerpedTy, v_uint>()) {
+            if constexpr (std::is_same<typename Format::LerpedTy, v_uint>()) {
                 return res;
             } else {
-                return Texel::Unpack(res);
+                return Format::Unpack(res);
             }
         }
-        return SampleLinear(ix, iy, offset, stride, mipLevel);
+        return SampleLinear(ix, iy, offset, mipLevel);
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOctImplicitLod(const v_float3& dir) const {
-        v_float2 uv = texutil::MapOctahedron(dir);
-        return SampleImplicitLod<SD>(uv.x, uv.y);
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctImplicitLod(const v_float3& dir) const {
+        return SampleImplicitLod<SD>(texutil::MapOctahedron(dir));
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleOctLevel(const v_float3& dir, v_float mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctLevel(const v_float3& dir, v_float mipLevel) const {
         v_float2 uv = texutil::MapOctahedron(dir);
 
         v_int baseMip = simd::conv<int>(mipLevel);
-        auto baseSample = SampleLevel<SD>(uv.x, uv.y, 0, baseMip);
+        auto baseSample = SampleLevel<SD>(uv, 0, baseMip);
 
         v_float mipFrac = mipLevel - simd::conv<float>(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
-            auto lowerSample = SampleLevel<SD>(uv.x, uv.y, 0, baseMip + 1);
+            auto lowerSample = SampleLevel<SD>(uv, 0, baseMip + 1);
             return baseSample + (lowerSample - baseSample) * mipFrac;
         }
         return baseSample;
     }
 
-    static constexpr v_int GetTexelOffset(v_int x, v_int y, v_int stride) {
+    v_int GetTexelOffset(v_int x, v_int y, v_int mipLevel) const {
         if constexpr (Layout_ == TextureLayout::Linear) {
-            return x + (y << stride);
+            return _mm512_dpwssds_epi32(x, y, (int)Width >> mipLevel);  // safe for all inputs within [-2**15..2**15)
         }
         if constexpr (Layout_ == TextureLayout::TiledY8) {
+            v_int stride = (int)RowShift - mipLevel;
             // ternlog prevents clang from duplicating mem load for const(7)
-            v_int t1 = _mm512_ternarylogic_epi32(y, y, v_int(7), _MM_TERNLOG_A & ~_MM_TERNLOG_C);
+            v_int t1;
+            t1 = _mm512_ternarylogic_epi32(t1, y, v_int(7), _MM_TERNLOG_B & ~_MM_TERNLOG_C);
             return (y & 7) | (x << 3) | (t1 << stride);
+        }
+        if constexpr (Layout_ == TextureLayout::TiledX4) {
+            v_int t1;
+            t1 = _mm512_ternarylogic_epi32(t1, y, v_int(3), _MM_TERNLOG_B & ~_MM_TERNLOG_C);
+            t1 = _mm512_dpwssds_epi32(x & 3, t1, (int)Width >> mipLevel);
+
+            v_int t2 = _mm512_ternarylogic_epi32(x, y, v_int(3), (_MM_TERNLOG_A & ~_MM_TERNLOG_C) | (_MM_TERNLOG_B & _MM_TERNLOG_C));
+            return t1 + (t2 << 2);
         }
         return 0;
     }
-    static constexpr uint32_t GetTexelOffset(uint32_t x, uint32_t y, uint32_t stride) {
+    uint32_t GetTexelOffset(uint32_t x, uint32_t y, uint32_t mipLevel) const {
         if constexpr (Layout_ == TextureLayout::Linear) {
-            return x + (y << stride);
+            return x + y * (Width >> mipLevel);
         }
         if constexpr (Layout_ == TextureLayout::TiledY8) {
+            uint32_t stride = RowShift - mipLevel;
             return (y & 7) | (x << 3) | ((y & ~7u) << stride);
+        }
+        if constexpr (Layout_ == TextureLayout::TiledX4) {
+            uint32_t tileOffset = ((x & ~3u) << 2) + (y & ~3u) * (Width >> mipLevel);
+            uint32_t pixelOffset = (x & 3) + ((y & 3) << 2);
+            return pixelOffset + tileOffset;
         }
         return 0;
     }
@@ -503,7 +525,7 @@ struct Texture2D {
 private:
 
     // Interpolates texels overlapping the specified pixel coords (in N.LerpFracBits fixed-point). No bounds check.
-    [[gnu::pure, gnu::always_inline]] Texel::LerpedTy SampleLinear(v_int ixf, v_int iyf, v_int offset, v_int stride, v_int mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLinear(v_int ixf, v_int iyf, v_int offset, v_int mipLevel) const {
         ixf = simd::max(ixf - (LerpFracMask / 2), 0);
         iyf = simd::max(iyf - (LerpFracMask / 2), 0);
 
@@ -516,27 +538,27 @@ private:
         v_uint data00, data10, data01, data11;
 
         if constexpr (Layout_ == TextureLayout::Linear) {
-            v_int indices00 = offset + ix + (iy << stride);
-            v_int indices01 = indices00 + (inboundY ? (1 << stride) : 0);
+            v_int indices00 = offset + GetTexelOffset(ix, iy, mipLevel);
+            v_int indices01 = indices00 + (inboundY ? (int)Width : 0);
             v_uint2 lo = simd::gather2(Data, indices00);
             v_uint2 hi = simd::gather2(Data, indices01);
             data00 = lo.x, data10 = lo.y;
             data01 = hi.x, data11 = hi.y;
         } else if constexpr (Layout_ == TextureLayout::TiledY8) {
-            v_int indices00 = offset + GetTexelOffset(ix, iy, stride);
+            v_int indices00 = offset + GetTexelOffset(ix, iy, mipLevel);
             data00 = simd::gather(Data + 0, indices00);
             data10 = simd::gather(Data + 8, indices00);
-            v_int indices01 = offset + GetTexelOffset(ix, iy + (inboundY ? 1 : 0), stride);
+            v_int indices01 = offset + GetTexelOffset(ix, iy + (inboundY ? 1 : 0), mipLevel);
             data01 = simd::gather(Data + 0, indices01);
             data11 = simd::gather(Data + 8, indices01);
         } else {
-            data00 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 0, stride));
-            data10 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 0, stride));
-            data01 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 1, stride));
-            data11 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 1, stride));
+            data00 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 0, mipLevel));
+            data10 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 0, mipLevel));
+            data01 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 1, mipLevel));
+            data11 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 1, mipLevel));
         }
 
-        if constexpr (std::is_same<Texel, pixfmt::RGBA8u>()) {
+        if constexpr (std::is_same<Format, pixfmt::RGBA8u>()) {
             // 15-bit fraction for mulhrs
             v_uint fx = v_uint(ixf & LerpFracMask) << (15 - LerpFracBits);
             v_uint fy = v_uint(iyf & LerpFracMask) << (15 - LerpFracBits);
@@ -555,19 +577,19 @@ private:
 
             return rbCol | (gaCol << 8);
         } else {
-            using R = Texel::UnpackedTy;
+            using R = Format::UnpackedTy;
 
             const float fracScale = 1.0f / (LerpFracMask + 1);
             v_float fx = simd::conv<float>(ixf & LerpFracMask) * fracScale;
             v_float fy = simd::conv<float>(iyf & LerpFracMask) * fracScale;
             fx = inboundX ? fx : 0;
 
-            R colors00 = Texel::Unpack(data00);
-            R colors10 = Texel::Unpack(data10);
+            R colors00 = Format::Unpack(data00);
+            R colors10 = Format::Unpack(data10);
             R rowA = colors00 + (colors10 - colors00) * fx;
 
-            R colors01 = Texel::Unpack(data01);
-            R colors11 = Texel::Unpack(data11);
+            R colors01 = Format::Unpack(data01);
+            R colors11 = Format::Unpack(data11);
             R rowB = colors01 + (colors11 - colors01) * fx;
 
             return rowA + (rowB - rowA) * fy;
@@ -577,29 +599,31 @@ private:
     void GenerateMip(uint32_t level, uint32_t layer) {
         uint32_t w = Width >> level, h = Height >> level;
         uint32_t* srcData = &Data[(layer * LayerStride) + MipOffsets[level - 1]];
-        int stride = (int)(RowShift - level + 1);
+        int parentLevel = (int)(level - 1);
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
                 v_int ix = ((int32_t)x + TilePixelOffsetsX) << 1;
                 v_int iy = ((int32_t)y + TilePixelOffsetsY) << 1;
 
-                auto c00 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 0, stride)));
-                auto c10 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 0, stride)));
-                auto c01 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 1, stride)));
-                auto c11 = Texel::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 1, stride)));
+                auto c00 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 0, parentLevel)));
+                auto c10 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 0, parentLevel)));
+                auto c01 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 1, parentLevel)));
+                auto c11 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 1, parentLevel)));
                 auto avg = (c00 + c10 + c01 + c11) * 0.25f;
 
-                WriteTile(Texel::Pack(avg), x, y, layer, level);
+                WriteTile(Format::Pack(avg), x, y, layer, level);
             }
         }
     }
 };
 
-template<pixfmt::Texel T>
-inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
-    assert(std::has_single_bit(width) && std::has_single_bit(height) && maxLevels <= simd::vec_width);
-    uint32_t rowShift = (uint32_t)std::countr_zero(std::max(width, 8u));
+template<typename Tex>
+inline Tex::Ptr CreateTexture(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    assert(maxLevels <= simd::vec_width);
+    assert(Tex::Layout == TextureLayout::TiledY8 ? (std::has_single_bit(width) && std::has_single_bit(height)) : 
+           Tex::Layout == TextureLayout::TiledX4 ? (width % 4 == 0 && height % 4 == 0) : true);
+
     uint32_t mipOffsets[16] = {};
     uint32_t layerStride = 0;
     uint32_t mip = 0;
@@ -612,10 +636,10 @@ inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t
     }
     assert(layerStride * (uint64_t)numLayers < INT32_MAX);
 
-    auto tex = (Texture2D<T>*)_mm_malloc(sizeof(Texture2D<T>) + (size_t)layerStride * numLayers * 4 + 256, 64);
+    auto tex = (Tex*)_mm_malloc(sizeof(Tex) + (size_t)layerStride * numLayers * 4 + 256, 64);
     tex->Width = width;
     tex->Height = height;
-    tex->RowShift = rowShift;
+    tex->RowShift = simd::tzcnt(std::max(width, 8u));
     tex->NumLayers = numLayers;
     tex->LayerStride = layerStride;
 
@@ -627,17 +651,17 @@ inline TexturePtr2D<T> CreateTexture2D(uint32_t width, uint32_t height, uint32_t
     tex->MaskU = (int32_t)width - 1;
     tex->MaskV = (int32_t)height - 1;
 
-    tex->MaskLerpU = (int32_t)(width << Texture2D<T>::LerpFracBits) - 1;
-    tex->MaskLerpV = (int32_t)(height << Texture2D<T>::LerpFracBits) - 1;
+    tex->MaskLerpU = (int32_t)(width << Tex::LerpFracBits) - 1;
+    tex->MaskLerpV = (int32_t)(height << Tex::LerpFracBits) - 1;
     tex->ScaleLerpU = (float)(tex->MaskLerpU + 1);
     tex->ScaleLerpV = (float)(tex->MaskLerpV + 1);
 
-    return TexturePtr2D<T>(tex);
+    return (typename Tex::Ptr){ tex };
 }
 
-template<typename T>
-inline T::Ptr CreateTexture(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
-    return CreateTexture2D<typename T::Texel>(width, height, maxLevels, numLayers);
+template<pixfmt::TexelFormat F, TextureLayout L = TextureLayout::Default>
+inline TexturePtr2D<F, L> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    return CreateTexture<Texture2D<F, L>>(width, height, maxLevels, numLayers);
 }
 
 };  // namespace swr

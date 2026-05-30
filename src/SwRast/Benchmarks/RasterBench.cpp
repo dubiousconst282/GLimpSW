@@ -52,7 +52,7 @@ void ShadePixels(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentV
         .MinFilter = swr::FilterMode::Linear,
     };
     auto tex = ctx.Materials[mesh.MaterialId].Texture;
-    v_uint color = tex->SampleImplicitLod<sampler>(uv.x, uv.y);
+    v_uint color = tex->SampleImplicitLod<sampler>(uv);
 #else
     v_uint color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
 #endif
