@@ -307,9 +307,9 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
 }
 
 template<bool EnableAlphaTest>
-void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
+void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
     // Depth test
-    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
+    v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
     if (vars.TileMask == 0) return;
 
@@ -328,31 +328,31 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Fr
     v_uint surfaceId = vars.MeshletId * swr::ShadedMeshlet::MaxPrims + vars.PrimId;
     surfaceId |= ctx.InstanceId << ShadingContext::VisbDrawShift;
 
-    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
-    vars.StoreTile(fb.GetColorBuffer(), surfaceId);
+    vars.StoreTile(ctx.DepthBuffer, vars.Depth);
+    vars.StoreTile(ctx.ColorBuffer, surfaceId);
 }
 
-void FS_Overdraw(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
-    v_uint counter = vars.LoadTile(fb.GetColorBuffer());
+void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
+    v_uint counter = vars.LoadTile(ctx.ColorBuffer);
 
     v_int isActive = _mm512_movm_epi32(vars.TileMask);
     counter = _mm512_adds_epu16(counter, isActive ? v_uint(0x0001'0000) : v_uint(0x0000'0001));
 
     vars.TileMask = 0xFFFF;
-    vars.StoreTile(fb.GetColorBuffer(), counter);
-    vars.StoreTile(fb.GetDepthBuffer(), simd::max(vars.Depth, vars.LoadTile(fb.GetDepthBuffer())));
+    vars.StoreTile(ctx.ColorBuffer, counter);
+    vars.StoreTile(ctx.DepthBuffer, simd::max(vars.Depth, vars.LoadTile(ctx.DepthBuffer)));
 }
 
-void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
+void FS_EncodeGBuffer(const ShadingContext& ctx, swr::FragmentVars& vars) {
     // Depth test
-    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
+    v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
     if (vars.TileMask == 0) return;
 
     const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
 
     if (mesh.MaterialId == UINT_MAX) {
-        vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
+        vars.StoreTile(ctx.DepthBuffer, vars.Depth);
         return;
     }
 
@@ -403,9 +403,9 @@ void FS_EncodeGBuffer(const ShadingContext& ctx, swr::Framebuffer& fb, swr::Frag
         packedCh2 |= (packedNMR >> 18 & 0x3F) << 20;
         packedCh2 |= (packedNMR >> 26 & 0x3F) << 26;
     }
-    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
-    vars.StoreTile(fb.GetColorBuffer(), baseColor);
-    vars.StoreTile(fb.GetLayerData<uint32_t>(2), packedCh2);
+    vars.StoreTile(ctx.DepthBuffer, vars.Depth);
+    vars.StoreTile(ctx.ColorBuffer, baseColor | (packedCh2 & 0x01010101));
+    // vars.StoreTile(ctx.ColorBuffer, packedCh2, layer: 1);
 
     // bool hasEmissive = MaterialTex->NumLayers >= 3 && any(alpha == 255);
 
@@ -660,12 +660,13 @@ const swr::ShaderDispatchTable         //
     ShadingContext::DeferredShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_EncodeGBuffer>(),  //
     ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();       //
 
-void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
-    glm::mat4 invProj = GetInverseScreenProjMatrix(WorldToClipMat, glm::ivec2(fb.Width, fb.Height));
+void ShadingContext::Resolve(swr::Rasterizer& raster) {
+    uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
+    glm::mat4 invProj = GetInverseScreenProjMatrix(WorldToClipMat, fbSize);
 
-    raster.DispatchPass(fb, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileUV) {
-        uint32_t tileOffset = fb.GetPixelOffset(tileBasePos.x, tileBasePos.y);
-        v_float tileDepth = simd::load(&fb.GetDepthBuffer()[tileOffset]);
+    raster.DispatchPass(fbSize, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileUV) {
+        uint32_t tileOffset = ColorBuffer->GetTexelOffset(tileBasePos.x, tileBasePos.y, 0);
+        v_float tileDepth = simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
         v_int skyMask = tileDepth <= 0.0f;
 
         v_float4 ndcPos = v_float4(conv<float>(tilePos), skyMask ? 1.0f : tileDepth, 1.0f);
@@ -675,7 +676,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
         uint64_t t1 = ShowPerfHeatmap ? __rdtsc() : 0;
 
         if (simd::any(~skyMask)) {
-            SurfaceData surf = ResolveSurface(*this, &fb.GetColorBuffer()[tileOffset], simd::movemask(~skyMask), tileUV, float2(fb.Width, fb.Height));
+            SurfaceData surf = ResolveSurface(*this, &ColorBuffer->Data[tileOffset], simd::movemask(~skyMask), tileUV, fbSize);
             finalColor = EvalLighting(surf, Lights, NumLights, Exposure * 0.001f, worldPos, ViewPos);
         }
         if (simd::any(skyMask) && SkyboxTex != nullptr) {
@@ -690,7 +691,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
             finalColor = finalColor * 0.3 + v_float3(d * 0.7, d * 0.8, d * 0.9);
         }
         v_uint packedColor = swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
-        simd::store(&fb.GetColorBuffer()[tileOffset], packedColor);
+        simd::store(&ColorBuffer->Data[tileOffset], packedColor);
     });
 
     // Draw lights in a kind of shitty way
@@ -705,17 +706,17 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
         float2 screenPos = float2(clipPos) / clipPos.w;
 
         screenPos = screenPos * 0.5f + 0.5f;
-        float radius = (glm::max(fb.Width, fb.Height) / 30.0f) / clipPos.w;
+        float radius = (glm::max(fbSize.x, fbSize.y) / 30.0f) / clipPos.w;
 
-        float2 centerPos = screenPos * float2(fb.Width, fb.Height);
+        float2 centerPos = screenPos * float2(fbSize);
         int2 startTilePos = glm::max(int2(centerPos - radius), 0) & ~3;
-        int2 endTilePos = glm::min(int2(centerPos + radius), int2(fb.Width, fb.Height));
+        int2 endTilePos = glm::min(int2(centerPos + radius), int2(fbSize));
 
         for (int y = startTilePos.y; y < endTilePos.y; y += 4) {
-            uint32_t tileOffset = fb.GetPixelOffset(uint32_t(startTilePos.x), uint32_t(y));
+            uint32_t tileOffset = ColorBuffer->GetTexelOffset(uint32_t(startTilePos.x), uint32_t(y), 0);
 
             for (int x = startTilePos.x; x < endTilePos.x; x += 4, tileOffset += 16) {
-                v_int depthMask = depth > simd::load(fb.GetDepthBuffer() + tileOffset);
+                v_int depthMask = depth > simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
 
                 v_int2 tilePos = v_int2(x + swr::TilePixelOffsetsX, y + swr::TilePixelOffsetsY);
                 v_float2 relPos = simd::conv<float>(tilePos) + 0.5f - centerPos;
@@ -723,7 +724,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
 
                 if (!simd::any(distSq < 0 && depthMask)) continue;
 
-                uint32_t* colorData = fb.GetColorBuffer() + tileOffset;
+                uint32_t* colorData = &ColorBuffer->Data[tileOffset];
                 v_uint bgColor = simd::load(colorData);
 
                 v_float a = 1 - (-distSq / (radius * radius));
@@ -736,18 +737,20 @@ void ShadingContext::Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb) {
     }
 }
 
-void ShadingContext::ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb, DebugLayer layer) {
-    raster.DispatchPass(fb, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileUV) {
-        uint32_t tileOffset = fb.GetPixelOffset(tileBasePos.x, tileBasePos.y);
-        v_float tileDepth = simd::load(&fb.GetDepthBuffer()[tileOffset]);
+void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
+    uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
+
+    raster.DispatchPass(fbSize, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileUV) {
+        uint32_t tileOffset = ColorBuffer->GetTexelOffset(tileBasePos.x, tileBasePos.y, 0);
+        v_float tileDepth = simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
         v_int skyMask = tileDepth <= 0.0f;
 
-        uint32_t* tilePtr = &fb.GetColorBuffer()[tileOffset];
+        uint32_t* tilePtr = &ColorBuffer->Data[tileOffset];
         v_uint tileData = simd::load(tilePtr);
         SurfaceData surface;
 
         if (layer == DebugLayer::BaseColor || layer == DebugLayer::Normals || layer == DebugLayer::MetallicRoughness) {
-            surface = ResolveSurface(*this, tilePtr, simd::movemask(~skyMask), tileUV, float2(fb.Width, fb.Height));
+            surface = ResolveSurface(*this, tilePtr, simd::movemask(~skyMask), tileUV, fbSize);
         }
 
         v_float3 finalColor = 0.0f;
@@ -773,7 +776,7 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb,
         uint32_t backgroundRGB = ((tileBasePos.x ^ tileBasePos.y) & 4) ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
         v_uint finalRGB = skyMask ? backgroundRGB : swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
 
-        simd::store(&fb.GetColorBuffer()[tileOffset], finalRGB);
+        simd::store(tilePtr, finalRGB);
     });
 }
 

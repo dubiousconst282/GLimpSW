@@ -154,9 +154,9 @@ static v_float4 GatherPos(const ShadedMeshlet& mesh, v_uint idx) {
     };
 }
 
-void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding shader) {
-    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
-    float2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
+void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
+    int2 vpHalfSize = _viewSize / 2u;
+    float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
     if (!EnableGuardband) guardBandFactor = float2(1.0f);
 
     _runner->Dispatch([&](uint32_t workerId) {
@@ -196,6 +196,8 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
 
                         vars.MeshletId = meshIdx;
                         vars.BasePrimId = primOffset;
+                        vars.TileStride = _tileStride;
+
                         memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
                         memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
                         memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
@@ -204,7 +206,7 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
 
                         for (uint32_t i : simd::BitIter(acceptMask)) {
                             uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                            drawFn(shader.Context, fb, vars, i, boundRect);
+                            drawFn(shader.Context, vars, i, boundRect);
                         }
                         SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
                     }
@@ -233,10 +235,12 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
 
                         TriangleEdgeVars vars;
                         vars.Setup(tris, vpHalfSize);
-
+                        
                         vars.MeshletId = meshIdx;
                         vars.BasePrimId = primOffset;
+                        vars.TileStride = _tileStride;
                         vars.ClipData = tris.ClipData;
+
                         memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
                         memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
                         memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
@@ -246,7 +250,7 @@ void Rasterizer::DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding s
 
                         for (uint32_t i : simd::BitIter(drawMask)) {
                             uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                            drawFn(shader.Context, fb, vars, i, boundRect);
+                            drawFn(shader.Context, vars, i, boundRect);
                         }
                         SWR_PERF_INC(TrianglesRasterized, simd::popcnt(drawMask));
                     }
@@ -494,23 +498,23 @@ void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
     OutMasks[i] = mask;
 }
 
-void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, ShaderBinding shader) {
+void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     ZoneScoped;
     SWR_PERF_BEGIN(Draw);
 
     if (!EnableBinning) {
-        DrawMeshletsST(fb, meshCount, shader);
+        DrawMeshletsST(meshCount, shader);
         SWR_PERF_END(Draw);
         return;
     }
-    _queue->AllocBins(fb.Width, fb.Height, _runner->GetThreadCount());
+    _queue->AllocBins(_viewSize.x, _viewSize.y, _runner->GetThreadCount());
 
     uint64_t workerBinElectMask = 0;
     for (uint32_t i = 0; i < 64; i += _queue->NumWorkers) {
         workerBinElectMask |= 1ull << i;
     }
-    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
-    float2 guardBandFactor = { MaxRenderSize / (float)fb.Width, MaxRenderSize / (float)fb.Height };
+    int2 vpHalfSize = _viewSize / 2u;
+    float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
 
     auto readyBarrier = Barrier(_queue->NumWorkers);
     std::atomic<uint32_t> doneMeshCount = 0;
@@ -621,7 +625,7 @@ void Rasterizer::DrawMeshlets(Framebuffer& fb, uint32_t meshCount, ShaderBinding
 
                         for (uint32_t j : simd::BitIter(mask)) {
                             uint32_t binId = i * 64 + j;
-                            RasterizeBin(fb, shader, binId);
+                            RasterizeBin(shader, binId);
                         }
                         SWR_PERF_INC(BinQueueFlushes, simd::popcnt(mask));
                     }
@@ -697,12 +701,12 @@ bool Rasterizer::DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask 
     }
     return underCap;
 }
-void Rasterizer::RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t binId) {
+void Rasterizer::RasterizeBin(ShaderBinding shader, uint32_t binId) {
     uint32_t binY = (binId * _queue->BinsPerRowRcp) >> 32;
     uint32_t binX = binId - binY * _queue->BinsPerRow;
     binX *= BinSize, binY *= BinSize;
 
-    int2 vpHalfSize = int2(fb.Width, fb.Height) / 2;
+    int2 vpHalfSize = _viewSize / 2u;
 
     // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
     volatile uint32_t binPosMin = binX | binY << 16;
@@ -723,6 +727,7 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t bi
             TriangleEdgeVars edges;
             memcpy(edges.VertexId, tris.VertexId, 64);
             edges.Setup(tris, vpHalfSize);
+            edges.TileStride = _tileStride;
 
             {
                 v_uint x0 = bbMin & 0xFFFF, y0 = bbMin >> 16;
@@ -735,7 +740,7 @@ void Rasterizer::RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t bi
             for (uint32_t j : simd::BitIter(acceptMask)) {
                 // clang sometimes emits full vector reload when indexing (only for local vars?)
                 uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
-                drawFn(shader.Context, fb, edges, j, boundRect);
+                drawFn(shader.Context, edges, j, boundRect);
             }
         }
         bin.Count = 0;

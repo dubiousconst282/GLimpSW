@@ -16,14 +16,14 @@ struct InstanceData {
 // https://bruop.github.io/ibl/
 struct ShadingContext {
     static constexpr uint32_t  //
-        NumFbLayers = 3,       //
-
         VisbMeshletBits = 11,  //
         VisbDrawShift = VisbMeshletBits + std::countr_zero(swr::ShadedMeshlet::MaxPrims),
         MaxMeshletsPerDraw = 1 << VisbMeshletBits,  //
         MaxDrawCalls = 1 << (32 - VisbDrawShift);
 
-    // Uniform: Per scene
+    // Uniform: Per frame
+    swr::Framebuffer<swr::pixfmt::R32f>* DepthBuffer;
+    swr::Framebuffer<swr::pixfmt::RGBA8u>* ColorBuffer;
     const Material* Materials;
     const Light* Lights;
     uint32_t NumLights;
@@ -49,8 +49,8 @@ struct ShadingContext {
                                  const float4x4& prevViewMat,  //
                                  float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap);
 
-    void Resolve(swr::Rasterizer& raster, swr::Framebuffer& fb);
-    void ResolveDebug(swr::Rasterizer& raster, swr::Framebuffer& fb, DebugLayer layer);
+    void Resolve(swr::Rasterizer& raster);
+    void ResolveDebug(swr::Rasterizer& raster, DebugLayer layer);
 
     static const swr::ShaderDispatchTable VisBufferShader, DeferredShader, OverdrawShader;
 };

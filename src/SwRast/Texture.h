@@ -215,6 +215,12 @@ struct Texture2D;
 template<pixfmt::TexelFormat Format, TextureLayout Layout = TextureLayout::Default>
 using TexturePtr2D = std::unique_ptr<Texture2D<Format, Layout>, simd::AlignedDeleter>;
 
+template<pixfmt::TexelFormat Format>
+using Framebuffer = Texture2D<Format, TextureLayout::TiledX4>;
+
+template<pixfmt::TexelFormat Format>
+using FramebufferPtr2D = TexturePtr2D<Format, TextureLayout::TiledX4>;
+
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
 
@@ -232,8 +238,6 @@ struct StbImage {
     static StbImage Load(const char* path, PixelType type = PixelType::RGBA_U8);
 };
 
-struct Framebuffer;
-
 namespace texutil {
 
 TexturePtr2D<pixfmt::RGBA8u> LoadImage(const char* path, uint32_t mipLevels = 8);
@@ -243,7 +247,7 @@ TexturePtr2D<pixfmt::R11G11B10f> LoadImageHDR(const char* path, uint32_t mipLeve
 // Loads a equirectangular panorama into a cubemap.
 TexturePtr2D<pixfmt::R11G11B10f> LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels = 8);
 
-void DownsampleDepth(Framebuffer& fb, swr::Texture2D<swr::pixfmt::R32f>& dest);
+void DownsampleDepth(Framebuffer<pixfmt::R32f>& src, Texture2D<pixfmt::R32f>& dest);
 
 // Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
 inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
@@ -336,22 +340,91 @@ struct Texture2D {
     Texture2D(const Texture2D&) = delete;
     Texture2D& operator=(const Texture2D&) = delete;
 
-    // Writes pixel data (with matching formats) to the texture.
+    void Clear(uint32_t color, uint32_t layer = 0, uint32_t mipLevel = 0) {
+        // Non-temporal fill is ~2-3x faster than memset(), but makes rasterization a bit slower. Still a small win overall.
+        // https://en.algorithmica.org/hpc/cpu-cache/bandwidth/
+        uint32_t* ptr = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        uint32_t* end = &ptr[(Width >> mipLevel) * (Height >> mipLevel)];
+
+        for (; ptr < end; ptr += 16) {
+            _mm512_stream_si512(ptr, _mm512_set1_epi32((int32_t)color));
+        }
+        _mm_sfence();
+    }
+
+    // Copy pixel array in linear layout to texture.
     void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) {
-        assert(layer < NumLayers);
+        assert(layer < NumLayers && mipLevel < MipLevels);
 
         uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
         const uint32_t* src = (const uint32_t*)pixels;
+        uint32_t w = Width >> mipLevel, h = Height >> mipLevel;
 
         if constexpr (Layout_ == TextureLayout::Linear) {
-            for (uint32_t y = 0; y < Height; y++) {
+            for (uint32_t y = 0; y < h; y++) {
                 memcpy(&dst[y * Width], &src[y * stride], Width * 4);
             }
         } else {
             // TODO: optimize
-            for (uint32_t y = 0; y < Height; y++) {
-                for (uint32_t x = 0; x < Width; x++) {
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
                     dst[GetTexelOffset(x, y, mipLevel)] = src[x + y * stride];
+                }
+            }
+        }
+    }
+
+    // Copy texture data to pixel array in linear layout.
+    void GetPixels(void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) const {
+        assert(layer < NumLayers && mipLevel < MipLevels);
+
+        const uint32_t* src = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        uint32_t* dest = (uint32_t*)pixels;
+        uint32_t w = Width >> mipLevel, h = Height >> mipLevel;
+
+        if constexpr (Layout_ == TextureLayout::TiledX4) {
+            assert(((uintptr_t)dest % 64) == 0);
+
+            for (uint32_t y = 0; y < h; y += 4) {
+                uint32_t x = 0;
+                const uint32_t* srcRow = &src[GetTexelOffset(x, y, mipLevel)];
+
+                // 30% faster than copying one tile at a time, limited by mem bw
+                for (; x + 15 < w; x += 16, srcRow += 64) {
+                    __m512i tileA = _mm512_load_si512(srcRow + 0);
+                    __m512i tileB = _mm512_load_si512(srcRow + 16);
+                    __m512i tileC = _mm512_load_si512(srcRow + 32);
+                    __m512i tileD = _mm512_load_si512(srcRow + 48);
+
+                    __m512i AB01 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(1, 0, 1, 0));
+                    __m512i AB23 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(3, 2, 3, 2));
+                    __m512i CD01 = _mm512_shuffle_i32x4(tileC, tileD, _MM_SHUFFLE(1, 0, 1, 0));
+                    __m512i CD23 = _mm512_shuffle_i32x4(tileC, tileD, _MM_SHUFFLE(3, 2, 3, 2));
+
+                    __m512i row0 = _mm512_shuffle_i32x4(AB01, CD01, _MM_SHUFFLE(2, 0, 2, 0));
+                    __m512i row1 = _mm512_shuffle_i32x4(AB01, CD01, _MM_SHUFFLE(3, 1, 3, 1));
+                    __m512i row2 = _mm512_shuffle_i32x4(AB23, CD23, _MM_SHUFFLE(2, 0, 2, 0));
+                    __m512i row3 = _mm512_shuffle_i32x4(AB23, CD23, _MM_SHUFFLE(3, 1, 3, 1));
+
+                    _mm512_stream_si512(&dest[(y + 0) * stride + x], row0);
+                    _mm512_stream_si512(&dest[(y + 1) * stride + x], row1);
+                    _mm512_stream_si512(&dest[(y + 2) * stride + x], row2);
+                    _mm512_stream_si512(&dest[(y + 3) * stride + x], row3);
+                }
+                for (; x < w; x += 4, srcRow += 16) {
+                    __m512i tile = _mm512_load_si512(srcRow);
+                    _mm_stream_si128(&dest[(y + 0) * stride + x], _mm512_extracti32x4_epi32(tile, 0));
+                    _mm_stream_si128(&dest[(y + 1) * stride + x], _mm512_extracti32x4_epi32(tile, 1));
+                    _mm_stream_si128(&dest[(y + 2) * stride + x], _mm512_extracti32x4_epi32(tile, 2));
+                    _mm_stream_si128(&dest[(y + 3) * stride + x], _mm512_extracti32x4_epi32(tile, 3));
+                }
+            }
+            _mm_sfence();
+        } else {
+            // TODO: optimize
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    dest[x + y * stride] = src[GetTexelOffset(x, y, mipLevel)];
                 }
             }
         }
@@ -662,6 +735,11 @@ inline Tex::Ptr CreateTexture(uint32_t width, uint32_t height, uint32_t maxLevel
 template<pixfmt::TexelFormat F, TextureLayout L = TextureLayout::Default>
 inline TexturePtr2D<F, L> CreateTexture2D(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
     return CreateTexture<Texture2D<F, L>>(width, height, maxLevels, numLayers);
+}
+
+template<pixfmt::TexelFormat F>
+inline TexturePtr2D<F, TextureLayout::TiledX4> CreateFramebuffer(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    return CreateTexture<Texture2D<F, TextureLayout::TiledX4>>(width, height, maxLevels, numLayers);
 }
 
 };  // namespace swr

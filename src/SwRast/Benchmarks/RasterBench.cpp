@@ -11,6 +11,9 @@
 #include <stb_image_write.h>
 
 struct ShadingContext {
+    swr::Framebuffer<swr::pixfmt::R32f>* DepthBuffer;
+    swr::Framebuffer<swr::pixfmt::RGBA8u>* ColorBuffer;
+
     glm::mat4 ProjMat;
     glm::mat3 ModelMat;
     const Meshlet* Meshlets;
@@ -33,9 +36,9 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
     memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
 }
 
-void ShadePixels(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
+void ShadePixels(const ShadingContext& ctx, swr::FragmentVars& vars) {
     // Depth test
-    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
+    v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
     if (vars.TileMask == 0) return;
 
@@ -56,8 +59,8 @@ void ShadePixels(const ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentV
 #else
     v_uint color = swr::pixfmt::RGBA8u::Pack({ vars.Bary, 1 });
 #endif
-    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
-    vars.StoreTile(fb.GetColorBuffer(), color);
+    vars.StoreTile(ctx.DepthBuffer, vars.Depth);
+    vars.StoreTile(ctx.ColorBuffer, color);
 }
 
 // [model path] [(camera) <x> <y> <z> <yaw> <pitch>]
@@ -72,11 +75,15 @@ int main(int argc, const char** args) {
         camera.Euler = { atof(args[5]), atof(args[6]) };
     }
 
-    auto fb = swr::CreateFramebuffer(1920, 1080);
+    uint2 fbSize = uint2(1920, 1080);
+    auto depthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(fbSize.x, fbSize.y);
+    auto colorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(fbSize.x, fbSize.y);
+
     auto raster = swr::Rasterizer(1);
     raster.EnableBinning = false;
+    raster.SetViewport(fbSize);
 
-    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = { fb->Width, fb->Height } }, 0);
+    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = float2(fbSize) }, 0);
 
     ankerl::nanobench::Bench ctx;
     ctx.minEpochTime(std::chrono::milliseconds(50));
@@ -86,11 +93,14 @@ int main(int argc, const char** args) {
     ctx.run("Render", [&]() {
         auto projMat = camera.GetProjMatrix() * camera.GetViewMatrix(true);
         auto shaderCtx = ShadingContext{
+            .DepthBuffer = depthFb.get(),
+            .ColorBuffer = colorFb.get(),
             .Materials = scene.Materials.data(),
         };
         auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels>();
 
-        fb->Clear(0, 0);
+        colorFb->Clear(0);
+        depthFb->Clear(0);
 
         for (auto& model : scene.Models) {
             for (auto& node : model->Nodes) {
@@ -100,12 +110,12 @@ int main(int argc, const char** args) {
                 shaderCtx.ModelMat = node.GlobalTransform;
                 shaderCtx.Meshlets = &scene.Meshlets[node.MeshOffset];
 
-                raster.DrawMeshlets(*fb, node.MeshCount, { shaderDispatch, &shaderCtx });
+                raster.DrawMeshlets(node.MeshCount, { shaderDispatch, &shaderCtx });
             }
         }
     });
 
-    auto pixels = simd::alloc_buffer<uint32_t>(fb->Width * fb->Height);
-    fb->GetPixels(0, pixels.get(), fb->Width);
-    stbi_write_png("logs/bench_view.png", (int)fb->Width, (int)fb->Height, 4, pixels.get(), (int)fb->Width * 4);
+    auto pixels = simd::alloc_buffer<uint32_t>(fbSize.x * fbSize.y);
+    colorFb->GetPixels(pixels.get(), fbSize.x);
+    stbi_write_png("logs/bench_view.png", (int)fbSize.x, (int)fbSize.y, 4, pixels.get(), (int)fbSize.x * 4);
 }

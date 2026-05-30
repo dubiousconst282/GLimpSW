@@ -25,7 +25,8 @@ namespace {
 
 GLFWwindow* _window;
 
-swr::FramebufferPtr _fb;
+swr::FramebufferPtr2D<swr::pixfmt::RGBA8u> _colorFb;
+swr::FramebufferPtr2D<swr::pixfmt::R32f> _depthFb;
 std::unique_ptr<swr::Rasterizer> _rast;
 swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
 GLuint _fbTexture = 0;
@@ -49,14 +50,15 @@ GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint
 }
 
 void CreateFramebuffer(uint32_t width, uint32_t height) {
-    _fb = swr::CreateFramebuffer(width, height, ShadingContext::NumFbLayers);
+    _depthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(width, height);
+    _colorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(width, height);
 
     uint32_t halfW = 1 << (32 - simd::lzcnt((width - 1) / 2));
     uint32_t halfH = 1 << (32 - simd::lzcnt((height - 1) / 2));
     _prevDepthMap = swr::CreateTexture2D<swr::pixfmt::R32f>(halfW, halfH, 16);
 
     if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
-    _fbTexture = CreateTexture(_fb->Width, _fb->Height, 1, GL_RGBA8);
+    _fbTexture = CreateTexture(_colorFb->Width, _colorFb->Height, 1, GL_RGBA8);
 }
 void LoadScene(const std::string& path) {
     _scene = std::make_unique<Scene>();
@@ -128,7 +130,7 @@ void RenderFrame() {
     ImGui::SeparatorText("Rasterizer");
 
     char currRes[64];
-    snprintf(currRes, sizeof(currRes), "%dx%d", _fb->Width, _fb->Height);
+    snprintf(currRes, sizeof(currRes), "%dx%d", _colorFb->Width, _colorFb->Height);
     if (ImGui::BeginCombo("Resolution", currRes)) {
         if (ImGui::Selectable("2880x1620")) CreateFramebuffer(2880, 1620);
         if (ImGui::Selectable("2560x1440")) CreateFramebuffer(2560, 1440);
@@ -179,6 +181,8 @@ void RenderFrame() {
     SWR_PERF_BEGIN(Frame);
 
     ShadingContext shader = {
+        .DepthBuffer = _depthFb.get(),
+        .ColorBuffer = _colorFb.get(),
         .Materials = _scene->Materials.data(),
         .Lights = _scene->Lights.data(),
         .NumLights = _scene->Lights.size(),
@@ -209,8 +213,11 @@ void RenderFrame() {
 
     {
         ZoneScopedN("ClearFb");
-        _fb->Clear(0, 0.0f);
+        _colorFb->Clear(0);
+        _depthFb->Clear(0);
     }
+
+    _rast->SetViewport(uint2(_colorFb->Width, _colorFb->Height));
 
     auto instances = std::vector<InstanceData>();
     instances.reserve(1024);
@@ -228,10 +235,11 @@ void RenderFrame() {
                 uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
 
                 SWR_PERF_BEGIN(Culling);
-                uint32_t visibleCount =
+                uint32_t visibleCount =                                                                          //
                     ShadingContext::CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount,  //
-                                                 projMat, viewMat, node.GlobalTransform, prevViewMat,           //
-                                                 float2(_fb->Width, _fb->Height), s_OcclusionCulling ? _prevDepthMap.get() : nullptr);
+                                                 projMat, viewMat, node.GlobalTransform, prevViewMat,            //
+                                                 float2(_colorFb->Width, _colorFb->Height),
+                                                 s_OcclusionCulling ? _prevDepthMap.get() : nullptr);
                 SWR_PERF_END(Culling);
 
                 if (visibleCount > 0) {
@@ -241,7 +249,7 @@ void RenderFrame() {
                     shader.ObjectToWorldMat = node.GlobalTransform;
                     shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform);
 
-                    _rast->DrawMeshlets(*_fb, meshCount, { dispatchTable, &shader });
+                    _rast->DrawMeshlets(meshCount, { dispatchTable, &shader });
                     instances.push_back({ .Meshlets = shader.InstanceMeshlets, .Transform = node.GlobalTransform });
                 }
             }
@@ -252,9 +260,9 @@ void RenderFrame() {
     shader.Instances = instances.data();
 
     if (s_EnableVisBuffer && s_Layer == DebugLayer::None) {
-        shader.Resolve(*_rast, *_fb);
+        shader.Resolve(*_rast);
     } else if (s_Layer != DebugLayer::None) {
-        shader.ResolveDebug(*_rast, *_fb, s_Layer);
+        shader.ResolveDebug(*_rast, s_Layer);
     }
 
     SWR_PERF_END(Resolve);
@@ -262,7 +270,7 @@ void RenderFrame() {
     if (s_OcclusionCulling) {
         ZoneScopedN("BuildHiZ");
         SWR_PERF_BEGIN(Culling);
-        swr::texutil::DownsampleDepth(*_fb, *_prevDepthMap);
+        swr::texutil::DownsampleDepth(*_depthFb, *_prevDepthMap);
         SWR_PERF_END(Culling);
     }
     {
@@ -270,15 +278,15 @@ void RenderFrame() {
         
         GLuint pbo;
         glCreateBuffers(1, &pbo);
-        glNamedBufferStorage(pbo, _fb->Width * _fb->Height * 4, nullptr, GL_MAP_WRITE_BIT);
+        glNamedBufferStorage(pbo, _colorFb->Width * _colorFb->Height * 4, nullptr, GL_MAP_WRITE_BIT);
 
         uint32_t* pixels = (uint32_t*)glMapNamedBuffer(pbo, GL_WRITE_ONLY); // spec guarantees align >= 64
-        _fb->GetPixels(0, pixels, _fb->Width);
+        _colorFb->GetPixels(pixels, _colorFb->Width);
         glUnmapNamedBuffer(pbo);
 
         // This copy could be avoided by reading buffer data directly from shader, but this is good enough.
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        glTextureSubImage2D(_fbTexture, 0, 0, 0, (GLsizei)_fb->Width, (GLsizei)_fb->Height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTextureSubImage2D(_fbTexture, 0, 0, 0, (GLsizei)_colorFb->Width, (GLsizei)_colorFb->Height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         glDeleteBuffers(1, &pbo);
     }

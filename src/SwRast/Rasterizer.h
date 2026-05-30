@@ -7,76 +7,6 @@
 
 namespace swr {
 
-struct Framebuffer {
-    // Data is stored in 4x4 tiles so that rasterizer writes are trivial.
-    uint32_t Width, Height, TileStride;
-    uint32_t LayerStride, NumLayers;
-    
-    alignas(64) uint32_t Data[];
-
-    Framebuffer() = delete;
-    Framebuffer(const Framebuffer&) = delete;
-    Framebuffer& operator=(const Framebuffer&) = delete;
-
-    uint32_t* GetColorBuffer() { return GetLayerData<uint32_t>(0); }
-    float* GetDepthBuffer() { return GetLayerData<float>(1); }
-
-    template<typename T>
-    T* GetLayerData(uint32_t idx = 0) {
-        assert(idx < NumLayers);
-        return (T*)&Data[idx * LayerStride];
-    }
-    template<typename T>
-    const T* GetLayerData(uint32_t idx = 0) const {
-        assert(idx < NumLayers);
-        return (T*)&Data[idx * LayerStride];
-    }
-
-    void Clear(uint32_t color, float depth) {
-        ClearLayer(0, color);
-        ClearLayer(1, simd::as<uint32_t>(depth));
-    }
-    void ClearLayer(uint32_t layerIdx, uint32_t value) {
-        // Non-temporal fill is ~2-3x faster than memset(), but makes rasterization a bit slower. Still a small win overall.
-        // https://en.algorithmica.org/hpc/cpu-cache/bandwidth/
-        uint32_t* ptr = GetLayerData<uint32_t>(layerIdx);
-        uint32_t* end = ptr + Width * Height;
-        for (; ptr < end; ptr += 16) {
-            _mm512_stream_si512(ptr, _mm512_set1_epi32((int32_t)value));
-        }
-        _mm_sfence();
-    }
-
-    uint32_t GetPixelOffset(uint32_t x, uint32_t y) const {
-        assert(x + 3 < Width && y + 3 < Height);
-
-        uint32_t tileOffset = ((x & ~3u) << 2) + (y & ~3u) * Width;
-        uint32_t pixelOffset = (x & 3) + (y & 3) * 4;
-        return pixelOffset + tileOffset;
-    }
-    v_int GetPixelOffset(v_int x, v_int y) const {
-        v_int tileOffset = ((x & ~3) << 2) + (y & ~3) * (int)Width;
-        v_int pixelOffset = (x & 3) + (y & 3) * 4;
-        return pixelOffset + tileOffset;
-    }
-    void GetPixels(uint32_t layerIdx, uint32_t* dest, uint32_t stride) const;
-};
-using FramebufferPtr = std::unique_ptr<Framebuffer, simd::AlignedDeleter>;
-
-inline FramebufferPtr CreateFramebuffer(uint32_t width, uint32_t height, uint32_t numLayers = 2) {
-    assert(width % 4 == 0 && height % 4 == 0);
-
-    uint32_t layerStride = (width * height + 63) & ~63u;
-    auto fb = (Framebuffer*)_mm_malloc(sizeof(Framebuffer) + (size_t)layerStride * numLayers * 4 + 256, 64);
-
-    fb->Width = width;
-    fb->Height = height;
-    fb->TileStride = width / 4;
-    fb->LayerStride = layerStride;
-    fb->NumLayers = numLayers;
-    return FramebufferPtr(fb);
-}
-
 enum class FaceCullMode : uint8_t { None, FrontCCW, FrontCW };
 
 struct ShadedMeshlet {
@@ -127,13 +57,13 @@ struct FragmentVars {
     template<typename T>
     T Interpolate(T v0, T v1, T v2) const { return BaryLerp(Bary, v0, v1, v2); }
 
-    template<typename T>
-    simd::vec<T> LoadTile(const T* ptr) {
-        return _mm512_load_si512(&ptr[TileOffset]);
+    template<typename T, typename F = T::Format::LerpedTy>
+    F LoadTile(const T* texture) {
+        return _mm512_load_si512(&texture->Data[TileOffset]);
     }
-    template<typename T>
-    void StoreTile(T* ptr, simd::vec<T> value) {
-        _mm512_mask_store_epi32(&ptr[TileOffset], TileMask, value);
+    template<typename T, typename F>
+    void StoreTile(T* texture, F value, uint32_t layer = 0) {
+        _mm512_mask_store_epi32(&texture->Data[TileOffset + layer * texture->LayerStride], TileMask, value);
     }
 };
 
@@ -162,6 +92,7 @@ struct TrianglePacket {
 struct TriangleEdgeVars {
     uint8_t VertexId[3][simd::vec_width];
     uint8_t BasePrimId;
+    uint16_t TileStride;
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
 
@@ -179,7 +110,7 @@ struct ShaderDispatchTable {
     static constexpr uint32_t MaxFragmentEntryPoints = 4;
 
     using MeshFnPtr = void (*)(void* ctx, uint32_t idx, ShadedMeshlet& meshlet);
-    using DrawFnPtr = void (*)(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect);
+    using DrawFnPtr = void (*)(void* ctx, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect);
 
     MeshFnPtr ShadeMeshlet = nullptr;
     DrawFnPtr DrawTriangle[MaxFragmentEntryPoints] = {};
@@ -210,7 +141,12 @@ struct Rasterizer {
     Rasterizer(uint32_t numThreads = 0);
     ~Rasterizer();
 
-    void DrawMeshlets(Framebuffer& fb, uint32_t count, ShaderBinding shader);
+    uint32_t GetThreadCount() const;
+    void SetThreadCount(uint32_t count);
+
+    void SetViewport(uint2 size) { _viewSize = size, _tileStride = size.x / 4; }
+
+    void DrawMeshlets(uint32_t count, ShaderBinding shader);
 
     // Dispatch work to the thread pool. `cb(uint32_t workerId)`
     template<typename TCallback>
@@ -220,12 +156,7 @@ struct Rasterizer {
 
     void Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser);
 
-    // Iterates over framebuffer tiles in parallel. `cb(uint2 tileBasePos, v_int tilePos, v_float2 tileNdc)`
-    template<typename TCallback>
-    [[gnu::nodebug]] void DispatchPass(Framebuffer& fb, TCallback&& cb) {
-        DispatchPass(uint2(fb.Width, fb.Height), cb);
-    }
-
+    // Iterates over texture tiles in parallel. `cb(uint2 tileBasePos, v_int tilePos, v_float2 tileNdc)`
     template<typename TCallback>
     void DispatchPass(uint2 numInvocs, TCallback&& cb) {
         float2 scaleNdc = 2.0f / float2(numInvocs);
@@ -255,23 +186,20 @@ struct Rasterizer {
         });
     }
 
-    uint32_t GetThreadCount() const;
-    void SetThreadCount(uint32_t count);
-
     static constexpr v_int FragPixelOffsetsX = simd::lane_idx<v_int> & 3;
     static constexpr v_int FragPixelOffsetsY = simd::lane_idx<v_int> >> 2;
 
     template<auto FragFn, bool IsClipped>
-    static void DrawTriangle(void* ctx, Framebuffer& fb, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
+    static void DrawTriangle(void* ctx, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
         [[assume(i < simd::vec_width)]];  // avoids masking on vector indexing
 
         uint16_t minX = boundRect >> 0, minY = boundRect >> 16;
         uint16_t offsetExtentX = boundRect >> 30, offsetExtentY = boundRect >> 46;  // (max - min) / 4 * 16
 
         // Using offset for loop control saves 2 registers and a bit of sALU
-        size_t offset = (minX * 4) + (minY * 4) * fb.TileStride;
-        size_t endOffsetY = (minY * 4 + offsetExtentY) * fb.TileStride;
-        size_t offsetIncY = fb.TileStride * 16 - offsetExtentX;
+        size_t offset = (minX * 4) + (minY * 4) * tri.TileStride;
+        size_t endOffsetY = (minY * 4 + offsetExtentY) * tri.TileStride;
+        size_t offsetIncY = tri.TileStride * 16 - offsetExtentX;
 
         // Barycentric coordinates at start of row
         v_int3 edgeStepX = v_int3(tri.A12[i], tri.A20[i], tri.A01[i]);
@@ -333,7 +261,7 @@ struct Rasterizer {
                     vars.Bary = { 1 - u - v, u, v };
 
                     using TContext = decltype(ShaderDispatchTable::GetContextType(FragFn));
-                    [[clang::always_inline]] FragFn(*(TContext*)ctx, fb, vars);
+                    [[clang::always_inline]] FragFn(*(TContext*)ctx, vars);
                 }
                 edge += edgeStepX;
             }
@@ -342,13 +270,15 @@ struct Rasterizer {
     }
 
 private:
+    uint2 _viewSize;
+    uint32_t _tileStride;
     std::unique_ptr<BinQueue> _queue;
     std::unique_ptr<ThreadedRunner> _runner;
 
-    void DrawMeshletsST(Framebuffer& fb, uint32_t count, ShaderBinding shader);
+    void DrawMeshletsST(uint32_t count, ShaderBinding shader);
 
     bool DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos);
-    void RasterizeBin(Framebuffer& fb, ShaderBinding shader, uint32_t binId);
+    void RasterizeBin(ShaderBinding shader, uint32_t binId);
 
     void WorkerFn(uint32_t workerId);
 };
@@ -360,7 +290,7 @@ ShaderDispatchTable GetDispatchTable() {
     constexpr int numEP = sizeof...(FragFn);
 
     static_assert(std::is_invocable_v<decltype(MeshFn), TContext&, uint32_t, ShadedMeshlet&>);
-    static_assert((std::is_invocable_v<decltype(FragFn), TContext&, Framebuffer&, FragmentVars&> && ...));
+    static_assert((std::is_invocable_v<decltype(FragFn), TContext&, FragmentVars&> && ...));
     static_assert(numEP < ShaderDispatchTable::MaxFragmentEntryPoints);
 
     DrawFnPtr drawFns[] = { &Rasterizer::DrawTriangle<FragFn, false>... };

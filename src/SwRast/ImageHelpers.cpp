@@ -29,9 +29,7 @@ StbImage StbImage::Load(const char* path, PixelType type) {
     };
 }
 
-namespace texutil {
-
-RgbaTexture2D::Ptr LoadImage(const char* path, uint32_t mipLevels) {
+RgbaTexture2D::Ptr texutil::LoadImage(const char* path, uint32_t mipLevels) {
     int width, height, channels;
     stbi_uc* pixels = stbi_load(path, &width, &height, &channels, 4);
 
@@ -43,7 +41,7 @@ RgbaTexture2D::Ptr LoadImage(const char* path, uint32_t mipLevels) {
     return tex;
 }
 
-HdrTexture2D::Ptr LoadImageHDR(const char* path, uint32_t mipLevels) {
+HdrTexture2D::Ptr texutil::LoadImageHDR(const char* path, uint32_t mipLevels) {
     int width, height, channels;
     float* pixels = stbi_loadf(path, &width, &height, &channels, 3);
 
@@ -70,7 +68,7 @@ HdrTexture2D::Ptr LoadImageHDR(const char* path, uint32_t mipLevels) {
 
     return tex;
 }
-HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels) {
+HdrTexture2D::Ptr texutil::LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels) {
     auto panoTex = LoadImageHDR(path, 1);
 
     uint32_t faceSize = panoTex->Width;
@@ -104,59 +102,17 @@ HdrTexture2D::Ptr LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLe
     return cubeTex;
 }
 
-};  // namespace texutil
-
-void Framebuffer::GetPixels(uint32_t layerIdx, uint32_t* dest, uint32_t stride) const {
-    assert(((uintptr_t)dest % 64) == 0);
-
-    for (uint32_t y = 0; y < Height; y += 4) {
-        uint32_t x = 0;
-        const uint32_t* src = GetLayerData<uint32_t>(layerIdx) + GetPixelOffset(x, y);
-
-        // 30% faster than copying one tile at a time, limited by mem bw
-        for (; x + 15 < Width; x += 16, src += 64) {
-            __m512i tileA = _mm512_load_si512(src + 0);
-            __m512i tileB = _mm512_load_si512(src + 16);
-            __m512i tileC = _mm512_load_si512(src + 32);
-            __m512i tileD = _mm512_load_si512(src + 48);
-
-            __m512i AB01 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(1, 0, 1, 0));
-            __m512i AB23 = _mm512_shuffle_i32x4(tileA, tileB, _MM_SHUFFLE(3, 2, 3, 2));
-            __m512i CD01 = _mm512_shuffle_i32x4(tileC, tileD, _MM_SHUFFLE(1, 0, 1, 0));
-            __m512i CD23 = _mm512_shuffle_i32x4(tileC, tileD, _MM_SHUFFLE(3, 2, 3, 2));
-
-            __m512i row0 = _mm512_shuffle_i32x4(AB01, CD01, _MM_SHUFFLE(2, 0, 2, 0));
-            __m512i row1 = _mm512_shuffle_i32x4(AB01, CD01, _MM_SHUFFLE(3, 1, 3, 1));
-            __m512i row2 = _mm512_shuffle_i32x4(AB23, CD23, _MM_SHUFFLE(2, 0, 2, 0));
-            __m512i row3 = _mm512_shuffle_i32x4(AB23, CD23, _MM_SHUFFLE(3, 1, 3, 1));
-
-            _mm512_stream_si512(&dest[(y + 0) * stride + x], row0);
-            _mm512_stream_si512(&dest[(y + 1) * stride + x], row1);
-            _mm512_stream_si512(&dest[(y + 2) * stride + x], row2);
-            _mm512_stream_si512(&dest[(y + 3) * stride + x], row3);
-        }
-        for (; x < Width; x += 4, src += 16) {
-            __m512i tile = _mm512_load_si512(src);
-            _mm_stream_si128(&dest[(y + 0) * stride + x], _mm512_extracti32x4_epi32(tile, 0));
-            _mm_stream_si128(&dest[(y + 1) * stride + x], _mm512_extracti32x4_epi32(tile, 1));
-            _mm_stream_si128(&dest[(y + 2) * stride + x], _mm512_extracti32x4_epi32(tile, 2));
-            _mm_stream_si128(&dest[(y + 3) * stride + x], _mm512_extracti32x4_epi32(tile, 3));
-        }
-    }
-    _mm_sfence();
-}
-
 // TODO: could reuse this for mipmap gen
 struct Downsampler {
-    swr::Framebuffer& Src;
+    swr::Framebuffer<swr::pixfmt::R32f>& Src;
     swr::Texture2D<swr::pixfmt::R32f>& Dst;
 
     void Load16x16(uint32_t x, uint32_t y, v_float block[16]) {
-        const float* layerData = Src.GetLayerData<float>(1);
+        const float* layerData = (const float*)Src.Data;
 
         if (x + 16 <= Src.Width && y + 16 <= Src.Height) [[likely]] {
             for (uint32_t yo = 0; yo < 4; yo++) {
-                const float* src = &layerData[Src.GetPixelOffset(x, y + yo * 4)];
+                const float* src = &layerData[Src.GetTexelOffset(x, y + yo * 4, 0)];
 
                 for (uint32_t xo = 0; xo < 4; xo++, src += 16) {
                     block[xo + yo * 4] = simd::load(src);
@@ -166,7 +122,7 @@ struct Downsampler {
             for (uint32_t i = 0; i < 16; i++) block[i] = FLT_MAX;
 
             for (uint32_t yo = 0; yo < 4 && (y + yo * 4 < Src.Height); yo++) {
-                const float* src = &layerData[Src.GetPixelOffset(x, y + yo * 4)];
+                const float* src = &layerData[Src.GetTexelOffset(x, y + yo * 4, 0)];
 
                 for (uint32_t xo = 0; xo < 4 && (x + xo * 4 < Src.Width); xo++, src += 16) {
                     block[xo + yo * 4] = simd::load(src);
@@ -239,9 +195,9 @@ struct Downsampler {
     }
 };
 
-void texutil::DownsampleDepth(swr::Framebuffer& fb, swr::Texture2D<swr::pixfmt::R32f>& dest) {
-    uint32_t rootLevel = 32 - simd::lzcnt(std::max(fb.Width, fb.Height));
-    v_float r = Downsampler{ fb, dest }.ReduceNxN(0, 0, rootLevel);
+void texutil::DownsampleDepth(Framebuffer<pixfmt::R32f>& src, Texture2D<pixfmt::R32f>& dest) {
+    uint32_t rootLevel = 32 - simd::lzcnt(std::max(src.Width, src.Height));
+    v_float r = Downsampler{ src, dest }.ReduceNxN(0, 0, rootLevel);
     dest.WriteTile(r, 0, 0, 0, rootLevel - 3);
 }
 
