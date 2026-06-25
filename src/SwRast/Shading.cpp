@@ -1,5 +1,4 @@
 #include "Shading.h"
-#include "Camera.h"
 
 namespace {
 
@@ -479,25 +478,25 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
 
     v_uint surfaceId = simd::load(tileData);
 
-    simd_foreach_unique_lane(i, surfaceId, activeMask) {
+    simd_foreach_unique_lane(i, surfaceId, _mm512_movm_epi32(activeMask)) {
         const InstanceData& instance = ctx.Instances[i >> ShadingContext::VisbDrawShift];
         const Meshlet& mesh = instance.Meshlets[i / swr::ShadedMeshlet::MaxPrims % ShadingContext::MaxMeshletsPerDraw];
         uint32_t triangleId = i % swr::ShadedMeshlet::MaxPrims;
 
-        simd::cmov(materialId, mesh.MaterialId, iterMask);
+        simd::cmov(materialId, mesh.MaterialId, v_exec);
 
         #pragma unroll
         for (uint32_t vi = 0; vi < 3; vi++) {
             uint32_t idx = mesh.Indices[vi][triangleId];
 
-            simd::cmov(pos[vi].x, mesh.Positions[0][idx], iterMask);
-            simd::cmov(pos[vi].y, mesh.Positions[1][idx], iterMask);
-            simd::cmov(pos[vi].z, mesh.Positions[2][idx], iterMask);
-            simd::cmov(packedTexCoord[vi], mesh.TexCoords[idx], iterMask);
-            simd::cmov(packedNormalTangent[vi], mesh.NormalTangents[idx], iterMask);
+            simd::cmov(pos[vi].x, mesh.Positions[0][idx], v_exec);
+            simd::cmov(pos[vi].y, mesh.Positions[1][idx], v_exec);
+            simd::cmov(pos[vi].z, mesh.Positions[2][idx], v_exec);
+            simd::cmov(packedTexCoord[vi], mesh.TexCoords[idx], v_exec);
+            simd::cmov(packedNormalTangent[vi], mesh.NormalTangents[idx], v_exec);
 
             if (vi == 0 && (mesh.TangentHandedness >> idx & 1)) {
-                tangentHandedness |= simd::movemask(iterMask);
+                tangentHandedness |= simd::movemask(v_exec);
             }
         }
     }
@@ -505,14 +504,14 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     v_float transform[4][3];
     v_uint instanceId = surfaceId >> ShadingContext::VisbDrawShift;
 
-    simd_foreach_unique_lane(i, instanceId, activeMask) {
+    simd_foreach_unique_lane(i, instanceId, _mm512_movm_epi32(activeMask)) {
         const InstanceData& instance = ctx.Instances[i];
 
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            simd::cmov(transform[j][0], instance.Transform[j].x, iterMask);
-            simd::cmov(transform[j][1], instance.Transform[j].y, iterMask);
-            simd::cmov(transform[j][2], instance.Transform[j].z, iterMask);
+            simd::cmov(transform[j][0], instance.Transform[j].x, v_exec);
+            simd::cmov(transform[j][1], instance.Transform[j].y, v_exec);
+            simd::cmov(transform[j][2], instance.Transform[j].z, v_exec);
         }
     }
 
@@ -543,14 +542,14 @@ SurfaceData ResolveSurface(const ShadingContext& ctx, const uint32_t* tileData, 
     v_uint packedAlbedo = 0;
     v_uint packedNMR = 0xFF00'8080; // 100% roughness, norm(0,0,+1)
 
-    simd_foreach_unique_lane(i, materialId, activeMask & simd::movemask(materialId != UINT_MAX)) {
+    simd_foreach_unique_lane(i, materialId, _mm512_movm_epi32(activeMask) && materialId != UINT_MAX) {
         // TODO: should probably add access mask to texture sampling, since UVs might vary wildly across different tris/lanes
         const swr::RgbaTexture2D& tex = *ctx.Materials[i].Texture;
         v_int mipLevel = swr::texutil::CalcMipLevel(texGrad, v_float2(tex.ScaleU, tex.ScaleV));
-        simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texCoord, 0, mipLevel), iterMask);
+        simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texCoord, 0, mipLevel), v_exec);
 
         if (tex.NumLayers >= 2) {
-            simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texCoord, 1, mipLevel), iterMask);
+            simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texCoord, 1, mipLevel), v_exec);
         }
     }
     v_float3 normal0, normal1, normal2;
@@ -718,7 +717,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
             for (int x = startTilePos.x; x < endTilePos.x; x += 4, tileOffset += 16) {
                 v_int depthMask = depth > simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
 
-                v_int2 tilePos = v_int2(x + swr::TilePixelOffsetsX, y + swr::TilePixelOffsetsY);
+                v_int2 tilePos = int2(x, y) + swr::TilePixelOffsets;
                 v_float2 relPos = simd::conv<float>(tilePos) + 0.5f - centerPos;
                 v_float distSq = simd::dot(relPos, relPos) - radius * radius;
 

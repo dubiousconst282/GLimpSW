@@ -22,9 +22,9 @@ void GatherMany_Native(const Data* data, v_int idx, v_float* dst) {
 void GatherMany_Cascade(const Data* data, v_int idx, v_float* dst) {
     v_float tmp[NumFields] = {};
 
-    simd_foreach_unique_lane(i, idx, v_mask(~0u)) {
+    simd_foreach_unique_lane(i, idx, true) {
         for (uint32_t j = 0; j < NumFields; j++) {
-            simd::cmov(tmp[j], data->Field[j][i], iterMask);
+            simd::cmov(tmp[j], data->Field[j][i], v_exec);
         }
     }
     for (uint32_t i = 0; i < NumFields; i++) {

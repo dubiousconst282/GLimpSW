@@ -84,16 +84,15 @@ HdrTexture2D::Ptr texutil::LoadOctahedronFromPanoramaHDR(const char* path, uint3
     float centerUV = 0.5f * scaleUV;
     for (uint32_t y = 0; y < faceSize; y += 4) {
         for (uint32_t x = 0; x < faceSize; x += 4) {
-            v_float u = simd::conv<float>((int32_t)x + swr::TilePixelOffsetsX) * scaleUV + centerUV;
-            v_float v = simd::conv<float>((int32_t)y + swr::TilePixelOffsetsY) * scaleUV + centerUV;
-            v_float3 dir = UnmapOctahedron({ u, v });
+            v_float2 uv = simd::conv<float>(int2(x, y) + swr::TilePixelOffsets) * scaleUV + centerUV;
+            v_float3 dir = UnmapOctahedron(uv);
 
             for (uint32_t i = 0; i < simd::vec_width; i++) {
-                u[i] = atan2f(dir.z[i], dir.x[i]) / simd::tau + 0.5f;
-                v[i] = asinf(-dir.y[i]) / simd::pi + 0.5f;
+                uv.x[i] = atan2f(dir.z[i], dir.x[i]) / simd::tau + 0.5f;
+                uv.y[i] = asinf(-dir.y[i]) / simd::pi + 0.5f;
             }
 
-            v_float3 tile = panoTex->SampleLevel<PanoSampler>(v_float2(u, v), 0, 0);
+            v_float3 tile = panoTex->SampleLevel<PanoSampler>(uv, 0, 0);
             cubeTex->WriteTile(tile, x, y);
         }
     }

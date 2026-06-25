@@ -224,8 +224,7 @@ using FramebufferPtr2D = TexturePtr2D<Format, TextureLayout::TiledX4>;
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
 
-constexpr v_int TilePixelOffsetsX = simd::lane_idx<v_int> & 3;
-constexpr v_int TilePixelOffsetsY = simd::lane_idx<v_int> >> 2;
+constexpr v_int2 TilePixelOffsets = { (simd::lane_idx<v_int> & 3), (simd::lane_idx<v_int> >> 2) };
 
 // TODO: delete or move this
 struct StbImage {
@@ -253,11 +252,10 @@ void DownsampleDepth(Framebuffer<pixfmt::R32f>& src, Texture2D<pixfmt::R32f>& de
 inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
     assert(width % 4 == 0 && height % 4 == 0);
 
-    for (int32_t y = 0; y < height; y += 4) {
-        for (int32_t x = 0; x < width; x += 4) {
-            v_float u = simd::conv<float>(x + TilePixelOffsetsX) + 0.5f;
-            v_float v = simd::conv<float>(y + TilePixelOffsetsY) + 0.5f;
-            visitor((uint32_t)x, (uint32_t)y, u * (1.0f / width), v * (1.0f / height));
+    for (int y = 0; y < height; y += 4) {
+        for (int x = 0; x < width; x += 4) {
+            v_float2 uv = simd::conv<float>(int2(x, y) + TilePixelOffsets) + 0.5f;
+            visitor((uint32_t)x, (uint32_t)y, uv.x * (1.0f / width), uv.y * (1.0f / height));
         }
     }
 }
@@ -520,10 +518,8 @@ struct Texture2D {
         // Calculate offsets and mip position
         v_int offset = layer * (int)LayerStride;
 
-        if (simd::any(mipLevel > 0)) {
-            ix >>= mipLevel, iy >>= mipLevel;
-            offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
-        }
+        ix >>= mipLevel, iy >>= mipLevel;
+        offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
 
         // Sample
         if (filter == FilterMode::Nearest) [[likely]] {
@@ -676,8 +672,8 @@ private:
 
         for (uint32_t y = 0; y < h; y += 4) {
             for (uint32_t x = 0; x < w; x += 4) {
-                v_int ix = ((int32_t)x + TilePixelOffsetsX) << 1;
-                v_int iy = ((int32_t)y + TilePixelOffsetsY) << 1;
+                v_int ix = ((int)x + TilePixelOffsets.x) << 1;
+                v_int iy = ((int)y + TilePixelOffsets.y) << 1;
 
                 auto c00 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 0, iy + 0, parentLevel)));
                 auto c10 = Format::Unpack(simd::gather(srcData, GetTexelOffset(ix + 1, iy + 0, parentLevel)));

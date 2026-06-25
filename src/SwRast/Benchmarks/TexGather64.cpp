@@ -101,8 +101,8 @@ int main() {
     ctx.run("Gather32", [&]() {
         for (int y = 0; y < texture->Height; y += 4) {
             for (int x = 0; x < texture->Width; x += 4) {
-                v_int tx = ((x + swr::TilePixelOffsetsX) << LerpFracBits) + (LerpFracMask/2);
-                v_int ty = ((y + swr::TilePixelOffsetsY) << LerpFracBits) + (LerpFracMask/2);
+                v_int tx = ((x + swr::TilePixelOffsets.x) << LerpFracBits) + (LerpFracMask/2);
+                v_int ty = ((y + swr::TilePixelOffsets.y) << LerpFracBits) + (LerpFracMask/2);
                 auto res = SampleLinear_G32(*texture, tx, ty, 0, (int)texture->RowShift, 0);
                 ctx.doNotOptimizeAway(res);
             }
@@ -111,8 +111,8 @@ int main() {
     ctx.run("Gather64", [&]() {
         for (int y = 0; y < texture->Height; y += 4) {
             for (int x = 0; x < texture->Width; x += 4) {
-                v_int tx = ((x + swr::TilePixelOffsetsX) << LerpFracBits) + (LerpFracMask / 2);
-                v_int ty = ((y + swr::TilePixelOffsetsY) << LerpFracBits) + (LerpFracMask / 2);
+                v_int tx = ((x + swr::TilePixelOffsets.x) << LerpFracBits) + (LerpFracMask / 2);
+                v_int ty = ((y + swr::TilePixelOffsets.y) << LerpFracBits) + (LerpFracMask / 2);
                 auto res = SampleLinear_G64(*texture, tx, ty, 0, (int)texture->RowShift, 0);
                 ctx.doNotOptimizeAway(res);
             }

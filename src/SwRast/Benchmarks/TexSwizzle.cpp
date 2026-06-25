@@ -82,6 +82,8 @@ struct FragmentInfo {
 };
 
 struct ShadingContext {
+    swr::Framebuffer<swr::pixfmt::R32f>* DepthBuffer;
+
     glm::mat4 ProjMat;
     glm::mat3 ModelMat;
     const Meshlet* Meshlets;
@@ -95,7 +97,7 @@ static glm::vec2 UnpackHalf2x16(uint32_t x) {
     return { v[0], v[1] };
 }
 
-void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
+void ShadeMeshlet(ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
     auto& mesh = ctx.Meshlets[index];
 
     for (uint32_t i = 0; i < mesh.NumVertices; i += simd::vec_width) {
@@ -106,9 +108,9 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
     memcpy(output.Indices, mesh.Indices, sizeof(mesh.Indices));
 }
 
-void ShadePixels(ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& vars) {
+void ShadePixels(ShadingContext& ctx, swr::FragmentVars& vars) {
     // Depth test
-    v_float oldDepth = vars.LoadTile(fb.GetDepthBuffer());
+    v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
     if (vars.TileMask == 0) return;
 
@@ -121,7 +123,7 @@ void ShadePixels(ShadingContext& ctx, swr::Framebuffer& fb, swr::FragmentVars& v
     v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
     simd::store(frag.UV, swr::pixfmt::RG16f::Pack({ simd::fract(uv.x), simd::fract(uv.y) }));
 
-    vars.StoreTile(fb.GetDepthBuffer(), vars.Depth);
+    vars.StoreTile(ctx.DepthBuffer, vars.Depth);
 }
 
 #if 1
@@ -137,16 +139,21 @@ int main(int argc, const char** args) {
         camera.Euler = { atof(args[5]), atof(args[6]) };
     }
 
-    auto fb = swr::CreateFramebuffer(1920, 1080);
+    uint2 fbSize = uint2(1920, 1080);
+    auto depthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(fbSize.x, fbSize.y);
+    auto colorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(fbSize.x, fbSize.y);
+
     auto raster = swr::Rasterizer(1);
     raster.EnableBinning = false;
+    raster.SetViewport(fbSize);
 
-    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = { fb->Width, fb->Height } }, 0);
+    camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = float2(fbSize) }, 0);
 
     auto projMat = camera.GetProjMatrix() * camera.GetViewMatrix(true);
     auto shaderDispatch = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels>();
 
-    fb->Clear(0, 0);
+    colorFb->Clear(0);
+    depthFb->Clear(0);
 
     std::vector<FragmentInfo> fragments;
 
@@ -155,11 +162,12 @@ int main(int argc, const char** args) {
             if (node.MeshCount == 0) continue;
 
             auto shaderCtx = ShadingContext{
+                .DepthBuffer = depthFb.get(),
                 .ProjMat = projMat * float4x4(node.GlobalTransform),
                 .Meshlets = &scene.Meshlets[node.MeshOffset],
                 .Frags = &fragments,
             };
-            raster.DrawMeshlets(*fb, node.MeshCount, { shaderDispatch, &shaderCtx });
+            raster.DrawMeshlets(node.MeshCount, { shaderDispatch, &shaderCtx });
         }
     }
     printf("Fragments: %.3fK\n", fragments.size() / 1e3);
@@ -179,7 +187,7 @@ int main(int argc, const char** args) {
             v_uint normalMR = SampleNearestAsIfSwizzled<swizzle>(*tex, uv.x, uv.y, 1);
             v_uint finalColor = color ^ (normalMR & 0x1F1F1F1F);
 
-            _mm512_store_epi32(&fb->GetColorBuffer()[frag.TileOffset], finalColor);
+            _mm512_store_epi32(&colorFb->Data[frag.TileOffset], finalColor);
         }
     };
 
@@ -189,9 +197,9 @@ int main(int argc, const char** args) {
     ctx.run("Tiled16X4", [&]() { bench.template operator()<3>(); });
     ctx.run("ZCurve", [&]() { bench.template operator()<4>(); });
 
-    auto pixels = simd::alloc_buffer<uint32_t>(fb->Width * fb->Height);
-    fb->GetPixels(0, pixels.get(), fb->Width);
-    stbi_write_png("logs/bench_view.png", (int)fb->Width, (int)fb->Height, 4, pixels.get(), (int)fb->Width * 4);
+    auto pixels = simd::alloc_buffer<uint32_t>(fbSize.x * fbSize.y);
+    colorFb->GetPixels(pixels.get(), fbSize.x);
+    stbi_write_png("logs/bench_view.png", (int)fbSize.x, (int)fbSize.y, 4, pixels.get(), (int)fbSize.x * 4);
 
     return 0;
 }
@@ -233,8 +241,8 @@ int main() {
 
             for (int y = 0; y < texture->Height; y += 4) {
                 for (int x = 0; x < texture->Width; x += 4) {
-                    v_float u = (simd::conv<float>(x + swr::TilePixelOffsetsX) + 0.5f) * scaleU;
-                    v_float v = (simd::conv<float>(y + swr::TilePixelOffsetsY) + 0.5f) * scaleV;
+                    v_float u = (simd::conv<float>(x + swr::TilePixelOffsets.x) + 0.5f) * scaleU;
+                    v_float v = (simd::conv<float>(y + swr::TilePixelOffsets.y) + 0.5f) * scaleV;
                     v_float2 r = Rotate(u, v, angle);
                     auto res = SampleNearestAsIfSwizzled<swizzle, false>(*texture, r.x, r.y);
                     ctx.doNotOptimizeAway(res);

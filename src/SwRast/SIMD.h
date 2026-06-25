@@ -205,8 +205,8 @@ SIMD_INLINE vec<E, N> gather(const E* ptr, mask_vec<vec<E, N>> idx, mask_vec<vec
 template<typename T> requires(sizeof(T) == 4)
 SIMD_INLINE mdvec<vec<T>, 2> gather2(const T* ptr, v_int idx, v_int mask = -1) {
     uint16_t k_mask = _mm512_movepi32_mask(mask);
-    auto lo = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask, _mm512_extracti32x8_epi32(idx, 0), ptr, 4);
-    auto hi = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask, _mm512_extracti32x8_epi32(idx, 1), ptr, 4);
+    auto lo = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask >> 0, _mm512_extracti32x8_epi32(idx, 0), ptr, 4);
+    auto hi = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), k_mask >> 8, _mm512_extracti32x8_epi32(idx, 1), ptr, 4);
     auto x = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 0, hi);
     auto y = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 1, hi);
     return { x, y };
@@ -270,6 +270,12 @@ template<typename T, int N>
 SIMD_INLINE void cmov(mdvec<T, N>& dest, mdvec<T, N> ifTrue, mask_vec<T> cond) {
     for (uint32_t i = 0; i < N; i++) {
         dest[i] = cond ? ifTrue[i] : dest[i];
+    }
+}
+template<typename T, int N>
+SIMD_INLINE void cmov(mdvec<T, N>& dest, glm::vec<N, elem_type<T>> ifTrue, mask_vec<T> cond) {
+    for (uint32_t i = 0; i < N; i++) {
+        dest[i] = cond ? ifTrue[(glm::length_t)i] : dest[i];
     }
 }
 
@@ -554,10 +560,17 @@ public:
 
 //////////////////////////////////////// Questionable Utility Macros ////////////////////////////////////////
 
+constexpr v_int v_exec = -1;
+
 // Notes:
 // - Widening mask to uint32 saves redundant trunc/moves
 // - Ptr cast avoids redundant re-spills, https://github.com/llvm/llvm-project/issues/190725)
-#define simd_foreach_unique_lane(i, v, activeMask)                                                                             \
-    for (auto [pendingMask, iterMask, i] = std::tuple{ uint32_t(v_mask(activeMask)), v == v, simd::elem_type<decltype(v)>{} }; \
-         (i = ((simd::elem_type<decltype(v)>*)&v)[simd::tzcnt(pendingMask)], iterMask = v == i, pendingMask != 0);             \
-         pendingMask &= ~(uint32_t)simd::movemask(iterMask))
+#define simd_foreach_unique_lane(lane, vec, cond)                                   \
+    if (v_int v__prev_exec = v_exec && (cond), v_exec; true)                        \
+        if (simd::elem_type<decltype(vec)> lane; true)                              \
+            for (uint32_t v_pending_exec = simd::movemask(v__prev_exec);            \
+                 (lane = ((decltype(lane)*)&vec)[simd::tzcnt(v_pending_exec)], /**/ \
+                  v_exec = v__prev_exec && (vec == lane), v_pending_exec != 0);     \
+                 v_pending_exec ^= simd::movemask(v_exec))
+
+#define simd_if(cond) if (v_int v__prev_exec = v_exec, v_exec = v__prev_exec && (cond); simd::any(v_exec))
