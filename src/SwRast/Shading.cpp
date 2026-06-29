@@ -277,6 +277,16 @@ v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
     return mask;
 }
 
+// https://momentsingraphics.de/CameraRays.html
+float3x3 GetCameraRayMatrix(const float4x4& worldToClip) {
+    glm::mat4x3 M = glm::transpose(worldToClip);
+    return { glm::cross(M[1], M[3]), glm::cross(M[3], M[0]), glm::cross(M[0], M[1]) };
+}
+v_float3 GetCameraRayDir(v_float2 screenNdc, const float3x3& m) {
+    // Must use precise sqrt to avoid noticeable distortions.
+    return simd::normalize_precise(v_float3(screenNdc.x) * m[0] + v_float3(screenNdc.y) * m[1] + m[2]);
+}
+
 void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
     if (ctx.InstanceCullBitmap != nullptr) {
         v_mask mask = ctx.InstanceCullBitmap[index / simd::vec_width];
@@ -739,17 +749,20 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
 void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
     uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
 
-    raster.DispatchPass(fbSize, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileUV) {
+    raster.DispatchPass(fbSize, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileNdc) {
         uint32_t tileOffset = ColorBuffer->GetTexelOffset(tileBasePos.x, tileBasePos.y, 0);
         v_float tileDepth = simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
         v_int skyMask = tileDepth <= 0.0f;
 
-        uint32_t* tilePtr = &ColorBuffer->Data[tileOffset];
-        v_uint tileData = simd::load(tilePtr);
+        v_uint tileData = simd::load(&ColorBuffer->Data[tileOffset]);
         SurfaceData surface;
 
-        if (layer == DebugLayer::BaseColor || layer == DebugLayer::Normals || layer == DebugLayer::MetallicRoughness) {
-            surface = ResolveSurface(*this, tilePtr, simd::movemask(~skyMask), tileUV, fbSize);
+        uint64_t ts1 = __rdtsc();
+
+        if (layer == DebugLayer::BaseColor || layer == DebugLayer::Normals ||                 //
+            layer == DebugLayer::MetallicRoughness || layer == DebugLayer::VisResolveHeatmap  //
+        ) {
+            surface = ResolveSurface(*this, tileData, tileNdc, fbSize);
         }
 
         v_float3 finalColor = 0.0f;
@@ -770,12 +783,26 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
             v_float countPix = simd::conv<float>(tileData >> 16);
             v_float countFrag = simd::conv<float>(tileData & 0xFFFF);
             finalColor = ColormapTurbo((countPix + countFrag * 0.5) / 30.0f);
+        } else if ((layer == DebugLayer::VoxelGrid || layer == DebugLayer::RaycastHeatmap) && BrickMap != nullptr) {
+            v_float3 dir = GetCameraRayDir(tileNdc, GetCameraRayMatrix(WorldToClipMat));
+            VoxelHitResult hit = BrickMap->RayCast(ViewPos, dir, v_float2(0, FLT_MAX), 0xFFFF, true);
+
+            v_float3 normal;
+            v_float2 metallicRoughness;
+            UnpackVoxelAttribs(hit.Attribs, finalColor, normal, metallicRoughness);
+        }
+
+        if (layer == DebugLayer::VisResolveHeatmap || layer == DebugLayer::RaycastHeatmap) {
+            uint64_t ts2 = __rdtsc();
+            double q = layer == DebugLayer::RaycastHeatmap ? 8000.0 : 4000.0;
+            finalColor = ColormapTurbo((ts2 - ts1) / q);
+            skyMask = 0;
         }
 
         uint32_t backgroundRGB = ((tileBasePos.x ^ tileBasePos.y) & 4) ? 0xFF'A0A0A0 : 0xFF'FFFFFF;
         v_uint finalRGB = skyMask ? backgroundRGB : swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
 
-        simd::store(tilePtr, finalRGB);
+        simd::store(&ColorBuffer->Data[tileOffset], finalRGB);
     });
 }
 

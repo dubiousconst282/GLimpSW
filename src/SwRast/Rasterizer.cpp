@@ -144,8 +144,10 @@ void Rasterizer::SetThreadCount(uint32_t count) {
     _runner = std::make_unique<ThreadedRunner>(count);
 }
 
-static v_float4 GatherPos(const ShadedMeshlet& mesh, v_uint idx) {
+static v_float4 GatherPos(const ShadedMeshlet& mesh, const uint8_t* indices) {
     static_assert(ShadedMeshlet::MaxVertices == 64);
+
+    v_uint idx = _mm512_cvtepu8_epi32(_mm_loadu_epi8(indices));
     return {
         simd::gather_preload64(mesh.Position[0], idx),
         simd::gather_preload64(mesh.Position[1], idx),
@@ -168,12 +170,31 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
             SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
 
             for (uint32_t primOffset = 0; primOffset < mesh.PrimCount; primOffset += simd::vec_width) {
-                v_uint i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
-                v_uint i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
-                v_uint i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
-                v_float4 v0 = GatherPos(mesh, i0);
-                v_float4 v1 = GatherPos(mesh, i1);
-                v_float4 v2 = GatherPos(mesh, i2);
+                v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
+                v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][primOffset]);
+                v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][primOffset]);
+
+                if (mesh.ReorientToMaxAxis) [[unlikely]] {
+                    v_float3 normal = simd::cross(v_float3(v1 - v0), v_float3(v2 - v0));
+                    v_int domAxis = simd::abs(normal.x) > simd::max_abs(normal.y, normal.z) ? 0 :  //
+                                    simd::abs(normal.y) > simd::abs(normal.z) ? 1 : 2;
+
+                    for (uint32_t i = 0; i < 3; i++) {
+                        v_float4& pos = i == 0 ? v0 : i == 1 ? v1 : v2;
+                        v_float4 tmp = pos;
+                        // 0 yzx
+                        // 1 xzy
+                        // 2 xyz
+                        simd::cmov(pos.x, tmp.y, domAxis == 0);
+                        simd::cmov(pos.y, tmp.z, domAxis != 2);
+                        simd::cmov(pos.z, tmp.x, domAxis == 0);
+                        simd::cmov(pos.z, tmp.y, domAxis == 1);
+                        pos.z = pos.z * 0.5 + 0.5;
+                    }
+                    // Save dom axis so frag shader can unswizzle coords later
+                    uint8_t* idx0 = &mesh.Indices[0][primOffset];
+                    _mm_storeu_epi8(idx0, _mm_loadu_epi8(idx0) | _mm512_cvtepi32_epi8(domAxis << 6));
+                }
                 ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
 
                 if (primOffset + simd::vec_width > mesh.PrimCount) {
@@ -558,12 +579,9 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
             for (; primOffset < mesh.PrimCount && !batchFull; primOffset += simd::vec_width) {
                 isIdle = false;
 
-                v_uint i0 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[0][primOffset]));
-                v_uint i1 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[1][primOffset]));
-                v_uint i2 = _mm512_cvtepu8_epi32(_mm_load_epi32(&mesh.Indices[2][primOffset]));
-                v_float4 v0 = GatherPos(mesh, i0);
-                v_float4 v1 = GatherPos(mesh, i1);
-                v_float4 v2 = GatherPos(mesh, i2);
+                v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
+                v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][primOffset]);
+                v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][primOffset]);
                 ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
 
                 if (primOffset + simd::vec_width > mesh.PrimCount) {

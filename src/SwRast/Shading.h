@@ -4,8 +4,22 @@
 #include "Texture.h"
 
 #include "Scene.h"
+#include "Voxel.h"
 
-enum class DebugLayer { None, BaseColor, Normals, MetallicRoughness, MeshletId, TriangleId, OverdrawPixel, OverdrawQuad };
+enum class DebugLayer {
+    None, BaseColor, Normals, MetallicRoughness,
+    MeshletId, TriangleId,
+    OverdrawPixel, OverdrawQuad,
+    VisResolveHeatmap, RaycastHeatmap,
+    VoxelGrid,
+};
+static const char* kDebugLayerNames[] = {
+    "None", "BaseColor", "Normals", "MetallicRoughness",
+    "MeshletId", "TriangleId",
+    "OverdrawPixel", "OverdrawQuad",
+    "VisResolveHeatmap", "RaycastHeatmap",
+    "VoxelGrid",
+};
 
 struct InstanceData {
     const Meshlet* Meshlets;
@@ -39,6 +53,7 @@ struct ShadingContext {
     // Uniform: Resolve pass
     const InstanceData* Instances;
     swr::HdrTexture2D* SkyboxTex;
+    BrickMap* BrickMap = nullptr;
     glm::vec3 ViewPos;
 
     float Exposure = 1.0f;

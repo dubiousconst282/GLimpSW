@@ -4,7 +4,7 @@ add_library(SwRast STATIC
     Scene.cpp
 )
 target_compile_options(SwRast PUBLIC "-march=native" "-mprefer-vector-width=512" "-ffast-math" "-Wno-unused" "-Wsign-conversion")
-target_compile_definitions(SwRast PUBLIC GLM_FORCE_XYZW_ONLY)
+target_compile_definitions(SwRast PUBLIC GLM_FORCE_XYZW_ONLY GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_link_libraries(SwRast PUBLIC
     glm::glm
     meshoptimizer
@@ -14,14 +14,18 @@ target_include_directories(SwRast PUBLIC ${stb_SOURCE_DIR} ${cgltf_SOURCE_DIR})
 # target_compile_options(SwRast PRIVATE "-fsanitize=address")
 # target_link_options(SwRast PRIVATE  "-fsanitize=address")
 
-add_executable(Playground Main.cpp Shading.cpp)
+add_executable(Playground
+    Main.cpp
+    Shading.cpp
+    Voxel.cpp
+)
 target_link_libraries(Playground PRIVATE
     SwRast
     glfw glad imgui
     nfd
 )
 add_executable(BenchmarkApp
-    Benchmarks/RasterBench.cpp
+    Benchmarks/RasterBench.cpp Shading.cpp Voxel.cpp
     # Benchmarks/CoarseRaster.cpp
     # Benchmarks/TexGather64.cpp
     # Benchmarks/TexSwizzle.cpp

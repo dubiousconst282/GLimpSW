@@ -1,8 +1,3 @@
-#include <vector>
-
-#include "Rasterizer.h"
-#include "Texture.h"
-
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
@@ -16,10 +11,15 @@
 #include <nfd.h>
 #include <nfd_glfw3.h>
 
-#include "Camera.h"
+#include "Rasterizer.h"
+#include "Texture.h"
 
+#include "Camera.h"
 #include "Scene.h"
 #include "Shading.h"
+#include "Voxel.h"
+
+#include <vector>
 
 namespace {
 
@@ -34,6 +34,7 @@ GLuint _fbTexture = 0;
 Camera _cam;
 std::unique_ptr<Scene> _scene;
 swr::HdrTexture2D::Ptr _skyboxTex;
+std::unique_ptr<BrickMap> _brickmap;
 
 GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
     GLuint handle;
@@ -63,6 +64,9 @@ void CreateFramebuffer(uint32_t width, uint32_t height) {
 void LoadScene(const std::string& path) {
     _scene = std::make_unique<Scene>();
     _scene->ImportGltf(path);
+
+    _brickmap = std::make_unique<BrickMap>(4, 16.0f);
+    _brickmap->VoxelizeScene(*_scene, float3(0));
 }
 void LoadSkybox(const std::string& path) {
     _skyboxTex = swr::texutil::LoadOctahedronFromPanoramaHDR(path.c_str()); //
@@ -155,9 +159,14 @@ void RenderFrame() {
     ImGui::Checkbox("Perf Heatmap", &s_ShowPerfHeatmap);
     ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
 
-    ImGui::Combo("Debug Channel", (int*)&s_Layer, "None\0BaseColor\0Normals\0MetallicRoughness\0MeshletId\0TriangleId\0OverdrawPixel\0OverdrawQuad\0");
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) s_Layer = (DebugLayer)(((uint32_t)s_Layer - 1) % 8);
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) s_Layer = (DebugLayer)(((uint32_t)s_Layer + 1) % 8);
+    {
+        const int count = std::size(kDebugLayerNames);
+        ImGui::Combo("Debug View", (int*)&s_DebugView, kDebugLayerNames, count);
+
+        int idx = (int)s_DebugView;
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) s_DebugView = (DebugLayer)((idx == 0 ? count : idx) - 1);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) s_DebugView = (DebugLayer)((idx + 1 < count ? idx + 1 : 0));
+    }
 
     ImGui::SliderFloat("Exposure", &s_Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
 
@@ -188,6 +197,7 @@ void RenderFrame() {
         .NumLights = _scene->Lights.size(),
         .WorldToClipMat = projMat * viewMat,
         .SkyboxTex = _skyboxTex.get(),
+        .BrickMap = _brickmap.get(),
         .ViewPos = _cam.ViewPosition,
         .Exposure = s_Exposure,
         .ShowPerfHeatmap = s_ShowPerfHeatmap,

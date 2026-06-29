@@ -193,6 +193,11 @@ SIMD_INLINE void store(void* ptr, const T& value) {
     ((load_buf*)ptr)->v = value;
 }
 
+template<is_vector T>
+SIMD_INLINE void store(void* ptr, T value, mask_vec<T> mask) {
+    __builtin_masked_store(vec<bool>(mask < 0), value, (elem_type<T>*)ptr);
+}
+
 SIMD_TFN_ANY T gather(const void* ptr, mask_vec<T> idx, mask_vec<T> mask = -1) {
     return __builtin_masked_gather(vec<bool>(mask < 0), idx, (const elem_type<T>*)ptr);
 }
@@ -251,6 +256,10 @@ SIMD_INLINE constexpr T shuffle(T values) {
 SIMD_TFN_MASK constexpr bitmask<T> movemask(T mask) {
     return __builtin_bit_cast(bitmask<T>, __builtin_convertvector(mask < 0, vec<bool, width_of<T>>));
 }
+template<is_vector T = v_int>
+SIMD_INLINE constexpr mask_vec<T> unmovemask(bitmask<T> mask) {
+    return __builtin_bit_cast(vec<bool, width_of<T>>, mask) ? -1 : 0;
+}
 
 // Checks if any lane of the given mask vector is true.
 SIMD_TFN_MASK constexpr bool any(T mask) { return movemask(mask) != 0; }
@@ -304,6 +313,10 @@ SIMD_TFN_FLOAT T fma(T a, T b, elem_type<T> c) { return __builtin_elementwise_fm
 SIMD_TFN_FLOAT T fma(T a, elem_type<T> b, elem_type<T> c) { return __builtin_elementwise_fma(a, T(b), T(c)); }
 
 SIMD_TFN_FLOAT T sqrt(T x) { return __builtin_elementwise_sqrt(x); }
+SIMD_INLINE v_float rsqrt(v_float x) {
+    v_float y = _mm512_rsqrt14_ps(x);
+    return (0.5f * y) * (3.0f - x * (y * y));
+}
 SIMD_INLINE v_float approx_rsqrt(v_float x) { return _mm512_rsqrt14_ps(x); }
 SIMD_INLINE v_float approx_rcp(v_float x) { return _mm512_rcp14_ps(x); }
 SIMD_INLINE v_float approx_sqrt(v_float x) { return approx_rsqrt(x) * x; }
@@ -449,8 +462,9 @@ SIMD_INLINE v_float3 cross(v_float3 a, v_float3 b) {
     };
 }
 
-SIMD_INLINE v_float3 normalize(v_float3 a) { return a * approx_rsqrt(dot(a, a)); }
-SIMD_INLINE v_float length(v_float3 p) { return approx_sqrt(dot(p, p)); }
+SIMD_INLINE v_float3 normalize(v_float3 v) { return v * approx_rsqrt(dot(v, v)); }
+SIMD_INLINE v_float3 normalize_precise(v_float3 v) { return v * rsqrt(dot(v, v)); }
+SIMD_INLINE v_float length(v_float3 v) { return approx_sqrt(dot(v, v)); }
 
 SIMD_INLINE v_float3 reflect(v_float3 i, v_float3 n) { return i - 2.0f * dot(n, i) * n; }
 
@@ -555,6 +569,13 @@ public:
     BitIter begin() const { return *this; }
     BitIter end() const { return BitIter(0); }
 };
+
+// Prevents clang's smart ass from canonicalizing/folding/instcombining the given value.
+template<is_vector T>
+SIMD_INLINE T uncanon(T x) {
+    asm("" : "+v"(x) : :);
+    return x;
+}
 
 };  // namespace simd
 

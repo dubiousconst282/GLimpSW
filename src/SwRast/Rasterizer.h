@@ -13,8 +13,11 @@ struct ShadedMeshlet {
     static constexpr uint32_t MaxVertices = 64, MaxPrims = 128;
 
     uint8_t PrimCount = 0;
+    uint8_t FragmentShaderId = 0;  // Index of fragment shader entry point in dispatch table
     FaceCullMode CullMode = FaceCullMode::FrontCCW;
-    uint8_t FragmentShaderId = 0;       // Index of fragment shader entry point in dispatch table
+
+    bool ReorientToMaxAxis = false;  // Reorient triangle to dominant normal axis, to maximize scan area (hack used by voxelizer).
+                                     // If enabled, index of dom axis will be written to upper 2 bits of `FragVars::VertexId[0]`.
 
     alignas(64) uint8_t Indices[3][MaxPrims];
     alignas(64) float Position[4][MaxVertices];
@@ -47,6 +50,7 @@ struct FragmentVars {
     uint8_t PrimId;
     uint8_t VertexId[3];
 
+    uint2 TilePos;
     size_t TileOffset;
     v_mask TileMask;
 
@@ -216,17 +220,19 @@ struct Rasterizer {
             .MeshletId = tri.MeshletId,
             .PrimId = uint8_t(tri.BasePrimId + primId),
             .VertexId = { tri.VertexId[0][primId], tri.VertexId[1][primId], tri.VertexId[2][primId] },
+            .TilePos = uint2(minX, minY),
         };
 
         [[assume(offset < endOffsetY)]];  // avoids redundant early bounds check
 
-        for (; offset < endOffsetY; offset += offsetIncY) {
+        for (; offset < endOffsetY; offset += offsetIncY, vars.TilePos.y += 4) {
             v_int3 edge = edgeOrigin;
 
+            vars.TilePos.x = minX;
             size_t endOffsetX = offset + offsetExtentX;
             [[assume(offset < endOffsetX)]];
 
-            for (; offset < endOffsetX; offset += 16) {
+            for (; offset < endOffsetX; offset += 16, vars.TilePos.x += 4) {
                 // v_mask tileMask = simd::movemask((a | b | c) >= 0); // llvm hoists const(-1) into extra zmm register
                 v_mask tileMask = _mm512_movepi32_mask(
                     _mm512_ternarylogic_epi32(edge.x, edge.y, edge.z, ~(_MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C)));
