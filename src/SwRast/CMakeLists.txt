@@ -24,6 +24,8 @@ target_link_libraries(Playground PRIVATE
     glfw glad imgui
     nfd
 )
+target_precompile_headers(SwRast PUBLIC <memory> <algorithm> <thread> <immintrin.h> <glm/glm.hpp>)
+
 add_executable(BenchmarkApp
     Benchmarks/RasterBench.cpp Shading.cpp Voxel.cpp
     # Benchmarks/CoarseRaster.cpp

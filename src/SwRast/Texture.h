@@ -248,18 +248,6 @@ TexturePtr2D<pixfmt::R11G11B10f> LoadOctahedronFromPanoramaHDR(const char* path,
 
 void DownsampleDepth(Framebuffer<pixfmt::R32f>& src, Texture2D<pixfmt::R32f>& dest);
 
-// Iterates over the given rect in 4x4 tile steps. Visitor takes normalized UVs centered around pixel center.
-inline void IterateTiles(uint32_t width, uint32_t height, auto&& visitor) {
-    assert(width % 4 == 0 && height % 4 == 0);
-
-    for (int y = 0; y < height; y += 4) {
-        for (int x = 0; x < width; x += 4) {
-            v_float2 uv = simd::conv<float>(int2(x, y) + TilePixelOffsets) + 0.5f;
-            visitor((uint32_t)x, (uint32_t)y, uv.x * (1.0f / width), uv.y * (1.0f / height));
-        }
-    }
-}
-
 // Calculate partial derivatives for a 4x4 fragment via finite difference.
 // https://gamedev.stackexchange.com/a/130933
 inline v_float dFdx(v_float p) {
@@ -297,10 +285,11 @@ inline v_float3 UnmapOctahedron(v_float2 uv) {
     v_float t = simd::max(-norm.z, 0.0);
     norm.x -= simd::mulsign(t, norm.x);
     norm.y -= simd::mulsign(t, norm.y);
-    return normalize(norm);
+    return simd::normalize(norm);
 }
 inline v_float2 FixupOctahedronWrap(v_float2 uv) {
     // TODO https://gpuopen.com/learn/fetching-from-cubes-and-octahedrons/
+    // https://www.readkong.com/page/octahedron-environment-maps-6054207
     return uv;
 }
 

@@ -71,8 +71,8 @@ HdrTexture2D::Ptr texutil::LoadImageHDR(const char* path, uint32_t mipLevels) {
 HdrTexture2D::Ptr texutil::LoadOctahedronFromPanoramaHDR(const char* path, uint32_t mipLevels) {
     auto panoTex = LoadImageHDR(path, 1);
 
-    uint32_t faceSize = panoTex->Width;
-    auto cubeTex = CreateTexture<HdrTexture2D>(faceSize, faceSize, mipLevels);
+    uint32_t octSize = panoTex->Width;
+    auto octTex = CreateTexture<HdrTexture2D>(octSize, octSize, mipLevels);
 
     constexpr SamplerDesc PanoSampler = {
         .Wrap = WrapMode::Repeat,
@@ -80,10 +80,10 @@ HdrTexture2D::Ptr texutil::LoadOctahedronFromPanoramaHDR(const char* path, uint3
         .MinFilter = FilterMode::Linear,
     };
 
-    float scaleUV = 1.0f / (faceSize - 1);
+    float scaleUV = 1.0f / (octSize - 1);
     float centerUV = 0.5f * scaleUV;
-    for (uint32_t y = 0; y < faceSize; y += 4) {
-        for (uint32_t x = 0; x < faceSize; x += 4) {
+    for (uint32_t y = 0; y < octSize; y += 4) {
+        for (uint32_t x = 0; x < octSize; x += 4) {
             v_float2 uv = simd::conv<float>(int2(x, y) + swr::TilePixelOffsets) * scaleUV + centerUV;
             v_float3 dir = UnmapOctahedron(uv);
 
@@ -93,12 +93,12 @@ HdrTexture2D::Ptr texutil::LoadOctahedronFromPanoramaHDR(const char* path, uint3
             }
 
             v_float3 tile = panoTex->SampleLevel<PanoSampler>(uv, 0, 0);
-            cubeTex->WriteTile(tile, x, y);
+            octTex->WriteTile(tile, x, y);
         }
     }
 
-    cubeTex->GenerateMips();
-    return cubeTex;
+    octTex->GenerateMips();
+    return octTex;
 }
 
 // TODO: could reuse this for mipmap gen

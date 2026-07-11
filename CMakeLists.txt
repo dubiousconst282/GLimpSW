@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 
 project(SwRast)
-
-set(CPACK_PROJECT_NAME ${PROJECT_NAME})
-set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
 set(CMAKE_CXX_STANDARD 20)
 
 # Setup CPM
@@ -34,7 +31,7 @@ target_include_directories(glad PUBLIC deps/glad/include/)
 
 # ImGui
 CPMAddPackage("gh:ocornut/imgui#v1.92.7")
-CPMAddPackage("gh:CedricGuillemet/ImGuizmo#1.9")
+CPMAddPackage(GITHUB_REPOSITORY "CedricGuillemet/ImGuizmo" GIT_TAG "1.9" DOWNLOAD_ONLY TRUE)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp

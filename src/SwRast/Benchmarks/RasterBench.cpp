@@ -60,8 +60,8 @@ int main(int argc, const char** args) {
         .Materials = scene.Materials.data(),
         .Lights = scene.Lights.data(),
         .NumLights = scene.Lights.size(),
-        .WorldToClipMat = camera.GetProjMatrix() * camera.GetViewMatrix(true),
         .ViewPos = camera.ViewPosition,
+        .WorldToClipMat = camera.GetProjMatrix() * camera.GetViewMatrix(true),
         .Exposure = 1.0f,
     };
 
