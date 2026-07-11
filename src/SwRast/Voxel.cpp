@@ -1,4 +1,5 @@
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include "Rasterizer.h"
 #include "Scene.h"
@@ -252,6 +253,7 @@ void BrickMap::VoxelizeScene(const Scene& scene, float3 centerPos) {
     float3 maxPos = centerPos + (VoxelGridSize / scale) * 0.5f;
     float clipScale = 2.0f / (VoxelGridSize / scale);
     float3 clipOffset = -minPos * clipScale - 1.0f;
+    float4x4 clipMatrix = glm::translate(glm::scale(float4x4(1), float3(clipScale)), clipOffset);
 
     auto shader = swr::GetDispatchTable<&MS_VoxelizeSurface, &FS_VoxelizeSurface>();
 
@@ -264,13 +266,7 @@ void BrickMap::VoxelizeScene(const Scene& scene, float3 centerPos) {
         for (auto& node : model->Nodes) {
             if (node.MeshCount == 0) continue;
 
-            glm::mat4x3 mat = node.GlobalTransform;
-            mat[0] *= clipScale;
-            mat[1] *= clipScale;
-            mat[2] *= clipScale;
-            mat[3] += clipOffset;
-
-            ctx.ObjectToWorldMat = mat;
+            ctx.ObjectToWorldMat = clipMatrix * float4x4(node.GlobalTransform);
             ctx.Meshlets = &scene.Meshlets[node.MeshOffset];
 
             raster.DrawMeshlets(node.MeshCount, { shader, &ctx });
@@ -355,6 +351,8 @@ static v_uint GetBrickAddr(v_float3 pos) {
     return addr;
 }
 
+#define STEP_DBG(msg) // printf("%d %016b: %s\n", i, simd::movemask(v_exec), msg);
+
 VoxelHitResult BrickMap::RayCast(v_float3 origin, v_float3 dir, v_float2 distRange, v_mask activeMask, bool fetchAttribs) const {
     // Mirror coordinates to negative ray octant
     v_float3 absDir = { simd::abs(dir.x), simd::abs(dir.y), simd::abs(dir.z) };
@@ -398,11 +396,13 @@ VoxelHitResult BrickMap::RayCast(v_float3 origin, v_float3 dir, v_float2 distRan
     v_uint2 currBrickMask = 0;
 
     for (uint32_t i = 0; i < 128; i++) {
-        activeMask &= simd::movemask(tcurr < texit);
+        simd_if(simd::unmovemask(activeMask)) { STEP_DBG("Iter"); }
 
         simd_if(dirtyStepMask >= (1u << kBrickScale) && simd::unmovemask(activeMask)) {
+            STEP_DBG("FetchBrick");
+
             // TODO: renormalize and continue on next cascade
-            activeMask &= simd::movemask(dirtyStepMask < (1u << kRootScale));
+            activeMask &= simd::movemask(tcurr < texit && dirtyStepMask < (1u << kRootScale));
             if (activeMask == 0) break;
 
             v_uint brickAddr = GetBrickAddr(pos) ^ brickMirrorMask;
@@ -434,11 +434,13 @@ VoxelHitResult BrickMap::RayCast(v_float3 origin, v_float3 dir, v_float2 distRan
         }
 
         simd_if(dirtyStepMask >= (1u << kTileScale) && currBrickOffset != 0 && simd::unmovemask(activeMask)) {
+            STEP_DBG("FetchTile");
+
             v_uint tileIdx = GetNodeCellIndex(pos, kTileScale) ^ mirrorMask;
             v_uint tileSlot = PrefixPopcnt(currBrickMask, tileIdx);
             v_int hasTile = SplitBitTest64(currBrickMask, tileIdx, 1);
 
-#if 0
+#if 1
             v_uint2 tileMask = simd::gather2(Storage.get(), v_int(currBrickOffset + tileSlot * 2), v_exec && hasTile);
 
             simd::cmov(currLevelMask, simd::select(hasTile, tileMask, currBrickMask), v_exec);
@@ -452,6 +454,8 @@ VoxelHitResult BrickMap::RayCast(v_float3 origin, v_float3 dir, v_float2 distRan
 #endif
             simd::cmov(currScaleExp, hasTile ? kCellScale : kTileScale, v_exec);
         }
+
+        // TODO: try doing two/multiple steps to minimize divergence of tile/brick fetches
 
         v_uint advScaleExp = currScaleExp;
         simd_if((currLevelMask.x | currLevelMask.y) != 0) {

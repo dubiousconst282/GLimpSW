@@ -28,6 +28,7 @@ _Sample screenshots of the current version (deferred vis-buffer), showing perfor
 
 ### Missing/broken features
 - Clipping not implemented in binned rasterizer (to be rewritten)
+- Models with multiple leaf hierarchy nodes are slower to render, due to extra synchonization points between draw calls
 - Non-binned rasterizer does not synchronize, artifacts with multi-threading
 - Occlusion culling uses reprojection only, results in occasional disocclusion artifacts
 - IBL, SSAO, TAA not yet ported to meshlet branch
@@ -40,8 +41,8 @@ Prior the rewrite, the raster pipeline was based around the traditional vertex s
 
 One major source of inefficiency was in the lack of shaded vertex reuse based on the index buffer, since finding and referencing duplicates in an efficient way did not seem feasible without fast conflict and gather instructions, therefore the vertex shader would always be invoked three times per triangle. Vertex shading in by itself was also rather expansive because it would spend a lot of time gathering and copying custom attributes, most of which would be immediately thrown away after clipping and culling (typically at least half of all triangles are culled in this early step).
 
-Meshlets are very elegant and enable many interesting optimizations, in particular they allow for very flexible data layouts. 
-It is trivial to [avoid gathers](#memory-gathers) in the mesh shader by using a SoA layout, but of course the rasterizer still needs to read the resulting indexed positions. However, it can take advantage of the small vertex limit (64) and use the amazing 2-input permute instructions instead, which runs over twice as fast as plain gathers.
+Meshlets are very elegant and enable many interesting optimizations, and in particular they allow for very flexible data layouts. 
+This makes it trivial to [avoid gathers](#memory-gathers) in the mesh shader by using an SoA layout, and although the rasterizer still needs to fetch the resulting indexed positions, it can take advantage of the small vertex limit (64) and use the amazing 2-input permute instructions instead, which run over twice as fast as gathers.
 
 Because I had planned to port the renderer to a vis-buffer, and considering the aforementioned inefficiency with custom attributes, they are not supported in the new pipeline. The fragment shader is only given perspective-correct barycentrics, which it can use to interpolate whatever attributes it needs after fetching them from source, as opposed to an intermediate "varying" buffer. Although that is ignoring costlier work for per-model transforms and skinning, which is maybe not a big deal since some games have a dedicated compute pass for skinning.
 
@@ -99,6 +100,44 @@ The rest of the pipeline is pretty traditional, with a few details I find intere
   - Bins store packet IDs + masks rather than individual triangle IDs, for significantly lower overhead
   - Packets that are contained within a single bin are common (30~60%), slower path loops over entire packet's min/max bounding box (edge tests are overkill since bins are very large, 128x128)
   - One bin queue per thread (probably scales poorly), bitmap helps skipping over empty bins
+
+### DDGI with Voxels
+I wanted to try implement probe-based GI using ray tracing. For that, I decided to use a voxelized representation of the scene, both because past experience and because they seem much faster to traverse than standard triangle BVHs. Tinybvh's AVX2 traversal had a throughput of ~7.7M camera and ~17.3M anyhit rays per sec on one thread, Embree's 16-wide packet traversal was a little better at 10-11M rays, but both still much slower than the 18-20M rays my previous brickmap voxel tracer could get up to, and which I thought could still be improved on.
+
+Good BVHs require fewer steps to traverse than a hierarchical voxel structure, since they can form a tighter (non-isotropic) fit around geometry, which minimizes redundant intersections and grazing rays. On the other hand, voxel occupancy can be represented very compactly throught bitmasks, which use far less memory traffic for traversal, in addition to simpler intersection tests.
+
+The new implementation uses a compressed brickmap structure which is essentially a sparse contree/64-tree, but with only 3 levels and a flat top-level grid. This removes the need of a stack and long-latency chain of gathers during traversal, is easier to work with, and also more compact, since it can avoid/use smaller leaf node pointers.
+
+It is capable of around 25-30M camera rays/sec, although probe rays are much slower at 6-7M/sec. I haven't spent much time trying things apart from the obvious premature micro-opts, but that's still somewhat workable. Updating 2048 probes with 64 rays each takes ~6ms on 4 threads, with 20% being spent on convolution.
+
+#### Voxelization
+This is very straightforward, just the standard rasterization method using a fragment shader that writes into a 3D grid at the corresponding depth ([good explanation here](https://github.com/BoyBaykiller/IDKEngine#voxel-global-illumination)), except those writes go into a bump-allocated brickmap rather than a flat grid. Unexpectedly fast and effective for how simple it is. For Sponza at 512³, the entire process takes 20ms single-threaded and outputs a 24MB intermediate brickmap, which is immediatelly compressed into the accel struct (24MB -> 9MB).
+
+I ended up adding an extension flag in the rasterizer for swizzling triangles to the dominant axis, because this step would have been difficult to implement in the mesh shader as it could potentially generate up to 3x extra unique vertices, past the 64 output limit. It's a little hacky, but far simpler and more efficient than having a separate swizzling pass, or drawing the geometry 3 times.
+
+There are some occasional gaps in the output, resulting from thin/unaligned triangles that fail to cover samples. This could be fixed with conservative rasterization, which can be implemented by biasing the edge functions similarly to the accept/reject tile edges used for hierarchical raster. Though probably at a significant cost since it will force every triangle to generate/overdraw samples. [maybe TODO]
+
+Surfaces that intersect the same voxels, such as thin opposing walls, will result in randomly flipped normals and attributes. This wastes samples but doesn't seem to cause noticeable artifacts on GI.
+
+[TODO: clipmap with partial updates]
+
+#### Probes
+
+- Leaking is very dependent on parameters. Depth sharpening power is VERY important (otherwise depth map resolution is wasted), as is the normal/view bias
+- Noticeable flickering even at high hysteresis
+- Probe convolution is rather expansive (30-40%), pre-computing weights gets it down to ~20%
+
+#### Shadows
+Ray casting was unsurprisingly too expansive and blocky for shadows, so I couldn't avoid shadow maps. I ended up using the following derivative-based biasing method, which works very well (though false-shadowing still occurs on occasion, e.g. around rotated planes), and requires no changes for sampling:
+
+```cpp
+    if constexpr (IsShadowRender) {
+        // Planar bias method, as described by Avelina9X: https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
+        v_float dx = swr::texutil::dFdx(vars.Depth);
+        v_float dy = swr::texutil::dFdy(vars.Depth);
+        vars.Depth -= simd::max(simd::abs(dx) + simd::abs(dy), 5e-6) * ctx.ShadowSampleRadius;
+    }
+```
 
 ### Quad Inefficiency
 The rasterizer maps the 16 SIMD lanes into 4x4 pixel fragments. This works reasonably well, but suffers from the characteristic quad utilization problem, where small triangles will cover very few lanes.
@@ -270,6 +309,8 @@ cmake --build ./build/
 ./build/src/SwRast/Playground
 ```
 
+Controls: `WASD`, `Space/Shift` for up/down, `Q/E` to increase/decrease speed, `Left click + Drag` to pan camera.
+
 ## Useful/interesting refs
 
 Rasterization basics:
@@ -281,6 +322,7 @@ Shading:
 - [Physically Based Rendering in Filament](https://google.github.io/filament/Filament.html)
 - [Image Based Lighting with Multiple Scattering](https://bruop.github.io/ibl/)
 - https://academysoftwarefoundation.github.io/OpenPBR/
+- https://github.com/AcademySoftwareFoundation/MaterialX/
 
 Meshlets:
 - [Visibility Buffer Rendering with Material Graphs – Filmic Worlds](https://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/)
@@ -293,3 +335,6 @@ Other:
 - [Algorithms for Modern Hardware - Algorithmica](https://en.algorithmica.org/hpc/)
 - [High-Performance Software Rasterization on GPUs](https://research.nvidia.com/publication/2011-08_high-performance-software-rasterization-gpus)
 - [Cuda-Based Software Rasterization for Billions of Triangles](https://github.com/m-schuetz/CuRast)
+- [Nyuzi - GPGPU microprocessor architecture](https://github.com/jbush001/NyuziProcessor)
+- https://github.com/BoyBaykiller/IDKEngine
+- https://github.com/Sunset-Flock/Timberdoodle

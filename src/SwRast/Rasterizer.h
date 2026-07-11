@@ -160,6 +160,26 @@ struct Rasterizer {
 
     void Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser);
 
+    // Dispatches a number of groups `ceil(numInvocs / groupSize)` over worker threads. `cb(uint4 groupRect)`
+    template<typename TCallback>
+    void DispatchGroups(uint2 numInvocs, uint32_t groupSize, TCallback&& cb) {
+        uint32_t numGroupsX = (numInvocs.x + groupSize - 1) / groupSize;
+        uint32_t numGroupsY = (numInvocs.y + groupSize - 1) / groupSize;
+        uint32_t numGroups = numGroupsX * numGroupsY;
+        uint32_t nextGroupId = GetThreadCount();
+
+        Dispatch([&](uint32_t workerId) {
+            for (uint32_t i = workerId; i < numGroups; i = __atomic_fetch_add(&nextGroupId, 1, __ATOMIC_RELAXED)) {
+                uint32_t x0 = (i % numGroupsX) * groupSize;
+                uint32_t y0 = (i / numGroupsX) * groupSize;
+                uint32_t x1 = std::min(x0 + groupSize, numInvocs.x);
+                uint32_t y1 = std::min(y0 + groupSize, numInvocs.y);
+
+                [[clang::always_inline]] cb(uint4(x0, y0, x1, y1));
+            }
+        });
+    }
+
     // Iterates over texture tiles in parallel. `cb(uint2 tileBasePos, v_int tilePos, v_float2 tileNdc)`
     template<typename TCallback>
     void DispatchPass(uint2 numInvocs, TCallback&& cb) {
@@ -323,7 +343,8 @@ enum class PerfCounter {
     DrawTime,
     ResolveTime,
 
-    ShadowTime,
+    ProbeUpdateTime,
+    ShadowRenderTime,
     FrameTime,
 
     Count_,

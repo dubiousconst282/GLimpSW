@@ -438,16 +438,51 @@ SIMD_INLINE v_float2 sincos(v_float a) { return sincos_2pi(a * 0.159154943091895
 SIMD_INLINE v_float sin(v_float a) { return sincos(a).x; }
 SIMD_INLINE v_float cos(v_float a) { return sincos(a).y; }
 
-// https://github.com/romeric/fastapprox/blob/master/fastapprox/src/fastlog.h
+// Max abs error: 0.000393033
+// https://jrfonseca.blogspot.com/2008/09/fast-sse2-pow-tables-or-polynomials.html
+// https://stackoverflow.com/a/45787548
 SIMD_INLINE v_float approx_log2(v_float x) {
-    v_float y = conv<float>(as<uint32_t>(x));
-    return fma(y, 1.1920928955078125e-7f, -126.94269504f);
+    v_float m = _mm512_getmant_ps(x, _MM_MANT_NORM_1_2, _MM_MANT_SIGN_zero);
+    v_float e = _mm512_getexp_ps(x);
+
+    // Minimax polynomial fit of log2(x)/(x - 1), for x in range [1, 2)
+    v_float p = -0.107254423828329604454f;
+    p = fma(p, m, +0.688243882994381274313f);
+    p = fma(p, m, -1.75647175389045657003f);
+    p = fma(p, m, +2.61761038894603480148f);
+    p = fma(p, m, -p);
+
+    return e + p;
 }
 SIMD_INLINE v_float approx_exp2(v_float x) {
-    x = max(x, -126.0f);
-    return as<float>(round2i((1 << 23) * (x + 126.94269504f)));
+    v_float f = _mm512_reduce_ps(x, _MM_FROUND_TO_NEG_INF);
+
+    // Minimax polynomial fit of 2^x, for x in range [0, 1)
+    // 2nd (err: 2.476056400384995e-3) = 0.3440011068961472 * x^2 + 0.6510467803034026 * x + 1.002476056400225
+    // 3rd (err: 1.070343494922904e-4) = 7.92042402197956e-2 * x^3 + 0.22433836478673508 * x^2 + 0.6964573949934694 * x + 0.999892965650519
+    // 4th (err: 3.704465938330266e-6) = 1.36976644758053e-2 * x^4 + 5.16903582059769e-2 * x^3 + 0.24163844572493004 * x^2 + 0.6929661226614153 * x + 1.0000037044659362
+    // 5th (err: 1.068891762511766e-7) = 1.896461145901645e-3 * x^5 + 8.94282898300906e-3 * x^4 + 5.586624630536514e-2 * x^3 + 0.24013971109055557 * x^2 + 0.6931547524751686 * x + 0.9999998931108275
+    v_float p = 7.92042402197956e-2;
+    p = fma(p, f, 0.22433836478673508);
+    p = fma(p, f, 0.6964573949934694);
+    p = fma(p, f, 0.999892965650519);
+
+    return _mm512_scalef_ps(p, x);
 }
 SIMD_INLINE v_float approx_pow(v_float x, v_float y) { return approx_exp2(approx_log2(x) * y); }
+
+// Max abs error: 0.0573072
+// https://github.com/romeric/fastapprox/blob/master/fastapprox/src/fastlog.h
+SIMD_INLINE v_float approx_approx_log2(v_float x) {
+    v_float y = conv<float>(as<int>(x));
+    return fma(y, 1.0 / (1 << 23), -126.94269504f);
+}
+SIMD_INLINE v_float approx_approx_exp2(v_float x) {
+    v_float y = fma(x, 1 << 23, 126.94269504 * (1 << 23));
+    v_int r = conv<int>(y);
+    return as<float>(r < (1 << 23) ? 0 : r);  // zap denormals
+}
+SIMD_INLINE v_float approx_approx_pow(v_float x, v_float y) { return approx_approx_exp2(approx_approx_log2(x) * y); }
 
 SIMD_INLINE v_int ilog2(v_float x) { return (as<v_int>(x) - (127 << 23)) >> 23; }
 
@@ -540,6 +575,13 @@ SIMD_INLINE v_uint rotr(v_uint a, int b) { return (a >> b) | (a << (32 - b)); }
 
 //////////////////////////////////////// Misc ////////////////////////////////////////
 
+// Prevents clang's smart ass from canonicalizing/folding/instcombining the given value.
+template<is_vector T>
+[[gnu::const]] SIMD_INLINE T uncanon(T x) {
+    asm("" : "+v"(x) : :);
+    return x;
+}
+
 struct AlignedDeleter {
     void operator()(void* data) const { _mm_free(data); }
 };
@@ -570,12 +612,64 @@ public:
     BitIter end() const { return BitIter(0); }
 };
 
-// Prevents clang's smart ass from canonicalizing/folding/instcombining the given value.
-template<is_vector T>
-SIMD_INLINE T uncanon(T x) {
-    asm("" : "+v"(x) : :);
-    return x;
-}
+// https://prng.di.unimi.it/xoroshiro64star.c
+struct XoRandom {
+    XoRandom(uint64_t seed = __rdtsc()) {
+        for (uint32_t i = 0; i < sizeof(s) / 8; i++) {
+            ((uint64_t*)s)[i] = SplitMix64(seed);
+        }
+    }
+
+    v_uint V_NextU32() {
+        v_uint s0 = s[0];
+        v_uint s1 = s[1] ^ s0;
+        v_uint result = s0 * 0x9E3779BBu;
+
+        s[0] = simd::rotl(s0, 26) ^ s1 ^ (s1 << 9);  // a, b
+        s[1] = simd::rotl(s1, 13);                   // c
+
+        return result;
+    }
+
+    // Returns a random float, uniformly distributed in range [0..1)
+    v_float V_NextUFloat() {
+        v_uint frac = (V_NextU32() >> 9) | 0x3F800000;
+        return simd::as<v_float>(frac) - 1.0f;
+    }
+    v_float2 V_NextUFloat2() {
+        v_uint bits = V_NextU32();
+        return simd::conv<float>(bits >> v_uint2(0, 16) & 65535) * (1.0f / 65536);
+    }
+
+    uint32_t NextU32() {
+        uint32_t s0 = s[0][0];
+        uint32_t s1 = s[1][0] ^ s0;
+        uint32_t result = s0 * 0x9E3779BBu;
+
+        s[0][0] = std::rotl(s0, 26) ^ s1 ^ (s1 << 9);  // a, b
+        s[1][0] = std::rotl(s1, 13);                   // c
+
+        return result;
+    }
+    float NextUFloat() {
+        uint frac = (NextU32() >> 9) | 0x3F800000;
+        return simd::as<float>(frac) - 1.0f;
+    }
+    float2 NextUFloat2() {
+        uint bits = NextU32();
+        return float2(bits >> uint2(0, 16) & 65535u) * (1.0f / 65536);
+    }
+
+private:
+    v_uint s[2];
+
+    static uint64_t SplitMix64(uint64_t& x) {
+        uint64_t z = (x += 0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+};
 
 };  // namespace simd
 

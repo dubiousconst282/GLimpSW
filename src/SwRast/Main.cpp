@@ -27,6 +27,8 @@ GLFWwindow* _window;
 
 swr::FramebufferPtr2D<swr::pixfmt::RGBA8u> _colorFb;
 swr::FramebufferPtr2D<swr::pixfmt::R32f> _depthFb;
+swr::FramebufferPtr2D<swr::pixfmt::R32f> _shadowDepthFb;
+
 std::unique_ptr<swr::Rasterizer> _rast;
 swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
 GLuint _fbTexture = 0;
@@ -35,6 +37,7 @@ Camera _cam;
 std::unique_ptr<Scene> _scene;
 swr::HdrTexture2D::Ptr _skyboxTex;
 std::unique_ptr<BrickMap> _brickmap;
+std::unique_ptr<GIProbeField> _probes;
 
 GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
     GLuint handle;
@@ -65,6 +68,17 @@ void LoadScene(const std::string& path) {
     _scene = std::make_unique<Scene>();
     _scene->ImportGltf(path);
 
+    if (_scene->Lights.size() == 0) {
+        uint32_t offset = _scene->Lights.AllocRange(1);
+
+        _scene->Lights[offset] = {
+            .Type = Light::kTypeDirectional,
+            .Direction = glm::normalize(-float3(0.589494, 0.684509, 0.428906)),
+            .Color = float3(1, 1, 1),
+            .Intensity = 5.0,
+        };
+    }
+
     _brickmap = std::make_unique<BrickMap>(4, 16.0f);
     _brickmap->VoxelizeScene(*_scene, float3(0));
 }
@@ -75,12 +89,58 @@ void LoadSkybox(const std::string& path) {
 void InitRenderer() {
     LoadScene("assets/models/Sponza/Sponza.gltf");
     LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
+    ShadingContext::LoadBlueNoise();
 
-    _cam = Camera{ .Position = {9.6753334456680022, 1.1288966350423235, -0.48801679478492588}, .Euler = {-1.58308733, -0.608505249}, .MoveSpeed = 5.0f };
-    
+    _cam = Camera{ .Position = { -9.38414, 1.63823, -0.00313 }, .Euler = { 0.7993, -0.0849 }, .MoveSpeed = 5.0f };
+
     _rast = std::make_unique<swr::Rasterizer>(4);
     _rast->EnableBinning = false;
     CreateFramebuffer(1920, 1080);
+
+    _shadowDepthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(1024, 1024, 1, 1);
+    _probes = std::make_unique<GIProbeField>();
+    _probes->ProbeBaseOffset = -float3(GIProbeField::GridSize) * _probes->ProbeSpacing / 2.0f;
+
+    // Adjustments for Sponza
+    _probes->ProbeBaseOffset.y = -0.5f;
+    _probes->ProbeBaseOffset.z -= 0.25f;
+
+    _probes->Reset(true);
+}
+
+void DrawModel(Model& model, ShadingContext& shader, const swr::ShaderDispatchTable& dispatcher,
+               std::vector<InstanceData>* instances,bool enableOcclusionCull) {
+    ZoneScoped;
+
+    for (auto& node : model.Nodes) {
+        if (node.MeshCount == 0) continue;
+
+        constexpr uint32_t batchSize = std::min(16384u, ShadingContext::MaxMeshletsPerDraw);
+        v_mask cullBitmap[batchSize / simd::vec_width];
+
+        for (uint32_t i = 0; i < node.MeshCount; i += batchSize) {
+            uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
+
+            SWR_PERF_BEGIN(Culling);
+            uint32_t visibleCount =
+                shader.CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount, node.GlobalTransform,
+                                    float2(_colorFb->Width, _colorFb->Height), enableOcclusionCull ? _prevDepthMap.get() : nullptr);
+            SWR_PERF_END(Culling);
+
+            if (visibleCount > 0) {
+                shader.InstanceMeshlets = &_scene->Meshlets[node.MeshOffset + i];
+                shader.InstanceCullBitmap = cullBitmap;
+                shader.ObjectToWorldMat = node.GlobalTransform;
+                shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform);
+
+                if (instances != nullptr) {
+                    shader.InstanceId = instances->size();
+                    instances->push_back({ .Meshlets = shader.InstanceMeshlets, .Transform = node.GlobalTransform });
+                }
+                _rast->DrawMeshlets(meshCount, { dispatcher, &shader });
+            }
+        }
+    }
 }
 
 void DrawTranslationGizmo(glm::vec3& pos) {
@@ -100,20 +160,64 @@ void DrawTranslationGizmo(glm::vec3& pos) {
     }
 }
 
+constexpr uint32_t MaxShadowCascades = 4;
+
+void ComputeShadowMatrices(const Camera& cam, float3 lightDir, uint32_t renderSize, float4x4 worldToShadowMat[MaxShadowCascades]) {
+    float splitDist[MaxShadowCascades] = { 2.0f, 5.0f, 12.0f, 20.0f };
+    float maxDist = 30.0f;
+
+    float3 frustumCorners[8];
+    float4x4 clipToWorldMat = glm::inverse(cam.GetProjMatrix() * cam.GetViewMatrix(true));
+
+    for (int i = 0; i < 8; i++) {
+        int3 corner = i >> int3(0, 1, 2) & 1;
+        float4 pos = clipToWorldMat * float4(int2(corner) * 2 - 1, corner.z ? cam.NearZ / maxDist : 1, 1);
+        frustumCorners[i] = float3(pos) / pos.w;
+    }
+
+    for (uint32_t cascadeIdx = 0; cascadeIdx < MaxShadowCascades; cascadeIdx++) {
+        float tSplit0 = cascadeIdx == 0 ? 0 : splitDist[cascadeIdx - 1] / maxDist;
+        float tSplit1 = splitDist[cascadeIdx] / maxDist;
+
+        float3 corners[8];
+        float3 center = float3(0);
+
+        for (uint32_t i = 0; i < 4; i++) {
+            corners[i + 0] = glm::mix(frustumCorners[i], frustumCorners[i + 4], tSplit0);
+            corners[i + 4] = glm::mix(frustumCorners[i], frustumCorners[i + 4], tSplit1);
+            center += (corners[i + 0] + corners[i + 4]);
+        }
+        center /= 8;
+
+        // Using radius as projection bounds prevents shimmering on camera rotation
+        float radius = 0;
+        for (uint32_t i = 0; i < 8; i++) {
+            radius = glm::max(radius, glm::length(corners[i] - center));
+        }
+        radius /= 2;
+
+        float4x4 proj = glm::ortho(-radius, +radius, -radius, +radius, 0.0f, radius * 12);
+        float4x4 view = glm::lookAt(center + lightDir * radius, center, float3(0, 1, 0));
+        float4x4 viewProj = proj * view;
+
+        // Texel-space stabilization
+        float halfRenderSize = renderSize * 0.5f;
+        float2 clipOrigin = viewProj * float4(0, 0, 0, halfRenderSize);
+        float2 snapOffset = (clipOrigin - glm::round(clipOrigin)) / halfRenderSize;
+
+        viewProj[3][0] -= snapOffset.x;
+        viewProj[3][1] -= snapOffset.y;
+
+        worldToShadowMat[cascadeIdx] = viewProj;
+    }
+}
+
 void RenderFrame() {
     FrameMark;
 
-    static bool s_VSync = false;
-
-    static DebugLayer s_Layer = DebugLayer::None;
-    static bool s_EnableVisBuffer = true;
-    static bool s_ShowPerfHeatmap = false;
-    static bool s_OcclusionCulling = true;
-    static float s_Exposure = 1.0f;
-
     ImGui::Begin("Settings");
     
-    ImGui::SeparatorText("Environment");
+    ImGui::SeparatorText("Scene");
 
     if (ImGui::Button("Import Model")) {
         nfdu8filteritem_t filters[1] = { { "GLTF models", "gltf,glb" } };
@@ -155,10 +259,14 @@ void RenderFrame() {
 
     ImGui::SeparatorText("Renderer");
 
-    ImGui::Checkbox("Vis-buffer", &s_EnableVisBuffer);
-    ImGui::Checkbox("Perf Heatmap", &s_ShowPerfHeatmap);
+    static bool s_OcclusionCulling = true;
+    static bool s_EnableDDGI = true;
+    static bool s_DrawProbes = true;
     ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
+    ImGui::Checkbox("DDGI", &s_EnableDDGI);
+    ImGui::Checkbox("Draw Probes", &s_DrawProbes);
 
+    static DebugLayer s_DebugView = DebugLayer::None;
     {
         const int count = std::size(kDebugLayerNames);
         ImGui::Combo("Debug View", (int*)&s_DebugView, kDebugLayerNames, count);
@@ -167,115 +275,182 @@ void RenderFrame() {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) s_DebugView = (DebugLayer)((idx == 0 ? count : idx) - 1);
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) s_DebugView = (DebugLayer)((idx + 1 < count ? idx + 1 : 0));
     }
+    static int debugShadowLayerIdx = -1;
+    ImGui::SliderInt("Debug Shadows", &debugShadowLayerIdx, -1, MaxShadowCascades);
 
-    ImGui::SliderFloat("Exposure", &s_Exposure, 0.1f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    static AutoExposureData s_ExposureData = {};
+    static float s_ExposureValue = -15.1f;
+    bool autoExposure = s_ExposureValue < -15.0f;
+
+    if (ImGui::SliderFloat("Exposure", &s_ExposureValue, -15.1f, 15.0f, autoExposure ? "Auto" : "%+.1f")) {
+        s_ExposureData.Exposure = 1.0f / exp2(-s_ExposureValue) * 1.2f; // EV100 -> Lmax
+    }
+
+    ImGui::DragFloatRange2("LogRange", &s_ExposureData.HistRange.x, &s_ExposureData.HistRange.y, 0.1f, -12.0f, 12.0f, "%.3f");
 
     ImGui::SeparatorText("Misc");
     ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
 
+    ImGui::InputScalarN("Pos", ImGuiDataType_Double, &_cam.Position, 3);
+    if (ImGui::IsItemActive() && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
+        char text[128];
+        snprintf(text, sizeof(text), ".Position = { %.5f, %.5f, %.5f }, .Euler = { %.4f, %.4f }",  //
+                 _cam.Position.x, _cam.Position.y, _cam.Position.z, _cam.Euler.x, _cam.Euler.y);
+        ImGui::SetClipboardText(text);
+    }
     ImGui::End();
 
     if (ImGui::IsKeyPressed(ImGuiKey_C)) {
         _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
     }
 
-    float4x4 prevViewMat = _cam.GetViewMatrix(true);
+    float4x4 prevCamViewMat = _cam.GetViewMatrix(true);
 
     _cam.Update(Camera::GetInputsFromImGui());
 
-    float4x4 projMat = _cam.GetProjMatrix();
-    float4x4 viewMat = _cam.GetViewMatrix(true);
-    float4x4 projViewMat = projMat * viewMat;
+    float4x4 camProjMat = _cam.GetProjMatrix();
+    float4x4 camViewMat = _cam.GetViewMatrix(true);
+    float4x4 camProjViewMat = camProjMat * camViewMat;
 
     SWR_PERF_BEGIN(Frame);
 
     ShadingContext shader = {
-        .DepthBuffer = _depthFb.get(),
         .ColorBuffer = _colorFb.get(),
         .Materials = _scene->Materials.data(),
         .Lights = _scene->Lights.data(),
         .NumLights = _scene->Lights.size(),
-        .WorldToClipMat = projMat * viewMat,
-        .SkyboxTex = _skyboxTex.get(),
-        .BrickMap = _brickmap.get(),
+
         .ViewPos = _cam.ViewPosition,
-        .Exposure = s_Exposure,
-        .ShowPerfHeatmap = s_ShowPerfHeatmap,
+        .PrevViewMat = prevCamViewMat,
+
+        .SkyboxTex = _skyboxTex.get(),
+        .ProbeField = s_EnableDDGI ? _probes.get() : nullptr,
+        .BrickMap = _brickmap.get(),
+        .Exposure = s_ExposureData.Exposure,
+        .AutoExp = autoExposure ? &s_ExposureData : nullptr,
     };
 
-    if (_scene->Lights.Storage.size() == 0) {
-        static Light light = {
-            .Type = Light::kTypeDirectional,
-            .Direction = glm::normalize(-float3(0.589494, 0.684509, 0.428906)),
-            .Color = float3(1, 1, 1),
-            .Intensity = 1500,
-        };
-        shader.Lights = &light;
-        shader.NumLights = 1;
+    Light* sunLight = _scene->Lights[0].Type == Light::kTypeDirectional ? &_scene->Lights[0] : nullptr;
+
+    if (sunLight != nullptr) {
+        ZoneScopedN("ShadowMap");
+        SWR_PERF_BEGIN(ShadowRender);
+
+        float3 dir = sunLight->Direction;
+        float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
+        if (ImGui::DragFloat2("Sun angle", &angle.x, 0.01f)) {
+            float r = cosf(angle.y);
+            sunLight->Direction = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
+        }
+
+        static float sampleRadius = 3;
+        ImGui::DragFloat("Sample Radius", &sampleRadius, 0.01, 1, 10, "%.1f");
+
+        static int cascadeIdx = 2;
+        ImGui::SliderInt("Active Cascade", &cascadeIdx, 0, 3);
+
+        ComputeShadowMatrices(_cam, sunLight->Direction, _shadowDepthFb->Width, shader.ShadowProjMatrices);
+        shader.ShadowDepthMap = _shadowDepthFb.get();
+        shader.ShadowSampleRadius = sampleRadius;
+        shader.ShadowProjMatrices[0] = shader.ShadowProjMatrices[cascadeIdx];  // TODO: sample cascades
+
+        _shadowDepthFb->Clear(0);
+        shader.DepthBuffer = _shadowDepthFb.get();
+        _rast->SetViewport(uint2(_shadowDepthFb->Width, _shadowDepthFb->Height));
+
+        shader.ProjMat = float4x4(1);
+        shader.ViewMat = float4x4(1);
+        shader.WorldToClipMat = shader.ShadowProjMatrices[0];
+
+        for (auto& model : _scene->Models) {
+            DrawModel(*model, shader, ShadingContext::ShadowGenShader, nullptr, false);
+        }
+        SWR_PERF_END(ShadowRender);
     }
 
-    bool debugOverdraw = s_Layer == DebugLayer::OverdrawPixel || s_Layer == DebugLayer::OverdrawQuad;
-
-    const swr::ShaderDispatchTable& dispatchTable =  //
-        debugOverdraw     ? ShadingContext::OverdrawShader :
-        s_EnableVisBuffer ? ShadingContext::VisBufferShader :
-                            ShadingContext::DeferredShader;
+    bool debugOverdraw = s_DebugView == DebugLayer::OverdrawPixel || s_DebugView == DebugLayer::OverdrawQuad;
+    auto& dispatchTable = debugOverdraw ? ShadingContext::OverdrawShader : ShadingContext::VisBufferShader;
 
     {
         ZoneScopedN("ClearFb");
         _colorFb->Clear(0);
         _depthFb->Clear(0);
+
+        shader.DepthBuffer = _depthFb.get();
+        _rast->SetViewport(uint2(_colorFb->Width, _colorFb->Height));
     }
 
-    _rast->SetViewport(uint2(_colorFb->Width, _colorFb->Height));
+    shader.ProjMat = camProjMat;
+    shader.ViewMat = camViewMat;
+    shader.WorldToClipMat = camProjViewMat;
 
     auto instances = std::vector<InstanceData>();
+    instances.resize(1); // reserve 0th instance id for "null"
     instances.reserve(1024);
 
     for (auto& model : _scene->Models) {
-        ZoneScopedN("Draw Model");
+        DrawModel(*model, shader, dispatchTable, &instances, s_OcclusionCulling);
+    }
 
-        for (auto& node : model->Nodes) {
-            if (node.MeshCount == 0) continue;
+    SWR_PERF_BEGIN(Resolve);
 
-            constexpr uint32_t batchSize = std::min(16384u, ShadingContext::MaxMeshletsPerDraw);
-            v_mask cullBitmap[batchSize / simd::vec_width];
+    shader.DepthBuffer = _depthFb.get();
+    shader.Instances = instances.data();
 
-            for (uint32_t i = 0; i < node.MeshCount; i += batchSize) {
-                uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
+    if (s_DebugView == DebugLayer::None) {
+        ZoneScopedN("Resolve");
 
-                SWR_PERF_BEGIN(Culling);
-                uint32_t visibleCount =                                                                          //
-                    ShadingContext::CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount,  //
-                                                 projMat, viewMat, node.GlobalTransform, prevViewMat,            //
-                                                 float2(_colorFb->Width, _colorFb->Height),
-                                                 s_OcclusionCulling ? _prevDepthMap.get() : nullptr);
-                SWR_PERF_END(Culling);
+        shader.Resolve(*_rast);
 
-                if (visibleCount > 0) {
-                    shader.InstanceMeshlets = &_scene->Meshlets[node.MeshOffset + i];
-                    shader.InstanceCullBitmap = cullBitmap;
-                    shader.InstanceId = instances.size();
-                    shader.ObjectToWorldMat = node.GlobalTransform;
-                    shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform);
+        if (autoExposure) {
+            s_ExposureData.UpdateExposure(ImGui::GetIO().DeltaTime, 1.1f);
+        }
+    } else if (s_DebugView != DebugLayer::None) {
+        shader.ResolveDebug(*_rast, s_DebugView);
+    }
+    SWR_PERF_END(Resolve);
 
-                    _rast->DrawMeshlets(meshCount, { dispatchTable, &shader });
-                    instances.push_back({ .Meshlets = shader.InstanceMeshlets, .Transform = node.GlobalTransform });
-                }
+    bool reinitProbes = false;
+    reinitProbes |= ImGui::DragFloat3("Probe Offset", &_probes->ProbeBaseOffset.x, 0.1f);
+    reinitProbes |= ImGui::DragFloat("Probe Spacing", &_probes->ProbeSpacing, 0.1f, 0.1f, 5.0f);
+    if (reinitProbes) _probes->Reset(false);
+
+    static bool forceUpdateAll = false;
+    ImGui::SliderInt("Rays/Probe", (int*)&_probes->RaysPerProbe, 16, 128);
+    ImGui::SliderInt("Max Hysteresis", (int*)&_probes->MaxHysteresis, 1, 128);
+    ImGui::DragFloat("Ray Max Dist", &_probes->MaxRayDist, 0.1f, 1.0f, 100.0f);
+    ImGui::DragFloat("Normal Bias", &_probes->NormalBias, 0.001, 0.01f, 0.5f);
+    ImGui::Checkbox("Force Update All", &forceUpdateAll);
+
+    if (forceUpdateAll) memset(_probes->CurrActiveBitmap, 255, sizeof(_probes->CurrActiveBitmap));
+
+    if (s_EnableDDGI) {
+        ZoneScopedN("ProbeUpdate");
+
+        SWR_PERF_BEGIN(ProbeUpdate);
+        shader.UpdateProbes(*_rast);
+        SWR_PERF_END(ProbeUpdate);
+
+        if (s_DrawProbes) {
+            shader.DrawProbesDebug();
+        }
+    }
+
+    if (debugShadowLayerIdx >= 0) {
+        uint2 size = uint2(_colorFb->Width / 3, _colorFb->Height / 3);
+        uint2 offset = uint2(_colorFb->Width - size.x, _colorFb->Height - size.y) & ~3u;
+
+        for (uint32_t y = 0; y < size.y; y += 4) {
+            for (uint32_t x = 0; x < size.x; x += 4) {
+                v_int2 pos = int2(x, y) + swr::TilePixelOffsets;
+                pos = simd::conv<int>(simd::conv<float>(pos) * float2(_shadowDepthFb->Width / (float)size.x, _shadowDepthFb->Height / (float)size.y));
+                v_float depth = simd::as<v_float>(_shadowDepthFb->Fetch(pos));
+
+                v_float3 color = depth;
+                _colorFb->WriteTile(swr::pixfmt::RGBA8u::Pack({ color, 1 }), offset.x + x, offset.y + y);
             }
         }
     }
-    SWR_PERF_BEGIN(Resolve);
-
-    shader.Instances = instances.data();
-
-    if (s_EnableVisBuffer && s_Layer == DebugLayer::None) {
-        shader.Resolve(*_rast);
-    } else if (s_Layer != DebugLayer::None) {
-        shader.ResolveDebug(*_rast, s_Layer);
-    }
-
-    SWR_PERF_END(Resolve);
 
     if (s_OcclusionCulling) {
         ZoneScopedN("BuildHiZ");
@@ -308,10 +483,13 @@ void RenderFrame() {
 
     swr::perf::FlushThreadCounters();
 
-    ImGui::Begin("Rasterizer Stats");
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize);
+
     ImGui::Text("Frame: %.1fms (%.0f FPS), Cull: %.2fms, Resolve: %.2fms",   //
-                swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,   //
-                1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),   //
+                swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,    //
+                1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),    //
                 swr::perf::GetAverage(swr::PerfCounter::CullingTime) / 1e6,  //
                 swr::perf::GetAverage(swr::PerfCounter::ResolveTime) / 1e6);
 
@@ -321,11 +499,13 @@ void RenderFrame() {
                 swr::perf::GetCurrent(swr::PerfCounter::TrianglesProcessed) / 1e3,   //
                 swr::perf::GetCurrent(swr::PerfCounter::TrianglesClipped) / 1e3,     //
                 swr::perf::GetCurrent(swr::PerfCounter::BinQueueFlushes) / 1e3);
+
+    ImGui::Text("Shadows: %.2fms, Probes: %.2fms",                                //
+                swr::perf::GetAverage(swr::PerfCounter::ShadowRenderTime) / 1e6,  //
+                swr::perf::GetAverage(swr::PerfCounter::ProbeUpdateTime) / 1e6);
     ImGui::End();
 
     swr::perf::Reset();
-
-    // DrawTranslationGizmo(_lightPos);
 }
 
 };

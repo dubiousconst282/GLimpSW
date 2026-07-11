@@ -55,9 +55,3 @@ struct BrickMap {
     BrickCluster* AllocCluster(uint3 pos, uint32_t sizeBytes);
     void FreeCluster(uint3 pos);
 };
-
-inline void UnpackVoxelAttribs(v_uint packed, v_float3& color, v_float3& normal, v_float2 metallicRoughness) {
-    color = simd::conv<float>(packed >> v_uint3(0, 5, 10) & v_uint3(31, 31, 15)) / v_float3(31, 31, 15);
-    normal = swr::texutil::UnmapOctahedron(simd::conv<float>(packed >> v_uint2(14, 19) & 31) / 31.0f);
-    metallicRoughness = simd::conv<float>(packed >> v_uint2(24, 28) & 15) / 15.0f;
-}

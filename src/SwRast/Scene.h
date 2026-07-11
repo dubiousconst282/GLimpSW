@@ -110,7 +110,11 @@ struct FlatPool {
     }
 
     T* data() { return Storage.data(); }
+    const T* data() const { return Storage.data(); }
     uint32_t size() const { return Storage.size(); }
+
+    auto begin() { return Storage.begin(); }
+    auto end() { return Storage.end(); }
 };
 
 struct Scene {
