@@ -48,10 +48,16 @@ float2 UnpackHalf2x16(uint32_t x) {
     auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
     return { v[0], v[1] };
 }
-void UnpackNormalTangent(v_uint packed, v_float3& norm, v_float3& tang) {
-    v_float4 oct = swr::pixfmt::RGBA8u::Unpack(packed);
-    norm = swr::texutil::UnmapOctahedron({ oct.x, oct.y });
-    tang = swr::texutil::UnmapOctahedron({ oct.z, oct.w });
+v_float3 UnpackNormal(v_uint packed[3], const v_float3& bary) {
+    // RGB10: 9141us  OctUnmap: 10568us  (1.15x)
+
+    // Folding snorm scaling after bary lerp saves 6 FMAs
+    // v_float3 v0 = swr::pixfmt::RGB10u::Unpack(packed[0]) * 2 - 1;
+
+    v_float3 v0 = simd::conv<float>(packed[0] >> v_uint3(0, 10, 20) & 1023);
+    v_float3 v1 = simd::conv<float>(packed[1] >> v_uint3(0, 10, 20) & 1023);
+    v_float3 v2 = simd::conv<float>(packed[2] >> v_uint3(0, 10, 20) & 1023);
+    return swr::BaryLerp(bary, v0, v1, v2) * (2.0f / 1023) - 1.0f;
 }
 
 // Standard "source over" alpha blending. Not gamma correct.
@@ -178,9 +184,9 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
         const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
         const Material& material = ctx.Materials[mesh.MaterialId];
 
-        v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0]]);
-        v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
-        v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
+        v_float2 uv0 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[0]].x);
+        v_float2 uv1 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[1]].x);
+        v_float2 uv2 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[2]].x);
         v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
         v_uint color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
 
@@ -273,8 +279,8 @@ struct SurfaceAttribs {
 SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_float2 screenNdc, float2 screenSize) {
     v_float3 pos[3];
     v_uint packedTexCoord[3];
-    v_uint packedNormalTangent[3];
-    v_mask tangentHandedness = 0;
+    v_uint packedNormal[3];
+    v_uint packedTangent[3];
     v_uint materialId = UINT_MAX;
 
     v_int v_exec = surfaceId != 0;
@@ -294,12 +300,9 @@ SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_flo
             simd::cmov(pos[vi].x, mesh.Positions[0][idx], v_exec);
             simd::cmov(pos[vi].y, mesh.Positions[1][idx], v_exec);
             simd::cmov(pos[vi].z, mesh.Positions[2][idx], v_exec);
-            simd::cmov(packedTexCoord[vi], mesh.TexCoords[idx], v_exec);
-            simd::cmov(packedNormalTangent[vi], mesh.NormalTangents[idx], v_exec);
-
-            if (vi == 0 && (mesh.TangentHandedness >> idx & 1)) {
-                tangentHandedness |= simd::movemask(v_exec);
-            }
+            simd::cmov(packedTexCoord[vi], mesh.Attribs[idx].x, v_exec);
+            simd::cmov(packedNormal[vi], mesh.Attribs[idx].y, v_exec);
+            simd::cmov(packedTangent[vi], mesh.Attribs[idx].z, v_exec);
         }
     }
 
@@ -354,16 +357,11 @@ SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_flo
             simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texCoord, 1, mipLevel), v_exec);
         }
     }
-    v_float3 normal0, normal1, normal2;
-    v_float3 tangent0, tangent1, tangent2;
-    UnpackNormalTangent(packedNormalTangent[0], normal0, tangent0);
-    UnpackNormalTangent(packedNormalTangent[1], normal1, tangent1);
-    UnpackNormalTangent(packedNormalTangent[2], normal2, tangent2);
 
-    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(swr::BaryLerp(bary, normal0, normal1, normal2), 0)));
-    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(swr::BaryLerp(bary, tangent0, tangent1, tangent2), 0)));
+    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(UnpackNormal(packedNormal, bary), 0)));
+    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(UnpackNormal(packedTangent, bary), 0)));
     v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
-    simd::cmov(bitangentWS, -bitangentWS, _mm512_movm_epi32(tangentHandedness));
+    simd::cmov(bitangentWS, -bitangentWS, v_int(packedTangent[0]) < 0);
 
     // Reconstruct Z from 2-channel normap map https://aras-p.info/texts/CompactNormalStorage.html
     v_float3 normalTS = v_float3(simd::conv<float>(packedNMR >> v_uint2(0, 8) & 255) * (1.0f / 127.5f) - 1.0f, 0);

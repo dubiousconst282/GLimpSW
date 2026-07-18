@@ -15,17 +15,20 @@ struct Material {
 struct Meshlet {
     float3 BoundCenter;
     float BoundRadius;
-    int32_t CullingCone; // s8 axis[3], s8 cutoff 
+    int32_t CullingCone; // s8 axis[3], s8 cutoff
 
     uint8_t NumVertices, NumTriangles;
     uint8_t AlphaCutoff;
     uint32_t MaterialId;
-    uint64_t TangentHandedness;
 
     alignas(64) float Positions[3][64];
-    uint32_t TexCoords[64];                // float16
-    uint32_t NormalTangents[64];           // oct16 x2
-    uint8_t Indices[3][128];
+    alignas(64) uint8_t Indices[3][128];
+
+    // Attributes are usually fetched together, so interleaved for better cache locality.
+    // x: TexCoords (float16 x 2)
+    // y: Normal    (RGB10)
+    // z: Tangent   (RGB10)
+    alignas(64) uint3 Attribs[64];
 };
 
 struct TransformTRS {

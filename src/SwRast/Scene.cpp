@@ -259,7 +259,7 @@ Model* Scene::ImportGltf(const std::string& path) {
                     if (texcoordAcc) {
                         float2 texcoord;
                         cgltf_accessor_read_float(texcoordAcc, vertIdx, &texcoord.x, 2);
-                        om.TexCoords[i] = glm::packHalf2x16(texcoord);
+                        om.Attribs[i].x = glm::packHalf2x16(texcoord);
                     }
                     if (normalAcc) {
                         float3 normal;
@@ -267,10 +267,9 @@ Model* Scene::ImportGltf(const std::string& path) {
                         cgltf_accessor_read_float(normalAcc, vertIdx, &normal.x, 3);
                         if (tangentAcc) cgltf_accessor_read_float(tangentAcc, vertIdx, &tangent.x, 4);
 
-                        v_float2 normalOct = swr::texutil::MapOctahedron(normal);
-                        v_float2 tangentOct = swr::texutil::MapOctahedron(float3(tangent));
-                        om.NormalTangents[i] = glm::packUnorm4x8({ normalOct.x[0], normalOct.y[0], tangentOct.x[0], tangentOct.y[0] });
-                        om.TangentHandedness |= (tangent.w < 0 ? (1ull << i) : 0);
+                        om.Attribs[i].y = swr::pixfmt::RGB10u::Pack(normal * 0.5f + 0.5f)[0];
+                        om.Attribs[i].z = swr::pixfmt::RGB10u::Pack(float3(tangent) * 0.5f + 0.5f)[0];
+                        om.Attribs[i].z |= (tangent.w < 0 ? (1ull << 31) : 0);
                     }
                 }
                 for (uint32_t i = 0; i < m.triangle_count; i++) {

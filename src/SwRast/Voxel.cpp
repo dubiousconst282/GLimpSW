@@ -69,10 +69,6 @@ static float2 UnpackHalf2x16(uint32_t x) {
     auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
     return { v[0], v[1] };
 }
-static void UnpackNormal(v_uint packed, v_float3& norm) {
-    v_float4 oct = swr::pixfmt::RGBA8u::Unpack(packed);
-    norm = swr::texutil::UnmapOctahedron({ oct.x, oct.y });
-}
 
 static void MS_VoxelizeSurface(VoxelizerContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
     const Meshlet& mesh = ctx.Meshlets[index];
@@ -97,9 +93,13 @@ static void FS_VoxelizeSurface(VoxelizerContext& ctx, swr::FragmentVars& vars) {
         .MagFilter = swr::FilterMode::Nearest,
         .MinFilter = swr::FilterMode::Nearest,
     };
-    v_float2 uv0 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[0] & 63]);
-    v_float2 uv1 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[1]]);
-    v_float2 uv2 = UnpackHalf2x16(mesh.TexCoords[vars.VertexId[2]]);
+
+    uint3 attr0 = mesh.Attribs[vars.VertexId[0] & 63];
+    uint3 attr1 = mesh.Attribs[vars.VertexId[1]];
+    uint3 attr2 = mesh.Attribs[vars.VertexId[2]];
+    v_float2 uv0 = UnpackHalf2x16(attr0.x);
+    v_float2 uv1 = UnpackHalf2x16(attr1.x);
+    v_float2 uv2 = UnpackHalf2x16(attr2.x);
     v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
     v_uint baseColor = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
 
@@ -112,11 +112,12 @@ static void FS_VoxelizeSurface(VoxelizerContext& ctx, swr::FragmentVars& vars) {
         packedNMR = material.Texture->SampleImplicitLod<SurfaceSampler>(uv, 1);
     }
 
-    v_float3 normal0, normal1, normal2;
-    UnpackNormal(mesh.NormalTangents[vars.VertexId[0] & 63], normal0);
-    UnpackNormal(mesh.NormalTangents[vars.VertexId[1]], normal1);
-    UnpackNormal(mesh.NormalTangents[vars.VertexId[2]], normal2);
-    v_float3 normalWS = simd::normalize(simd::mul(float3x3(ctx.ObjectToWorldMat), vars.Interpolate(normal0, normal1, normal2)));
+    v_float3 normal0 = v_float3(attr0.y >> uint3(0, 10, 20) & 1023u);
+    v_float3 normal1 = v_float3(attr1.y >> uint3(0, 10, 20) & 1023u);
+    v_float3 normal2 = v_float3(attr2.y >> uint3(0, 10, 20) & 1023u);
+    v_float3 normalOS = vars.Interpolate(normal0, normal1, normal2) * (2.0f / 1023) - 1.0f;
+
+    v_float3 normalWS = simd::normalize(simd::mul(float3x3(ctx.ObjectToWorldMat), normalOS));
 
     v_uint packedData = 0;
 
