@@ -1,7 +1,5 @@
 #include "Shading.h"
 
-namespace {
-
 constexpr swr::SamplerDesc SurfaceSampler = {
     .Wrap = swr::WrapMode::Repeat,
     .MagFilter = swr::FilterMode::Linear,
@@ -13,139 +11,7 @@ constexpr swr::SamplerDesc EnvSampler = {
     .MinFilter = swr::FilterMode::Linear,
 };
 
-v_float pow5(v_float x) { return (x * x) * (x * x) * x; }
-
-v_float D_GGX(v_float NoH, v_float roughness) {
-    v_float a = NoH * roughness;
-    v_float k = roughness * simd::approx_rcp(1.0f - NoH * NoH + a * a);
-    return k * k * simd::inv_pi;
-}
-v_float V_SmithGGXCorrelatedFast(v_float NoV, v_float NoL, v_float roughness) {
-    v_float a = 2.0f * NoL * NoV;
-    v_float b = NoL + NoV;
-    return 0.5f / simd::lerp(a, b, roughness);
-}
-v_float3 F_Schlick(v_float u, v_float3 f0) {
-    v_float f = pow5(1.0 - u);
-    return f + f0 * (1.0f - f);
-}
-v_float Fd_Lambert() { return 1.0f / simd::pi; }
-
-v_float3 Tonemap_Unreal(v_float3 x) {
-    // Unreal 3, Documentation: "Color Grading"
-    // Adapted to be close to Tonemap_ACES, with similar range
-    // Gamma 2.2 correction is baked in, don't use with sRGB conversion!
-    return x / (x + 0.155) * 1.019;
-}
-
-// https://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences
-v_float DitherRoberts(v_float2 pos) {
-    v_float r = simd::fract(pos.x * 0.7548776662 + pos.y * 0.56984029);
-    return simd::abs(r * 2.0 - 1.0);
-}
-
-float2 UnpackHalf2x16(uint32_t x) {
-    auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
-    return { v[0], v[1] };
-}
-v_float3 UnpackNormal(v_uint packed[3], const v_float3& bary) {
-    // RGB10: 9141us  OctUnmap: 10568us  (1.15x)
-
-    // Folding snorm scaling after bary lerp saves 6 FMAs
-    // v_float3 v0 = swr::pixfmt::RGB10u::Unpack(packed[0]) * 2 - 1;
-
-    v_float3 v0 = simd::conv<float>(packed[0] >> v_uint3(0, 10, 20) & 1023);
-    v_float3 v1 = simd::conv<float>(packed[1] >> v_uint3(0, 10, 20) & 1023);
-    v_float3 v2 = simd::conv<float>(packed[2] >> v_uint3(0, 10, 20) & 1023);
-    return swr::BaryLerp(bary, v0, v1, v2) * (2.0f / 1023) - 1.0f;
-}
-
-// Standard "source over" alpha blending. Not gamma correct.
-v_uint AlphaBlendU8(v_uint bg, v_uint fg) {
-    v_uint t = (fg >> 1) & 0x7F80'0000;
-    t |= (t >> 16) | 0x0040'0040;
-
-    v_uint rb = simd::lerp16((bg >> 0 & 0x00FF'00FF), (fg >> 0 & 0x00FF'00FF), t);
-    v_uint ag = simd::lerp16((bg >> 8 & 0x00FF'00FF), (fg >> 8 & 0x00FF'00FF), t);
-    return rb | (ag << 8);
-}
-
-// https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization
-v_float3 ColormapTurbo(v_float x) {
-    static constexpr float c[] = {
-        0.13572138, 4.61539260,  -42.66032258, 132.13108234, -152.94239396, 59.28637943,  //
-        0.09140261, 2.19418839,  4.84296658,   -14.18503333, 4.27729857,    2.82956604,   //
-        0.10667330, 12.64194608, -60.58204836, 110.36276771, -89.90310912,  27.34824973,  //
-    };
-    return {
-        x * (x * (x * (x * (x * c[5] + c[4]) + c[3]) + c[2]) + c[1]) + c[0],
-        x * (x * (x * (x * (x * c[11] + c[10]) + c[9]) + c[8]) + c[7]) + c[6],
-        x * (x * (x * (x * (x * c[17] + c[16]) + c[15]) + c[14]) + c[13]) + c[12],
-    };
-}
-
-// 2D Polyhedral Bounds of a Clipped, Perspective Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
-// proj = P00, P11, znear
-v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
-    c.z *= -1;
-    v_int mask = c.z >= r + proj.z;
-    if (!simd::any(mask)) return 0;
-
-    v_float3 cr = c * r;
-    v_float vx = simd::approx_sqrt(c.x * c.x + c.z * c.z - r * r);
-    v_float vy = simd::approx_sqrt(c.y * c.y + c.z * c.z - r * r);
-
-    bb.x = (vx * c.x - cr.z) * simd::approx_rcp(vx * c.z + cr.x) * (proj.x * 0.5f) + 0.5f;
-    bb.y = (vy * c.y + cr.z) * simd::approx_rcp(vy * c.z - cr.y) * (proj.y * 0.5f) + 0.5f;
-    bb.z = (vx * c.x + cr.z) * simd::approx_rcp(vx * c.z - cr.x) * (proj.x * 0.5f) + 0.5f;
-    bb.w = (vy * c.y - cr.z) * simd::approx_rcp(vy * c.z + cr.y) * (proj.y * 0.5f) + 0.5f;
-
-    return mask;
-}
-bool ProjectSphere(float3 c, float r, float3 proj, float4& bb) {
-    c.z *= -1;
-    if (c.z < r + proj.z) return false;
-
-    float3 cr = c * r;
-    float vx = glm::sqrt(c.x * c.x + c.z * c.z - r * r);
-    float vy = glm::sqrt(c.y * c.y + c.z * c.z - r * r);
-
-    bb.x = (vx * c.x - cr.z) / (vx * c.z + cr.x) * (proj.x * 0.5f) + 0.5f;
-    bb.y = (vy * c.y + cr.z) / (vy * c.z - cr.y) * (proj.y * 0.5f) + 0.5f;
-    bb.z = (vx * c.x + cr.z) / (vx * c.z - cr.x) * (proj.x * 0.5f) + 0.5f;
-    bb.w = (vy * c.y - cr.z) / (vy * c.z + cr.y) * (proj.y * 0.5f) + 0.5f;
-
-    return true;
-}
-
-// https://momentsingraphics.de/CameraRays.html
-float3x3 GetCameraRayMatrix(const float4x4& worldToClip) {
-    glm::mat4x3 M = glm::transpose(worldToClip);
-    return { glm::cross(M[1], M[3]), glm::cross(M[3], M[0]), glm::cross(M[0], M[1]) };
-}
-v_float3 GetCameraRayDir(v_float2 screenNdc, const float3x3& m) {
-    // Must use precise sqrt to avoid noticeable distortions.
-    return simd::normalize_precise(v_float3(screenNdc.x) * m[0] + v_float3(screenNdc.y) * m[1] + m[2]);
-}
-
-// Point in sphere for given UV in range [0..1)
-v_float3 SampleUniformSphere(v_float2 u) {
-    v_float cosTheta = u.x * 2 - 1;
-    v_float sinTheta = simd::approx_sqrt(1.000001f - cosTheta * cosTheta);
-    return v_float3(simd::sincos_2pi(u.y) * sinTheta, cosTheta);
-}
-// Building an Orthonormal Basis, Revisited
-// http://jcgt.org/published/0006/01/01/
-float3x3 BuildOrthonormalBasis(float3 n) {
-    float sign = n.z < 0.0f ? -1.0f : 1.0f;
-    float a = -1.0f / (sign + n.z);
-    float b = n.x * n.y * a;
-    float3 b1 = float3(1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x);
-    float3 b2 = float3(b, sign + n.y * n.y * a, -n.y);
-    return float3x3(b1, b2, n);
-}
-
-void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
+static void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
     if (ctx.InstanceCullBitmap != nullptr) {
         v_mask mask = ctx.InstanceCullBitmap[index / simd::vec_width];
 
@@ -173,8 +39,13 @@ void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet&
     }
 }
 
+static float2 UnpackHalf2x16(uint32_t x) {
+    auto v = _mm_cvtph_ps(_mm_set1_epi32((int)x));
+    return { v[0], v[1] };
+}
+
 template<bool EnableAlphaTest, bool IsShadowRender>
-void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
+static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
     // Depth test
     v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
@@ -209,7 +80,7 @@ void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
     }
 }
 
-void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
+static void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
     v_uint counter = vars.LoadTile(ctx.ColorBuffer);
 
     v_int isActive = _mm512_movm_epi32(vars.TileMask);
@@ -220,9 +91,22 @@ void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
     vars.StoreTile(ctx.DepthBuffer, simd::max(vars.Depth, vars.LoadTile(ctx.DepthBuffer)));
 }
 
+// clang-format off
+const swr::ShaderDispatchTable
+    ShadingContext::VisBufferShader = swr::GetDispatchTable<&ShadeMeshlet,
+                                                            &FS_EncodeSurfaceId<0, 0>,
+                                                            &FS_EncodeSurfaceId<1, 0>
+                                                        >(),
+    ShadingContext::ShadowGenShader = swr::GetDispatchTable<&ShadeMeshlet,
+                                                            &FS_EncodeSurfaceId<0, 1>,
+                                                            &FS_EncodeSurfaceId<1, 1>
+                                                        >(),
+    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();
+// clang-format on
+
 // http://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/
-void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenNdc, float2 screenSize,  //
-                       v_float3& bary, v_float3& ddx, v_float3& ddy) {
+static void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenNdc, float2 screenSize,  //
+                              v_float3& bary, v_float3& ddx, v_float3& ddy) {
     v_float3 invW = 1.0f / v_float3(v0.w, v1.w, v2.w);
 
     v_float2 p0 = v_float2(v0) * invW.x;
@@ -269,14 +153,28 @@ void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenNdc
     ddx = interpW_ddx * (bary * interpInvW + ddx) - bary;
     ddy = interpW_ddy * (bary * interpInvW + ddy) - bary;
 }
+
+static v_float3 ResolveNormal(v_uint packed[3], const v_float3& bary) {
+    // RGB10: 9141us  OctUnmap: 10568us  (1.15x)
+
+    // Folding snorm scaling after bary lerp saves 6 FMAs
+    // v_float3 v0 = swr::pixfmt::RGB10u::Unpack(packed[0]) * 2 - 1;
+
+    v_float3 v0 = simd::conv<float>(packed[0] >> v_uint3(0, 10, 20) & 1023);
+    v_float3 v1 = simd::conv<float>(packed[1] >> v_uint3(0, 10, 20) & 1023);
+    v_float3 v2 = simd::conv<float>(packed[2] >> v_uint3(0, 10, 20) & 1023);
+    return swr::BaryLerp(bary, v0, v1, v2) * (2.0f / 1023) - 1.0f;
+}
+
 struct SurfaceAttribs {
     v_uint Albedo;
     v_float3 Normal;
     v_float Metallic, Roughness;
     v_uint PackedNMR;
 };
+
 [[clang::always_inline]]
-SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_float2 screenNdc, float2 screenSize) {
+static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_float2 screenNdc, float2 screenSize) {
     v_float3 pos[3];
     v_uint packedTexCoord[3];
     v_uint packedNormal[3];
@@ -358,8 +256,8 @@ SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_flo
         }
     }
 
-    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(UnpackNormal(packedNormal, bary), 0)));
-    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(UnpackNormal(packedTangent, bary), 0)));
+    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedNormal, bary), 0)));
+    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedTangent, bary), 0)));
     v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
     simd::cmov(bitangentWS, -bitangentWS, v_int(packedTangent[0]) < 0);
 
@@ -383,9 +281,29 @@ SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_flo
     };
 }
 
-simd::vec<uint16_t> s_BlueNoise[64][32][32];
+static simd::vec<uint16_t> s_BlueNoise[64][32][32];
 
-v_float2 GetTemporalBlueNoise(uint3 pos, uint32_t sampleIdx) {
+void ShadingContext::LoadBlueNoise() {
+    FILE* fs = fopen("assets/bluenoise/stbn_unorm8x2_128x128x64.bin", "rb");
+    if (!fs) {
+        fprintf(stderr, "Missing blue noise texture");
+        return;
+    }
+
+    for (uint32_t i = 0; i < 64; i++) {
+        uint16_t buffer[128 * 128];
+        fread(buffer, sizeof(buffer), 1, fs);
+
+        for (uint32_t y = 0; y < 128; y++) {
+            for (uint32_t x = 0; x < 128; x++) {
+                s_BlueNoise[i][x / 4][y / 4][(x & 3) + (y & 3) * 4] = buffer[x + y * 128];
+            }
+        }
+    }
+    fclose(fs);
+}
+
+static v_float2 GetTemporalBlueNoise(uint3 pos, uint32_t sampleIdx) {
     // R2 sequence
     pos.x += (sampleIdx * 3242174888 + 2147483647) >> 25;
     pos.y += (sampleIdx * 2447445413 + 2147483647) >> 25;
@@ -393,12 +311,12 @@ v_float2 GetTemporalBlueNoise(uint3 pos, uint32_t sampleIdx) {
     return simd::conv<float>(q >> v_int2(0, 8) & 255) / 255.0f;
 }
 
-float2 Hammersley(uint32_t i, uint32_t numSamples) {
+static float2 Hammersley(uint32_t i, uint32_t numSamples) {
     return { i / float(numSamples), __builtin_elementwise_bitreverse(i) * float(1.0 / UINT_MAX) };
 }
 
 [[clang::always_inline]]
-v_float SampleShadowMap(const ShadingContext& ctx, v_float3 worldPos, uint3 noisePos, uint32_t numSamples) {
+static v_float SampleShadowMap(const ShadingContext& ctx, v_float3 worldPos, uint3 noisePos, uint32_t numSamples) {
     auto* shadowMap = ctx.ShadowDepthMap;
     v_float4 mappedPos = simd::mul(ctx.ShadowProjMatrices[0], v_float4(worldPos, 1));
     mappedPos /= mappedPos.w;
@@ -426,7 +344,24 @@ v_float SampleShadowMap(const ShadingContext& ctx, v_float3 worldPos, uint3 nois
     return simd::conv<float>(visibleCount) / numSamples;
 }
 
-v_float GetLightAttenuation(const Light& light, v_float3 surfacePosWS) {
+static v_float pow5(v_float x) { return (x * x) * (x * x) * x; }
+
+static v_float D_GGX(v_float NoH, v_float roughness) {
+    v_float a = NoH * roughness;
+    v_float k = roughness * simd::approx_rcp(1.0f - NoH * NoH + a * a);
+    return k * k * simd::inv_pi;
+}
+static v_float V_SmithGGXCorrelatedFast(v_float NoV, v_float NoL, v_float roughness) {
+    v_float a = 2.0f * NoL * NoV;
+    v_float b = NoL + NoV;
+    return 0.5f / simd::lerp(a, b, roughness);
+}
+static v_float3 F_Schlick(v_float u, v_float3 f0) {
+    v_float f = pow5(1.0 - u);
+    return f + f0 * (1.0f - f);
+}
+
+static v_float GetLightAttenuation(const Light& light, v_float3 surfacePosWS) {
     if (light.Type == Light::kTypeDirectional) return 1.0;
 
     // from Filament, equivalent to GLTF spec: `attenuation = max( min( 1.0 - ( dist / range )^4, 1 ), 0 ) / dist^2`
@@ -448,7 +383,7 @@ v_float GetLightAttenuation(const Light& light, v_float3 surfacePosWS) {
 }
 
 [[clang::always_inline]]
-v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_float3 worldPos, v_float3 irradiance, uint3 noisePos,
+static v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_float3 worldPos, v_float3 irradiance, uint3 noisePos,
                       uint32_t numShadowSamples) {
     v_float3 finalColor = 0;
     v_float reflectance = 0.5;  // parametized IOR
@@ -521,7 +456,7 @@ static v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 d
     v_float2 B = d01 + (d11 - d01) * simd::fract(oct.x);
     return A + (B - A) * simd::fract(oct.y);
 }
-v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir) {
+static v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 7;
 
     v_int2 q = simd::conv<int>(oct);
@@ -541,7 +476,7 @@ v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir
 }
 
 [[clang::always_inline]]
-v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfaceNormal, v_float3 viewDir) {
+static v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfaceNormal, v_float3 viewDir) {
     v_float3 biasedSurfacePos = surfacePos + (surfaceNormal + viewDir * 3) * field.NormalBias;
 
     v_float3 baseSamplePos = (biasedSurfacePos - field.ProbeBaseOffset) / field.ProbeSpacing;
@@ -608,7 +543,7 @@ v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfac
     return sumIrradiance / simd::max(sumWeight, 1e-5);
 }
 
-SurfaceAttribs UnpackVoxelAttribs(v_uint packed) {
+static SurfaceAttribs UnpackVoxelAttribs(v_uint packed) {
     v_uint3 color = packed >> v_uint3(0, 5, 10) & v_uint3(31, 31, 15);
     v_float2 octNormal = simd::conv<float>(packed >> v_uint2(14, 19) & 31) / 31.0f;
     v_float2 mr = simd::conv<float>(packed >> v_uint2(24, 28) & 15) / 15.0f;
@@ -621,21 +556,28 @@ SurfaceAttribs UnpackVoxelAttribs(v_uint packed) {
     };
 }
 
-};  // namespace
+static v_float3 Tonemap_Unreal(v_float3 x) {
+    // Unreal 3, Documentation: "Color Grading"
+    // Adapted to be close to Tonemap_ACES, with similar range
+    // Gamma 2.2 correction is baked in, don't use with sRGB conversion!
+    return x / (x + 0.155) * 1.019;
+}
 
-// clang-format off
-const swr::ShaderDispatchTable
-    ShadingContext::VisBufferShader = swr::GetDispatchTable<&ShadeMeshlet,
-                                                            &FS_EncodeSurfaceId<0, 0>,
-                                                            &FS_EncodeSurfaceId<1, 0>
-                                                        >(),
-    ShadingContext::ShadowGenShader = swr::GetDispatchTable<&ShadeMeshlet,
-                                                            &FS_EncodeSurfaceId<0, 1>,
-                                                            &FS_EncodeSurfaceId<1, 1>
-                                                        >(),
-    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();       //
+// https://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences
+static v_float DitherRoberts(v_float2 pos) {
+    v_float r = simd::fract(pos.x * 0.7548776662 + pos.y * 0.56984029);
+    return simd::abs(r * 2.0 - 1.0);
+}
 
-// clang-format on
+// Standard "source over" alpha blending. Not gamma correct.
+static v_uint AlphaBlendU8(v_uint bg, v_uint fg) {
+    v_uint t = (fg >> 1) & 0x7F80'0000;
+    t |= (t >> 16) | 0x0040'0040;
+
+    v_uint rb = simd::lerp16((bg >> 0 & 0x00FF'00FF), (fg >> 0 & 0x00FF'00FF), t);
+    v_uint ag = simd::lerp16((bg >> 8 & 0x00FF'00FF), (fg >> 8 & 0x00FF'00FF), t);
+    return rb | (ag << 8);
+}
 
 void ShadingContext::Resolve(swr::Rasterizer& raster) {
     assert(Instances[0].Meshlets == nullptr);  // 0th instance id must be reserved for "null"
@@ -769,6 +711,30 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
     }
 }
 
+// https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization
+static v_float3 ColormapTurbo(v_float x) {
+    static constexpr float c[] = {
+        0.13572138, 4.61539260,  -42.66032258, 132.13108234, -152.94239396, 59.28637943,  //
+        0.09140261, 2.19418839,  4.84296658,   -14.18503333, 4.27729857,    2.82956604,   //
+        0.10667330, 12.64194608, -60.58204836, 110.36276771, -89.90310912,  27.34824973,  //
+    };
+    return {
+        x * (x * (x * (x * (x * c[5] + c[4]) + c[3]) + c[2]) + c[1]) + c[0],
+        x * (x * (x * (x * (x * c[11] + c[10]) + c[9]) + c[8]) + c[7]) + c[6],
+        x * (x * (x * (x * (x * c[17] + c[16]) + c[15]) + c[14]) + c[13]) + c[12],
+    };
+}
+
+// https://momentsingraphics.de/CameraRays.html
+static float3x3 GetCameraRayMatrix(const float4x4& worldToClip) {
+    glm::mat4x3 M = glm::transpose(worldToClip);
+    return { glm::cross(M[1], M[3]), glm::cross(M[3], M[0]), glm::cross(M[0], M[1]) };
+}
+static v_float3 GetCameraRayDir(v_float2 screenNdc, const float3x3& m) {
+    // Must use precise sqrt to avoid noticeable distortions.
+    return simd::normalize_precise(v_float3(screenNdc.x) * m[0] + v_float3(screenNdc.y) * m[1] + m[2]);
+}
+
 void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
     uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
     float4x4 invProj = glm::inverse(WorldToClipMat);
@@ -836,6 +802,40 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
 
         simd::store(&ColorBuffer->Data[tileOffset], finalRGB);
     });
+}
+
+// 2D Polyhedral Bounds of a Clipped, Perspective Projected 3D Sphere. Michael Mara, Morgan McGuire. 2013.
+// proj = P00, P11, znear
+static v_int ProjectSphere(v_float3 c, v_float r, float3 proj, v_float4& bb) {
+    c.z *= -1;
+    v_int mask = c.z >= r + proj.z;
+    if (!simd::any(mask)) return 0;
+
+    v_float3 cr = c * r;
+    v_float vx = simd::approx_sqrt(c.x * c.x + c.z * c.z - r * r);
+    v_float vy = simd::approx_sqrt(c.y * c.y + c.z * c.z - r * r);
+
+    bb.x = (vx * c.x - cr.z) * simd::approx_rcp(vx * c.z + cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.y = (vy * c.y + cr.z) * simd::approx_rcp(vy * c.z - cr.y) * (proj.y * 0.5f) + 0.5f;
+    bb.z = (vx * c.x + cr.z) * simd::approx_rcp(vx * c.z - cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.w = (vy * c.y - cr.z) * simd::approx_rcp(vy * c.z + cr.y) * (proj.y * 0.5f) + 0.5f;
+
+    return mask;
+}
+static bool ProjectSphere(float3 c, float r, float3 proj, float4& bb) {
+    c.z *= -1;
+    if (c.z < r + proj.z) return false;
+
+    float3 cr = c * r;
+    float vx = glm::sqrt(c.x * c.x + c.z * c.z - r * r);
+    float vy = glm::sqrt(c.y * c.y + c.z * c.z - r * r);
+
+    bb.x = (vx * c.x - cr.z) / (vx * c.z + cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.y = (vy * c.y + cr.z) / (vy * c.z - cr.y) * (proj.y * 0.5f) + 0.5f;
+    bb.z = (vx * c.x + cr.z) / (vx * c.z - cr.x) * (proj.x * 0.5f) + 0.5f;
+    bb.w = (vy * c.y - cr.z) / (vy * c.z + cr.y) * (proj.y * 0.5f) + 0.5f;
+
+    return true;
 }
 
 uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
@@ -933,24 +933,21 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
     return visibleCount;
 }
 
-void ShadingContext::LoadBlueNoise() {
-    FILE* fs = fopen("assets/bluenoise/stbn_unorm8x2_128x128x64.bin", "rb");
-    if (!fs) {
-        fprintf(stderr, "Missing blue noise texture");
-        return;
-    }
-
-    for (uint32_t i = 0; i < 64; i++) {
-        uint16_t buffer[128 * 128];
-        fread(buffer, sizeof(buffer), 1, fs);
-
-        for (uint32_t y = 0; y < 128; y++) {
-            for (uint32_t x = 0; x < 128; x++) {
-                s_BlueNoise[i][x / 4][y / 4][(x & 3) + (y & 3) * 4] = buffer[x + y * 128];
-            }
-        }
-    }
-    fclose(fs);
+// Point in sphere for given UV in range [0..1)
+static v_float3 SampleUniformSphere(v_float2 u) {
+    v_float cosTheta = u.x * 2 - 1;
+    v_float sinTheta = simd::approx_sqrt(1.000001f - cosTheta * cosTheta);
+    return v_float3(simd::sincos_2pi(u.y) * sinTheta, cosTheta);
+}
+// Building an Orthonormal Basis, Revisited
+// http://jcgt.org/published/0006/01/01/
+static float3x3 BuildOrthonormalBasis(float3 n) {
+    float sign = n.z < 0.0f ? -1.0f : 1.0f;
+    float a = -1.0f / (sign + n.z);
+    float b = n.x * n.y * a;
+    float3 b1 = float3(1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    float3 b2 = float3(b, sign + n.y * n.y * a, -n.y);
+    return float3x3(b1, b2, n);
 }
 
 constexpr int ProbeMaxRays = 128;
