@@ -500,22 +500,12 @@ v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_f
     return finalColor;
 }
 
-v_int GetProbeTexelIndex8(v_float3 dir) {
-    v_float2 oct = swr::texutil::MapOctahedron(dir);
-    // FIXME: Surfaces facing Z- look weirdly shiny, probably need interpolation and/or correct wrapping to avoid it.
-    // Biasing by 0.25 masks the problem a bit.
-    v_int2 q = simd::conv<int>(oct * 7.0f + 0.25f) & 7;
-    return q.x | (q.y << 3);
-}
-v_int GetProbeTexelIndex16(v_float3 dir) {
-    v_float2 oct = swr::texutil::MapOctahedron(dir);
-    v_int2 q = simd::conv<int>(oct * 15.0f) & 15;
-    return q.x | (q.y << 4);
-}
-v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 dir) {
+// TODO: Store border data for proper octahedron filtering
+static v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 15;
     // TODO: blue noise works, but obviously noisy. Maybe with half-res + blurring.
     // oct += GetTemporalBlueNoise(noisePos, 1);
+
     v_int2 q = simd::conv<int>(oct);
     v_int idx00 = ((q.x + 0) & 15) | ((q.y + 0) & 15) << 4;
     v_int idx01 = ((q.x + 0) & 15) | ((q.y + 1) & 15) << 4;
@@ -529,6 +519,24 @@ v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 dir) {
 
     v_float2 A = d00 + (d10 - d00) * simd::fract(oct.x);
     v_float2 B = d01 + (d11 - d01) * simd::fract(oct.x);
+    return A + (B - A) * simd::fract(oct.y);
+}
+v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir) {
+    v_float2 oct = swr::texutil::MapOctahedron(dir) * 7;
+
+    v_int2 q = simd::conv<int>(oct);
+    v_int idx00 = ((q.x + 0) & 7) | ((q.y + 0) & 7) << 3;
+    v_int idx01 = ((q.x + 0) & 7) | ((q.y + 1) & 7) << 3;
+    v_int idx10 = ((q.x + 1) & 7) | ((q.y + 0) & 7) << 3;
+    v_int idx11 = ((q.x + 1) & 7) | ((q.y + 1) & 7) << 3;
+
+    v_float3 d00 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx00));
+    v_float3 d10 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx10));
+    v_float3 d01 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx01));
+    v_float3 d11 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx11));
+
+    v_float3 A = d00 + (d10 - d00) * simd::fract(oct.x);
+    v_float3 B = d01 + (d11 - d01) * simd::fract(oct.x);
     return A + (B - A) * simd::fract(oct.y);
 }
 
@@ -568,19 +576,14 @@ v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfac
             v_float3 unbiasedDir = simd::normalize(probePos - surfacePos);
             weight *= simd::max(simd::dot(surfaceNormal, unbiasedDir), 0.001);
 
-            // Original softening appears to introduce leaks and grid artifacts, maybe smth else is wrong.
+            // Original softening appears to cause pinch artifacts in some cases.
             // v_float NdotP = simd::max(0.0001, simd::dot(surfaceNormal, unbiasedDir) * 0.5 + 0.5);
             // weight *= (NdotP * NdotP);
         }
 
         // Chebyshev visibility
         {
-#if 1
             v_float2 moments = SampleProbeDepth(field, probeIdx, biasedSurfacePos - probePos);
-#else
-            v_uint packedDepth = simd::gather(field.Depth[0][0], probeIdx * 256 + GetProbeTexelIndex16(biasedSurfacePos - probePos));
-            v_float2 moments = swr::pixfmt::RG16f::Unpack(packedDepth);
-#endif
             v_float distToProbe = simd::length(biasedSurfacePos - probePos);
 
             v_float variance = simd::abs(moments.x * moments.x - moments.y);
@@ -599,8 +602,7 @@ v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfac
             weight *= (i & 4) ? cageOffset.z : 1 - cageOffset.z;
         }
 
-        v_uint packedIrradiance = simd::gather(field.Irradiance[0], probeIdx * 64 + GetProbeTexelIndex8(surfaceNormal));
-        sumIrradiance += swr::pixfmt::R11G11B10f::Unpack(packedIrradiance) * weight;
+        sumIrradiance += SampleProbeIrradiance(field, probeIdx, surfaceNormal) * weight;
         sumWeight += weight;
     }
     return sumIrradiance / simd::max(sumWeight, 1e-5);
@@ -1031,7 +1033,7 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
         uint32_t startOffset = workerId * probesPerThread;
         uint32_t endOffset = glm::min(GIProbeField::ProbesPerCascade, startOffset + probesPerThread);
 
-        // Force denormal flushing to avoid slowing convolution
+        // Force denormal flushing to avoid slowing convolution with near zero weights
         // (shouldn't be an issue now with pre-computed FP16 weights, but just in case)
         _mm_setcsr(_mm_getcsr() | _MM_FLUSH_ZERO_ON);
 
@@ -1041,10 +1043,8 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
             if (!isActive) continue;
 
             uint8_t& sampleCount = ProbeField->SampleCounts[probeIdx];
-            if (isActive) {
-                uint32_t maxCount = wasActive ? ProbeField->MaxHysteresis : ProbeField->MaxHysteresis / 3 + 2;
-                sampleCount = (uint8_t)glm::min(sampleCount + 1u, maxCount);
-            }
+            uint32_t maxSampleCount = wasActive ? ProbeField->MaxHysteresis : ProbeField->MaxHysteresis / 3 + 2;
+            sampleCount = (uint8_t)glm::min(sampleCount + 1u, maxSampleCount);
 
             float hysteresis = (1.0f / sampleCount);
 
@@ -1064,14 +1064,16 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
                 simd_if(isValidHit) {
                     SurfaceAttribs surf = UnpackVoxelAttribs(hit.Attribs);
                     v_float3 worldPos = center + rayDir * hit.Dist;
-                    
-                    // TODO: multi bounce
-                    v_float3 irradiance = 0; // SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
+
+                    v_float3 irradiance = 0;
+                    if (ProbeField->MultiBounce) {
+                        irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
+                    }
                     simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, int3(0), 1), v_exec);
                 }
                 simd_if(isMiss) {
                     constexpr swr::SamplerDesc sampler = { .MagFilter = swr::FilterMode::Nearest, .MinFilter = swr::FilterMode::Nearest };
-                    simd::cmov(radiance, SkyboxTex->SampleOctLevel<sampler>(rayDir, 4), v_exec);
+                    simd::cmov(radiance, SkyboxTex->SampleOctLevel<sampler>(rayDir, 4) * SkyboxIntensity, v_exec);
                 }
 
                 // Clamp fireflies (mostly coming from skybox)
@@ -1165,12 +1167,10 @@ void ShadingContext::DrawProbesDebug() {
                 if (!simd::any(mask)) continue;
 
 #if 1
-                v_uint packedData = simd::gather(ProbeField->Irradiance[i], GetProbeTexelIndex8(surfacePos - center));
-                v_float3 color = swr::pixfmt::R11G11B10f::Unpack(packedData);
+                v_float3 color = SampleProbeIrradiance(*ProbeField, (int)i, surfacePos - center);
                 color = Tonemap_Unreal(color);
 #else
-                v_uint packedData = simd::gather(ProbeField->Depth[i], GetProbeTexelIndex16(surfacePos - center));
-                v_float2 moments = swr::pixfmt::RG16f::Unpack(packedData);
+                v_float2 moments = SampleProbeDepth(*ProbeField, (int)i, surfacePos - center);
                 v_float variance = simd::abs(moments.x * moments.x - moments.y);
                 v_float3 color = v_float3(moments.x, simd::approx_sqrt(variance), 0) * 0.1;
 #endif

@@ -420,6 +420,12 @@ void RenderFrame() {
     ImGui::SliderInt("Max Hysteresis", (int*)&_probes->MaxHysteresis, 1, 128);
     ImGui::DragFloat("Ray Max Dist", &_probes->MaxRayDist, 0.1f, 1.0f, 100.0f);
     ImGui::DragFloat("Normal Bias", &_probes->NormalBias, 0.001, 0.01f, 0.5f);
+
+    static float skyboxIntensity = 1;
+    ImGui::DragFloat("Skybox Intensity", &skyboxIntensity, 0.01, 0.001f, 100.0f);
+    shader.SkyboxIntensity = skyboxIntensity;
+
+    ImGui::Checkbox("Multi-Bounce", &_probes->MultiBounce);
     ImGui::Checkbox("Force Update All", &forceUpdateAll);
 
     if (forceUpdateAll) memset(_probes->CurrActiveBitmap, 255, sizeof(_probes->CurrActiveBitmap));

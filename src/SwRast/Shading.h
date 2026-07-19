@@ -61,6 +61,7 @@ struct ShadingContext {
     // Uniform: Resolve pass
     const InstanceData* Instances;
     swr::HdrTexture2D* SkyboxTex;
+    float SkyboxIntensity = 1.0;
 
     struct GIProbeField* ProbeField = nullptr;
     BrickMap* BrickMap = nullptr;
@@ -92,6 +93,7 @@ struct GIProbeField {
     uint32_t RaysPerProbe = 64;
     float MaxRayDist = 10;
     uint32_t MaxHysteresis = 64;
+    bool MultiBounce = false;
 
     // Sampling
     float NormalBias = 0.12;
