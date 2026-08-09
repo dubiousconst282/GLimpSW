@@ -105,7 +105,7 @@ struct TriangleEdgeVars {
     v_int B01, B12, B20;        // Edge deltas on Y axis
 
     v_float Z0, Z10, Z20;       // Z0, ((Z1, Z2) - Z0) * rcpArea 
-    v_float W0, W0S, W1S, W2S;  // W0, (W0, W1, W2) * rcpArea
+    v_float W0S, W1S, W2S;      // (W0, W1, W2) * rcpArea
 
     void Setup(const TrianglePacket& tris, int2 vpHalfSize);
 };
@@ -148,21 +148,27 @@ struct Rasterizer {
     uint32_t GetThreadCount() const;
     void SetThreadCount(uint32_t count);
 
-    void SetViewport(uint2 size) { _viewSize = size, _tileStride = size.x / 4; }
+    void SetViewport(uint2 size) {
+        _viewSize = size;
+        _viewHalfSize = size / 2u;
+        _tileStride = size.x / 4;
+    }
 
     void DrawMeshlets(uint32_t count, ShaderBinding shader);
+
+    // Note: nodebug/noinline attributes are for improving readability in callstack/tracy.
 
     // Dispatch work to the thread pool. `cb(uint32_t workerId)`
     template<typename TCallback>
     [[gnu::nodebug]] void Dispatch(TCallback&& cb) {
-        Dispatch([](void* pUser, uint32_t workerId) { (*(TCallback*)pUser)(workerId); }, &cb);
+        Dispatch([](void* pUser, uint32_t workerId) { [[clang::noinline]] (*(TCallback*)pUser)(workerId); }, &cb);
     }
 
     void Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser);
 
     // Dispatches a number of groups `ceil(numInvocs / groupSize)` over worker threads. `cb(uint4 groupRect)`
     template<typename TCallback>
-    void DispatchGroups(uint2 numInvocs, uint32_t groupSize, TCallback&& cb) {
+    [[gnu::nodebug]] void DispatchGroups(uint2 numInvocs, uint32_t groupSize, TCallback&& cb) {
         uint32_t numGroupsX = (numInvocs.x + groupSize - 1) / groupSize;
         uint32_t numGroupsY = (numInvocs.y + groupSize - 1) / groupSize;
         uint32_t numGroups = numGroupsX * numGroupsY;
@@ -174,8 +180,9 @@ struct Rasterizer {
                 uint32_t y0 = (i / numGroupsX) * groupSize;
                 uint32_t x1 = std::min(x0 + groupSize, numInvocs.x);
                 uint32_t y1 = std::min(y0 + groupSize, numInvocs.y);
+                uint4 rect = uint4(x0, y0, x1, y1);
 
-                [[clang::always_inline]] cb(uint4(x0, y0, x1, y1));
+                [[clang::noinline]] cb(rect);
             }
         });
     }
@@ -203,7 +210,7 @@ struct Rasterizer {
                     for (uint32_t x = x0; x < x1; x += 4) {
                         v_int2 tilePos = v_int2((int)x + FragPixelOffsetsX, (int)y + FragPixelOffsetsY);
                         v_float2 tileNdc = conv<float>(tilePos) * scaleNdc + centerNdc;
-                        [[clang::always_inline]] cb(uint2(x, y), tilePos, tileNdc);
+                        [[clang::noinline]] cb(uint2(x, y), tilePos, tileNdc);
                     }
                 }
             }
@@ -221,6 +228,7 @@ struct Rasterizer {
         uint16_t offsetExtentX = boundRect >> 30, offsetExtentY = boundRect >> 46;  // (max - min) / 4 * 16
 
         // Using offset for loop control saves 2 registers and a bit of sALU
+        // (unless shader uses `FragVars::TilePos`, which should otherwise be DCE'd)
         size_t offset = (minX * 4) + (minY * 4) * tri.TileStride;
         size_t endOffsetY = (minY * 4 + offsetExtentY) * tri.TileStride;
         size_t offsetIncY = tri.TileStride * 16 - offsetExtentX;
@@ -266,8 +274,8 @@ struct Rasterizer {
                     vars.TileMask = tileMask;
 
                     // Perspective correction - https://stackoverflow.com/a/24460895
-                    // (Relying on code motion to move this after depth-test branch in shader, not optimal.)
-                    v_float pw0 = simd::fma(u + v, -tri.W0S[i], tri.W0[i]);
+                    // (Relying on code motion to move this after depth-test branch in shader, flaky.)
+                    v_float pw0 = tri.W0S[i] * simd::conv<float>(edge.x);
                     v_float pw1 = tri.W1S[i];  // (1/area) is baked in!
                     v_float pw2 = tri.W2S[i];
                     v_float w = simd::fma(u, pw1, simd::fma(v, pw2, pw0));
@@ -277,7 +285,7 @@ struct Rasterizer {
                     u *= pw1 * rcpW;
                     v *= pw2 * rcpW;
 
-                    if (IsClipped) {
+                    if constexpr (IsClipped) {
                         float3 ru = tri.ClipData->ClippedU[i];
                         float3 rv = tri.ClipData->ClippedV[i];
                         v_float cu = simd::fma(u, ru.y, simd::fma(v, ru.z, ru.x));
@@ -296,7 +304,7 @@ struct Rasterizer {
     }
 
 private:
-    uint2 _viewSize;
+    uint2 _viewSize, _viewHalfSize;
     uint32_t _tileStride;
     std::unique_ptr<BinQueue> _queue;
     std::unique_ptr<ThreadedRunner> _runner;

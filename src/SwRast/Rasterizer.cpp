@@ -95,11 +95,6 @@ struct ThreadedRunner {
         _timestamp.notify_all();
     }
 
-    template<typename TCallback>
-    void Dispatch(TCallback&& cb) {
-        Dispatch([](void* pData, uint32_t workerId) { (*(TCallback*)pData)(workerId); }, &cb);
-    }
-
     void Dispatch(void (*cb)(void* pData, uint32_t workerId), void* pData);
 
     uint32_t GetThreadCount() const { return _threads.size() + 1; }
@@ -157,11 +152,10 @@ static v_float4 GatherPos(const ShadedMeshlet& mesh, const uint8_t* indices) {
 }
 
 void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
-    int2 vpHalfSize = _viewSize / 2u;
     float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
     if (!EnableGuardband) guardBandFactor = float2(1.0f);
 
-    _runner->Dispatch([&](uint32_t workerId) {
+    Dispatch([&](uint32_t workerId) {
         for (uint32_t meshIdx = workerId; meshIdx < count; meshIdx += _runner->GetThreadCount()) {
             ShadedMeshlet mesh;
             shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
@@ -205,15 +199,15 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
 
                 if (cc.AcceptMask != 0) {
                     TrianglePacket tris;
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, vpHalfSize, mesh.CullMode);
+                    v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
                     acceptMask &= cc.AcceptMask;
 
                     if (acceptMask != 0) {
-                        v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                        v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
                         v_uint extent = boundBox.y - boundBox.x;
 
                         TriangleEdgeVars vars;
-                        vars.Setup(tris, vpHalfSize);
+                        vars.Setup(tris, _viewHalfSize);
 
                         vars.MeshletId = meshIdx;
                         vars.BasePrimId = primOffset;
@@ -247,15 +241,15 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                     clipper.OutTris = clippedTris;
                     clipper.OutData = clipData;
                     clipper.OutMasks = clipValidMask;
-                    clipper.ClipTriangles(v0, v1, v2, cc, vpHalfSize, mesh.CullMode);
+                    clipper.ClipTriangles(v0, v1, v2, cc, _viewHalfSize, mesh.CullMode);
 
                     for (uint32_t i = 0; i < clipper.OutIdx; i += simd::vec_width) {
                         TrianglePacket& tris = clippedTris[i / simd::vec_width];
-                        v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                        v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
                         v_uint extent = boundBox.y - boundBox.x;
 
                         TriangleEdgeVars vars;
-                        vars.Setup(tris, vpHalfSize);
+                        vars.Setup(tris, _viewHalfSize);
                         
                         vars.MeshletId = meshIdx;
                         vars.BasePrimId = primOffset;
@@ -351,7 +345,6 @@ void TriangleEdgeVars::Setup(const TrianglePacket& tris, int2 vpHalfSize) {
     Z10 = (tris.Z1 - tris.Z0) * rcpArea;
     Z20 = (tris.Z2 - tris.Z0) * rcpArea;
 
-    W0 = tris.W0;
     W0S = tris.W0 * rcpArea;
     W1S = tris.W1 * rcpArea;
     W2S = tris.W2 * rcpArea;
@@ -543,7 +536,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     // #define DBG(msg, ...) printf("[RasterJob %d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
     #define DBG(...)
 
-    _runner->Dispatch([&](uint32_t workerId) {
+    Dispatch([&](uint32_t workerId) {
         ZoneScopedN("MeshWorker");
 
         DBG("Begin");
@@ -611,7 +604,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
                     memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                    v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
+                    v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
                     batchFull |= !DistributeToBins(workerId, nextPacketIdx, acceptMask, boundBox.x, boundBox.y);
                     batchFull |= nextPacketIdx + 1 >= maxPacketIdx;
 
@@ -863,8 +856,16 @@ void ThreadedRunner::Dispatch(void (*cb)(void* pData, uint32_t workerId), void* 
 
     cb(pData, 0);
 
+    ZoneScopedNC("JoinDispatch", 0xEECC55);
+
     // Wait idle
+#if SYNC_SPIN_ONLY
     while (_numBusy.load(std::memory_order::acquire) > 0) _mm_pause();
+#else
+    for (uint32_t n; (n = _numBusy.load(std::memory_order::acquire)) > 0;) {
+        _numBusy.wait(n, std::memory_order::acquire);
+    }
+#endif
 
     _jobData = nullptr;
     _jobCallback = nullptr;
@@ -890,10 +891,14 @@ void ThreadedRunner::WorkerFn(uint32_t workerId) {
         prevTimestamp = currTimestamp;
 
         _jobCallback(_jobData, workerId);
-        _numBusy.fetch_sub(1, std::memory_order::acq_rel);
+        if (_numBusy.fetch_sub(1, std::memory_order::acq_rel) == 1) {
+            _numBusy.notify_all();
+        }
     }
 }
 void Barrier::Wait() {
+    ZoneScoped;
+
     uint64_t currToken = _token.fetch_sub(1, std::memory_order::acq_rel);
     uint32_t prevGen = uint32_t(currToken >> 32);
     uint32_t prevCount = uint32_t(currToken);
@@ -908,7 +913,7 @@ void Barrier::Wait() {
 #if SYNC_SPIN_ONLY
             _mm_pause();
 #else
-            _token.wait(prevToken, std::memory_order::acquire);
+            _token.wait(currToken, std::memory_order::acquire);
 #endif
             currToken = _token.load(std::memory_order::acquire);
         }
