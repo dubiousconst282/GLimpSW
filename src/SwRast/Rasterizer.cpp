@@ -1,43 +1,43 @@
-// #undef NDEBUG
-
 #include "Rasterizer.h"
-
-#include <tracy/Tracy.hpp>
 
 #include <vector>
 #include <thread>
 
-#define SYNC_SPIN_ONLY 1
+#include <tracy/Tracy.hpp>
+#include <tracy/TracyC.h>
+
+#define TracyCoalescedZoneBegin(ctx, name, color) if (!ctx.active) { TracyCZoneNC(zone, name, color, true); ctx = zone; }
+#define TracyCoalescedZoneEnd(ctx) if (ctx.active) { TracyCZoneEnd(ctx); ctx.active = false; }
+
+// #undef assert
+// static void assert_fail(const char* expr) { fprintf(stderr, "Assert failure: %s\n", expr); abort(); }
+// #define assert(expr) ((expr) || (__builtin_debugtrap(), assert_fail(#expr), 0))
 
 namespace swr {
 
-static constexpr uint32_t MaxWorkerBatch = 256, MaxBinSize = 63;
-static constexpr uint32_t BinShift = 7, BinSize = 1 << BinShift;
-static constexpr uint32_t MaxRenderBins = (Rasterizer::MaxRenderSize + BinSize - 1) / BinSize;
-static constexpr uint32_t FrameBitmapWords = (MaxRenderBins * MaxRenderBins) / 64;
+static constexpr uint32_t MaxPacketsPerWorker = 200, MaxPacketsPerBin = 128, BatchesInFlight = 2;
+static constexpr uint32_t BinShift = 6, BinSize = 1 << BinShift;
+
+static constexpr uint32_t MaxBinGridSize = (Rasterizer::MaxRenderSize + BinSize - 1) / BinSize;
+static constexpr uint32_t MaxRasterBinWorkers = 32;
 
 struct alignas(64) TriangleBin {
-    uint32_t Count;
-    uint32_t Ids[MaxBinSize];
+    uint32_t Ids[MaxPacketsPerBin];
 };
 struct BinQueue {
-    uint16_t BinsPerRow = 0, BinsPerFrame = 0, NumWorkers = 0;
+    uint2 BinGridSize;
+    uint16_t BinsPerFrame = 0, BinCountBatchStride = 0, NumWorkers = 0;
     uint64_t BinsPerRowRcp = 0;
+    uint64_t BinWorkPattern = 0;
 
-    // Binner working set
-    std::unique_ptr<TriangleBin[]> Bins;
-    std::unique_ptr<TrianglePacket[]> Batch;
-    std::unique_ptr<uint64_t[]> WorkerBitmap;  // Per worker bitmaps
+    std::unique_ptr<uint8_t[]> BinCounts;
+    std::unique_ptr<TriangleBin[]> BinPool;
+    std::unique_ptr<TrianglePacket[]> PacketPool;
 
-    // Commited to rasterizer
-    std::unique_ptr<TriangleBin[]> CommitedBins;
-    std::unique_ptr<TrianglePacket[]> CommitedBatch;
-    uint64_t FrameBitmap[FrameBitmapWords];    // Merged from all workers
+    alignas(64) uint64_t ReadyBitmap[MaxRasterBinWorkers * BatchesInFlight][(MaxBinGridSize * MaxBinGridSize + 63) / 64];
 
-    void AllocBins(uint32_t fbWidth, uint32_t fbHeight, uint32_t workerCount);
-    bool InsertBin(uint32_t workerId, uint32_t binId, uint32_t packetIdx, v_mask mask);
-
-    void Commit();
+    void AllocBins(uint2 fbSize, uint32_t workerCount);
+    bool InsertBin(uint32_t workerId, uint2 binPos, uint32_t packetIdx, v_mask mask);
 };
 
 enum class ClipPlane {
@@ -132,10 +132,6 @@ void Rasterizer::SetThreadCount(uint32_t count) {
     if (count == 0) {
         count = std::max(std::thread::hardware_concurrency() / 2, 1u);
     }
-    // The bin rasterizer cannot handle more than 64 threads.
-    // This architecture probably won't scale well past too many threads anyway, so better to just cap it.
-    count = std::min(count, 64u);
-
     _runner = std::make_unique<ThreadedRunner>(count);
 }
 
@@ -521,33 +517,33 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
         SWR_PERF_END(Draw);
         return;
     }
-    _queue->AllocBins(_viewSize.x, _viewSize.y, _runner->GetThreadCount());
-
-    uint64_t workerBinElectMask = 0;
-    for (uint32_t i = 0; i < 64; i += _queue->NumWorkers) {
-        workerBinElectMask |= 1ull << i;
-    }
-    int2 vpHalfSize = _viewSize / 2u;
     float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
+    if (!EnableGuardband) guardBandFactor = float2(1.0f);
 
-    auto readyBarrier = Barrier(_queue->NumWorkers);
-    std::atomic<uint32_t> doneMeshCount = 0;
+    _queue->AllocBins(_viewSize, _runner->GetThreadCount());
 
-    // #define DBG(msg, ...) printf("[RasterJob %d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
-    #define DBG(...)
+    std::atomic<uint32_t> finishedMeshCount = 0;
+    std::atomic<uint64_t> activeWorkers = (1ull << _queue->NumWorkers) - 1;
+
+#define DBG(msg, ...) // printf("[W%d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
+    //printf("Draw(%d)\n", meshCount);
 
     Dispatch([&](uint32_t workerId) {
+        if (workerId >= _queue->NumWorkers) return;
+
         ZoneScopedN("MeshWorker");
 
         DBG("Begin");
         ShadedMeshlet mesh = { .PrimCount = 0 };
 
-        uint32_t meshJobs = 0;
         uint32_t nextMeshIdx = workerId, meshIdx = nextMeshIdx;
         uint32_t primOffset = 0;
 
-        uint32_t nextPacketIdx = workerId * MaxWorkerBatch;
-        uint32_t maxPacketIdx = nextPacketIdx + MaxWorkerBatch;
+        uint32_t batchId = workerId * BatchesInFlight;
+        uint32_t batchMeshCount = 0;
+        uint32_t nextPacketIdx = 0;
+
+        TracyCZoneCtx meshZone = {};
 
         while (true) {
             bool batchFull = false;
@@ -555,11 +551,12 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
 
             // Fetch another meshlet
             if (nextMeshIdx < meshCount && primOffset >= mesh.PrimCount) {
+                TracyCoalescedZoneBegin(meshZone, "FetchMeshlet", 0x55BB55);
                 isIdle = false;
 
                 meshIdx = nextMeshIdx;
                 nextMeshIdx += _queue->NumWorkers;
-                meshJobs++;
+                batchMeshCount++;
 
                 shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
                 if (mesh.PrimCount == 0) continue;
@@ -588,9 +585,10 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                 }
 
                 if (cc.AcceptMask != 0) {
-                    assert(nextPacketIdx < maxPacketIdx);
-                    TrianglePacket& tris = _queue->Batch[nextPacketIdx];
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, vpHalfSize, mesh.CullMode);
+                    assert(nextPacketIdx < MaxPacketsPerWorker);
+                    uint32_t packetId = batchId * MaxPacketsPerWorker + nextPacketIdx;
+                    TrianglePacket& tris = _queue->PacketPool[packetId];
+                    v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
 
                     acceptMask &= cc.AcceptMask;
                     if (acceptMask == 0) continue;
@@ -605,61 +603,134 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
                     v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
-                    batchFull |= !DistributeToBins(workerId, nextPacketIdx, acceptMask, boundBox.x, boundBox.y);
-                    batchFull |= nextPacketIdx + 1 >= maxPacketIdx;
-
-                    nextPacketIdx++;
+                    batchFull |= !DistributeToBins(batchId, packetId, acceptMask, boundBox.x, boundBox.y);
+                    batchFull |= ++nextPacketIdx >= MaxPacketsPerWorker;
                 }
             }
 
-            // Rasterize!
+            // Rasterize
             if (batchFull || isIdle) {
-                {
-                    ZoneScopedN("Sync"); DBG("Batch Ready m=%d pkt=%d/%d", meshJobs, nextPacketIdx, maxPacketIdx);
+                TracyCoalescedZoneEnd(meshZone);
+                DBG("Commit m=%d p=%d b=%d", batchMeshCount, nextPacketIdx, batchId % BinsInFlight);
 
-                    readyBarrier.Wait();
-                    if (doneMeshCount.load(std::memory_order::acquire) >= meshCount) break;
-
-                    if (workerId == 0) {
-                        _queue->Commit();
+                // Commit bins
+                if (nextPacketIdx > 0) {
+                    for (uint32_t i = 0; i < _queue->BinsPerFrame; i += 64) {
+                        assert(_queue->ReadyBitmap[batchId][i / 64u] == 0);
+                        auto counts = simd::load<uint8_t, 64>(&_queue->BinCounts[batchId * _queue->BinCountBatchStride + i]);
+                        _queue->ReadyBitmap[batchId][i / 64u] = simd::movemask(counts != 0);
                     }
-                    readyBarrier.Wait();
-                    DBG("Batch Accept");
+                    _mm_mfence();
                 }
 
-                {
-                    ZoneScopedN("Rasterize");
+                while (true) {
+                    RasterizeBins(shader, workerId);
 
-                    for (uint32_t i = 0; i < FrameBitmapWords; i++) {
-                        uint32_t shift = (workerId + i * 64) % 64;
-                        uint64_t mask = _queue->FrameBitmap[i] & (workerBinElectMask << shift);
+                    // Switch to next batch
+                    batchId = (batchId / BatchesInFlight * BatchesInFlight) + ((batchId + 1) % BatchesInFlight);
+                    nextPacketIdx = 0;
 
-                        for (uint32_t j : simd::BitIter(mask)) {
-                            uint32_t binId = i * 64 + j;
-                            RasterizeBin(shader, binId);
-                        }
-                        SWR_PERF_INC(BinQueueFlushes, simd::popcnt(mask));
+                    bool isNextBatchBusy = false;
+                    for (uint32_t i = 0; i < _queue->BinsPerFrame; i += 64) {
+                        isNextBatchBusy |= _queue->ReadyBitmap[batchId][i / 64u] != 0;
                     }
+                    if (!isNextBatchBusy) break;
+                    _mm_pause();
                 }
-                DBG("Batch Done");
+                // Cheaper to clear all bins here rather than one at a time in the rasterizer.
+                memset(&_queue->BinCounts[batchId * _queue->BinCountBatchStride], 0, _queue->BinsPerFrame);
 
+                // Exit if no more meshes
                 if (nextMeshIdx >= meshCount && primOffset >= mesh.PrimCount) {
-                    doneMeshCount.fetch_add(meshJobs, std::memory_order::acq_rel);
-                    meshJobs = 0;
+                    uint32_t prevCount = finishedMeshCount.fetch_add(batchMeshCount, std::memory_order::relaxed);
+                    if (prevCount >= meshCount - batchMeshCount) {
+                        if (activeWorkers.fetch_and(~(1ull << workerId), std::memory_order::acq_rel) == 0) break;
+                    }
+                    batchMeshCount = 0;
                 }
-
-                // Reset batch counters
-                nextPacketIdx = workerId * MaxWorkerBatch;
             }
         }
         DBG("Exit");
         perf::FlushThreadCounters();
     });
-
-    for (uint32_t i = 0; i < _queue->BinsPerFrame * _queue->NumWorkers; i++) {
-        assert(_queue->Bins[i].Count == 0);
-    }
     SWR_PERF_END(Draw);
+
+    memset(_queue->BinCounts.get(), 0, _queue->BinCountBatchStride * _queue->NumWorkers * BatchesInFlight);
+}
+
+void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
+    TracyCZoneCtx rasterZone = {};
+
+    uint32_t numBatches = _queue->NumWorkers * BatchesInFlight;
+    uint64_t binPattern = _queue->BinWorkPattern << workerId;
+    
+    for (uint32_t binChunkOffset = 0; binChunkOffset < _queue->BinsPerFrame; binChunkOffset += 64) {
+        // Create local copy of commit bitmap to minimize MESI transitions
+        static_assert(MaxRasterBinWorkers * BatchesInFlight <= 64);
+        uint64_t binMasks[MaxRasterBinWorkers * BatchesInFlight];
+        uint64_t batchMask = 0;
+
+        #pragma nounroll
+        for (uint32_t batchId = 0; batchId < numBatches; batchId++) {
+            binMasks[batchId] = _queue->ReadyBitmap[batchId][binChunkOffset / 64u] & binPattern;
+            batchMask |= binMasks[batchId] ? (1ull << batchId) : 0;
+        }
+        if (batchMask == 0) continue;
+
+        TracyCoalescedZoneBegin(rasterZone, "RasterBin", 0xEE5555);
+
+        for (uint32_t batchId : simd::BitIter(batchMask)) {
+            for (uint32_t binMaskOffset : simd::BitIter(binMasks[batchId])) {
+                uint32_t binId = binChunkOffset + binMaskOffset;
+
+                // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
+                uint32_t binY = (binId * _queue->BinsPerRowRcp) >> 32;
+                uint32_t binX = binId - binY * _queue->BinGridSize.x;
+                volatile uint32_t binPosMin = (binX | binY << 16) * BinSize;
+                volatile uint32_t binPosMax = binPosMin + (BinSize * 0x0001'0001);
+
+                uint8_t count = _queue->BinCounts[batchId * _queue->BinCountBatchStride + binId];
+                uint32_t* ids = _queue->BinPool[batchId * _queue->BinsPerFrame + binId].Ids;
+                DBG("RasterBin %d: %d", binId, count);
+
+                for (uint32_t i = 0; i < count; i++) {
+                    TrianglePacket& tris = _queue->PacketPool[ids[i] >> 16];
+                    v_mask acceptMask = v_mask(ids[i] & 0xFFFF);
+
+                    v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
+                    v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)binPosMin));
+                    v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)binPosMax));
+                    v_uint bbExtent = bbMax - bbMin;
+
+                    TriangleEdgeVars edges;
+                    edges.Setup(tris, _viewHalfSize);
+
+                    memcpy(edges.VertexId, tris.VertexId, sizeof(edges.VertexId));
+                    edges.BasePrimId = tris.BasePrimId;
+                    edges.TileStride = _tileStride;
+                    edges.MeshletId = tris.MeshletId;
+                    edges.ClipData = tris.ClipData;
+
+                    {
+                        v_uint x0 = bbMin & 0xFFFF, y0 = bbMin >> 16;
+                        v_uint x1 = bbMax & 0xFFFF, y1 = bbMax >> 16;
+                        assert((simd::movemask(x0 > x1 || y0 > y1) & acceptMask) == 0);
+                    }
+
+                    auto drawFn = shader.Dispatch.DrawTriangle[tris.FragmentShaderId];
+
+                    for (uint32_t j : simd::BitIter(acceptMask)) {
+                        // clang sometimes emits full vector reload when indexing (only for local vars?)
+                        uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
+                        drawFn(shader.Context, edges, j, boundRect);
+                    }
+                }
+            }
+            __atomic_fetch_and(&_queue->ReadyBitmap[batchId][binChunkOffset / 64u], ~binMasks[batchId], __ATOMIC_RELAXED);
+        }
+    }
+
+    TracyCoalescedZoneEnd(rasterZone);
 }
 
 static uint32_t ReduceMin_U16x2(v_uint value, v_mask mask) {
@@ -680,7 +751,7 @@ static uint32_t ReduceMax_U16x2(v_uint value, v_mask mask) {
 }
 
 // Returns false when a bin gets full.
-bool Rasterizer::DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos) {
+bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos) {
     v_uint binMinPos = _mm512_srli_epi16(triMinPos, BinShift);
     v_uint binMaxPos = _mm512_srli_epi16(triMaxPos - 0x0001'0001, BinShift);
     v_uint firstLaneBinPos = _mm512_permutexvar_epi32(_mm512_set1_epi32(_mm_tzcnt_32(acceptMask)), binMinPos);
@@ -689,8 +760,7 @@ bool Rasterizer::DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask 
     // Fast path for packets that span one bin
     if ((acceptMask & ~sameBinMask) == 0) [[likely]] {
         uint32_t binPos = firstLaneBinPos[0];
-        uint32_t binId = (binPos & 0xFFFF) + (binPos >> 16) * _queue->BinsPerRow;
-        return _queue->InsertBin(workerId, binId, packetIdx, acceptMask);
+        return _queue->InsertBin(batchId, uint2(binPos & 0xFFFF, binPos >> 16), packetIdx, acceptMask);
     }
 
     uint32_t startBB = ReduceMin_U16x2(binMinPos, acceptMask);
@@ -700,144 +770,72 @@ bool Rasterizer::DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask 
 
     bool underCap = true;
 
+    // TODO: coarse edge intersections might actually be worth for larger tris
     for (uint32_t y = startY; y <= endY; y++) {
         for (uint32_t x = startX; x <= endX; x++) {
             v_mask mask = acceptMask & simd::movemask(x >= (binMinPos & 0xFFFF) & x <= (binMaxPos & 0xFFFF) &  //
                                                       y >= (binMinPos >> 16) & y <= (binMaxPos >> 16));
             if (mask == 0) continue;
 
-            uint32_t binId = x + y * _queue->BinsPerRow;
-            underCap &= _queue->InsertBin(workerId, binId, packetIdx, mask);
+            underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
         }
     }
     return underCap;
 }
-void Rasterizer::RasterizeBin(ShaderBinding shader, uint32_t binId) {
-    uint32_t binY = (binId * _queue->BinsPerRowRcp) >> 32;
-    uint32_t binX = binId - binY * _queue->BinsPerRow;
-    binX *= BinSize, binY *= BinSize;
+bool BinQueue::InsertBin(uint32_t batchId, uint2 binPos, uint32_t packetIdx, v_mask mask) {
+    uint32_t binId = binPos.x + binPos.y * BinGridSize.x;
+    uint8_t& count = BinCounts[batchId * BinCountBatchStride + binId];
+    uint32_t* ids = BinPool[batchId * BinsPerFrame + binId].Ids;
 
-    int2 vpHalfSize = _viewSize / 2u;
+    assert(count < MaxPacketsPerBin);
+    static_assert(simd::vec_width <= 16);
+    static_assert(MaxPacketsPerWorker * MaxRasterBinWorkers < UINT16_MAX);
 
-    // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
-    volatile uint32_t binPosMin = binX | binY << 16;
-    volatile uint32_t binPosMax = binPosMin + (BinSize * 0x0001'0001);
-
-    for (uint32_t workerId = 0; workerId < _queue->NumWorkers; workerId++) {
-        TriangleBin& bin = _queue->CommitedBins[binId * _queue->NumWorkers + workerId];
-
-        for (uint32_t i = 0; i < bin.Count; i++) {
-            TrianglePacket& tris = _queue->CommitedBatch[bin.Ids[i] >> 16];
-            v_mask acceptMask = bin.Ids[i];
-
-            v_uint2 boundBox = tris.GetRenderBoundingBox(vpHalfSize);
-            v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)binPosMin));
-            v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)binPosMax));
-            v_uint bbExtent = bbMax - bbMin;
-
-            TriangleEdgeVars edges;
-            memcpy(edges.VertexId, tris.VertexId, 64);
-            edges.Setup(tris, vpHalfSize);
-            edges.TileStride = _tileStride;
-
-            {
-                v_uint x0 = bbMin & 0xFFFF, y0 = bbMin >> 16;
-                v_uint x1 = bbMax & 0xFFFF, y1 = bbMax >> 16;
-                assert((simd::movemask(x0 > x1 || y0 > y1) & acceptMask) == 0);
-            }
-
-            auto drawFn = shader.Dispatch.DrawTriangle[tris.FragmentShaderId];
-
-            for (uint32_t j : simd::BitIter(acceptMask)) {
-                // clang sometimes emits full vector reload when indexing (only for local vars?)
-                uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
-                drawFn(shader.Context, edges, j, boundRect);
-            }
-        }
-        bin.Count = 0;
-    }
+    ids[count++] = (packetIdx << 16) | mask;
+    return count < MaxPacketsPerBin;
 }
 
-void BinQueue::AllocBins(uint32_t fbWidth, uint32_t fbHeight, uint32_t workerCount) {
-    uint32_t newBinsPerRow = (fbWidth + BinSize - 1) >> BinShift;
-    uint32_t newBinCount = ((fbHeight + BinSize - 1) >> BinShift) * newBinsPerRow;
+void BinQueue::AllocBins(uint2 fbSize, uint32_t workerCount) {
+    workerCount = std::min(workerCount, MaxRasterBinWorkers);
+    uint2 newGridSize = (fbSize + BinSize - 1u) >> BinShift;
 
-    if (newBinsPerRow == BinsPerRow && newBinCount == BinsPerFrame && workerCount == NumWorkers) return;
+    if (BinGridSize.x == newGridSize.x && BinGridSize.y == newGridSize.y && workerCount == NumWorkers) return;
 
-    assert(MaxWorkerBatch * NumWorkers < UINT16_MAX);
+    BinGridSize = newGridSize;
+    BinsPerFrame = uint16_t(newGridSize.x * newGridSize.y);
 
-    BinsPerRow = newBinsPerRow;
-    BinsPerFrame = newBinCount;
-    NumWorkers = workerCount;
+    NumWorkers = uint16_t(workerCount);
+    BinCountBatchStride = uint16_t((BinsPerFrame + 63) & ~63u);  // align per-worker `BinCounts` to cacheline
 
-    BinsPerRowRcp = ((1ull << 32) / BinsPerRow) + 1;  // magic div coeff, good for up to 16 bits
+    BinsPerRowRcp = ((1ull << 32) / BinGridSize.x) + 1;  // magic div coeff, good for up to 16 bits
 
-    Bins = std::make_unique<TriangleBin[]>(BinsPerFrame * NumWorkers);
-    CommitedBins = std::make_unique<TriangleBin[]>(BinsPerFrame * NumWorkers);
-
-    Batch = std::make_unique<TrianglePacket[]>(MaxWorkerBatch * NumWorkers);
-    CommitedBatch = std::make_unique<TrianglePacket[]>(MaxWorkerBatch * NumWorkers);
-
-    WorkerBitmap = std::make_unique<uint64_t[]>(FrameBitmapWords * NumWorkers);
-
-    for (uint32_t i = 0; i < BinsPerFrame * NumWorkers; i++) {
-        Bins[i].Count = 0;
-        CommitedBins[i].Count = 0;
-    }
-}
-bool BinQueue::InsertBin(uint32_t workerId, uint32_t binId, uint32_t packetIdx, v_mask mask) {
-    TriangleBin& bin = Bins[binId * NumWorkers + workerId];
-    assert(bin.Count < MaxBinSize);
-
-    bin.Ids[bin.Count++] = (packetIdx << 16) | mask;
-    WorkerBitmap[workerId * FrameBitmapWords + (binId / 64u)] |= (1ull << (binId & 63));
-
-    return bin.Count < MaxBinSize;
-}
-
-void BinQueue::Commit() {
-    std::swap(CommitedBatch, Batch);
-    std::swap(CommitedBins, Bins);
-
-    memset(FrameBitmap, 0, sizeof(FrameBitmap));
-
-    for (uint32_t i = 0; i < NumWorkers; i++) {
-        for (uint32_t j = 0; j < FrameBitmapWords; j++) {
-            FrameBitmap[j] |= WorkerBitmap[i * FrameBitmapWords + j];
-        }
-        for (uint32_t j = 0; j < FrameBitmapWords; j++) {
-            WorkerBitmap[i * FrameBitmapWords + j] = 0;
-        }
+    BinCounts = std::make_unique<uint8_t[]>(BinCountBatchStride * NumWorkers * BatchesInFlight);
+    BinPool = std::make_unique<TriangleBin[]>(BinsPerFrame * NumWorkers * BatchesInFlight);
+    PacketPool = std::make_unique<TrianglePacket[]>(MaxPacketsPerWorker * NumWorkers * BatchesInFlight);
+    
+    BinWorkPattern = 0;
+    for (uint32_t i = 0; i < 64; i += NumWorkers) {
+        BinWorkPattern |= 1ull << i;
     }
 
-    // Worth transpose for bit-iter over non-empty worker bins?
-    // dest.bit[binId * NumWorkers + workerId] = src.bit[workerId * WorkerBitmapSize + binId]
-    //
-    // uint32_t binStride = (NumWorkers + 7) / 8;
-    // for (uint32_t j = 0; j < BinsPerFrame; j += 64) {
-    //     for (uint32_t i = 0; i < NumWorkers; i += 8) {
-    //         uint8_t boundMask = i + 8 <= NumWorkers ? 255 : (1u << (NumWorkers % 8)) - 1;
-    //         auto x = _mm512_mask_i32gather_epi64(_mm512_setzero_si512(), boundMask,                          //
-    //                                              _mm512_castsi512_si256(simd::lane_idx * FrameBitmapWords),  //
-    //                                              &WorkerBitmaps[(i * FrameBitmapWords) + (j / 64u)], 8);
+    // TODO: investigate alternative raster patterns https://schmalstieg.github.io/pdf/Schmalstieg_338.pdf
+    // for (uint32_t y = 0; y < gridSize.y; y++) {
+    //     // X-shift + offset
+    //     float k = (numWorkers + 1) / ceilf(sqrtf(numWorkers));
+    //     uint32_t offset = uint32_t(ceilf(y * k));
 
-    //         // Transpose 64x8 to 8x64
-    //         // https://haroldbot.nl/avx512bpc.html?q=b%206%2C7%2C8%2C0%2C1%2C2%2C3%2C4%2C5
-    //         __m512i s1 = _mm512_set_epi8(7, 15, 23, 31, 39, 47, 55, 63,  //
-    //                                      6, 14, 22, 30, 38, 46, 54, 62,  //
-    //                                      5, 13, 21, 29, 37, 45, 53, 61,  //
-    //                                      4, 12, 20, 28, 36, 44, 52, 60,  //
-    //                                      3, 11, 19, 27, 35, 43, 51, 59,  //
-    //                                      2, 10, 18, 26, 34, 42, 50, 58,  //
-    //                                      1, 9, 17, 25, 33, 41, 49, 57,   //
-    //                                      0, 8, 16, 24, 32, 40, 48, 56);
-    //         x = _mm512_permutexvar_epi8(s1, x);
-    //         x = _mm512_gf2p8affine_epi64_epi8(_mm512_set1_epi64((int64_t)0x80'40'20'10'08'04'02'01), x, 0);
-
-    //         //_mm512_storeu_epi64(&dest[(j / 64) * binStride + i], x);
-    //     }
+    //     // Van der Corput (broken for N != POT, must skip if offset >= N)
+    //     uint32_t m = simd::lzcnt(y | 1);
+    //     uint32_t k = __builtin_elementwise_bitreverse(y) >> m;
+    //     uint32_t offset = (uint32_t)ceilf(k / float(1 << (32 - m)) * N);
+    //     // uint32_t offset = (k * N) >> (32 - m);
     // }
 }
+
+// Toggle between futex and mm_pause() spin loops for syncing.
+// Spin loops have lower latency but can degrade perf past core count,
+// see https://travisdowns.github.io/blog/2020/07/06/concurrency-costs.html
+#define SYNC_SPIN_ONLY 1
 
 void Rasterizer::Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser) { _runner->Dispatch(cb, pUser); }
 

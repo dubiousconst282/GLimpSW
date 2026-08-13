@@ -312,7 +312,7 @@ private:
     void DrawMeshletsST(uint32_t count, ShaderBinding shader);
 
     bool DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos);
-    void RasterizeBin(ShaderBinding shader, uint32_t binId);
+    void RasterizeBins(ShaderBinding shader, uint32_t workerId);
 
     void WorkerFn(uint32_t workerId);
 };
