@@ -94,7 +94,6 @@ void InitRenderer() {
     _cam = Camera{ .Position = { -9.38414, 1.63823, -0.00313 }, .Euler = { 0.7993, -0.0849 }, .MoveSpeed = 5.0f };
 
     _rast = std::make_unique<swr::Rasterizer>(4);
-    _rast->EnableBinning = false;
     CreateFramebuffer(1920, 1080);
 
     _shadowDepthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(1024, 1024, 1, 1);
@@ -256,6 +255,7 @@ void RenderFrame() {
     ImGui::Checkbox("Binning", &_rast->EnableBinning);
     ImGui::Checkbox("Clipping", &_rast->EnableClipping);
     ImGui::Checkbox("Guardband", &_rast->EnableGuardband);
+    ImGui::Checkbox("Intersect Bins", &_rast->EnableBinIntersect);
 
     ImGui::SeparatorText("Renderer");
 
@@ -504,7 +504,7 @@ void RenderFrame() {
                 swr::perf::GetCurrent(swr::PerfCounter::TrianglesRasterized) / 1e3,  //
                 swr::perf::GetCurrent(swr::PerfCounter::TrianglesProcessed) / 1e3,   //
                 swr::perf::GetCurrent(swr::PerfCounter::TrianglesClipped) / 1e3,     //
-                swr::perf::GetCurrent(swr::PerfCounter::BinQueueFlushes) / 1e3);
+                swr::perf::GetCurrent(swr::PerfCounter::BinsFlushed) / 1e3);
 
     ImGui::Text("Shadows: %.2fms, Probes: %.2fms",                                //
                 swr::perf::GetAverage(swr::PerfCounter::ShadowRenderTime) / 1e6,  //

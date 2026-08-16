@@ -668,7 +668,10 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     for (uint32_t i = 0; i < _queue->BinsPerFrame; i += 64) {
                         assert(_queue->ReadyBitmap[batchId][i / 64u] == 0);
                         auto counts = simd::load<uint8_t, 64>(&_queue->BinCounts[batchId * _queue->BinCountBatchStride + i]);
-                        _queue->ReadyBitmap[batchId][i / 64u] = simd::movemask(counts != 0);
+                        uint64_t mask = simd::movemask(counts != 0);
+                        _queue->ReadyBitmap[batchId][i / 64u] = mask;
+
+                        SWR_PERF_INC(BinsFlushed, simd::popcnt(mask));
                     }
                     _mm_mfence();
                 }
@@ -817,6 +820,7 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
         return _queue->InsertBin(batchId, uint2(binPos & 0xFFFF, binPos >> 16), packetIdx, acceptMask);
     }
 
+    v_uint binExtent = binMaxPos - binMinPos;
     uint32_t startBB = ReduceMin_U16x2(binMinPos, acceptMask);
     uint32_t endBB = ReduceMax_U16x2(binMaxPos, acceptMask);
     uint32_t startX = startBB & 0xFFFF, startY = startBB >> 16;
@@ -824,18 +828,60 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
 
     bool underCap = true;
 
-    // TODO: coarse edge intersections might actually be worth for larger tris
-    for (uint32_t y = startY; y <= endY; y++) {
-        for (uint32_t x = startX; x <= endX; x++) {
-            v_mask mask = acceptMask & simd::movemask(x >= (binMinPos & 0xFFFF) & x <= (binMaxPos & 0xFFFF) &  //
-                                                      y >= (binMinPos >> 16) & y <= (binMaxPos >> 16));
-            if (mask == 0) continue;
+    // Fast path for medium triangles (spanning less than 3x3 bins)
+    if (simd::all(simd::min(binExtent, binExtent << 16) < 0x0003'0000) || !EnableBinIntersect) [[likely]] {
+        for (uint32_t y = startY; y <= endY; y++) {
+            v_uint packedPos = v_uint(startX | (y << 16));
 
-            underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
+            for (uint32_t x = startX; x <= endX; x++, packedPos += 1) {
+                v_uint clampedPos = _mm512_min_epi16(_mm512_max_epi16(packedPos, binMinPos), binMaxPos);
+                v_mask mask = simd::movemask(clampedPos == packedPos) & acceptMask;
+
+                if (mask != 0) {
+                    underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
+                }
+            }
         }
+        return underCap;
+    }
+    TriangleEdgeVars tri;
+    [[clang::always_inline]] tri.Setup(_queue->PacketPool[packetIdx], _viewHalfSize);
+
+    v_int3 edgeStepX = v_int3(tri.A12, tri.A20, tri.A01);
+    v_int3 edgeStepY = v_int3(tri.B12, tri.B20, tri.B01);
+
+    // Edge offsets at innermost tile corner
+    v_int3 edgeOrigin = {
+        (simd::max(edgeStepX.x, 0) + simd::max(edgeStepY.x, 0)) * (BinSize - 1),
+        (simd::max(edgeStepX.y, 0) + simd::max(edgeStepY.y, 0)) * (BinSize - 1),
+        (simd::max(edgeStepX.z, 0) + simd::max(edgeStepY.z, 0)) * (BinSize - 1),
+    };
+    edgeStepX *= BinSize, edgeStepY *= BinSize;
+
+    edgeOrigin += v_int3(tri.Edge0, tri.Edge1, tri.Edge2);
+    edgeOrigin += edgeStepX * int(startX);
+    edgeOrigin += edgeStepY * int(startY);
+
+    for (uint32_t y = startY; y <= endY; y++) {
+        v_uint packedPos = v_uint(startX | (y << 16));
+        v_int3 edge = edgeOrigin;
+
+        for (uint32_t x = startX; x <= endX; x++, packedPos += 1) {
+            v_int insideTri = (edge.x | edge.y | edge.z) >= 0;
+            v_uint clampedPos = _mm512_min_epi16(_mm512_max_epi16(packedPos, binMinPos), binMaxPos);
+            v_mask mask = simd::movemask(insideTri && clampedPos == packedPos) & acceptMask;
+
+            if (mask != 0) {
+                underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
+            }
+            edge += edgeStepX;
+        }
+        edgeOrigin += edgeStepY;
     }
     return underCap;
 }
+
+[[clang::always_inline]]
 bool BinQueue::InsertBin(uint32_t batchId, uint2 binPos, uint32_t packetIdx, v_mask mask) {
     uint32_t binId = binPos.x + binPos.y * BinGridSize.x;
     uint32_t count = BinCounts[batchId * BinCountBatchStride + binId]++;

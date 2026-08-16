@@ -138,9 +138,10 @@ struct Rasterizer {
     static constexpr uint32_t MaxRenderSize = 2896;  // Determined by integer overflow bound around edge equations. 2**(31/2 - 4)
 
     // Debug
-    bool EnableBinning = true;    // Use binned rasterizer (if disabled, may artifact due to thread racing)
-    bool EnableClipping = true;   // Enable non-trivial clipping
-    bool EnableGuardband = true;  // Enable guardband clipping
+    bool EnableBinning = true;        // Use binned rasterizer (if disabled, may artifact due to thread racing)
+    bool EnableClipping = true;       // Enable non-trivial clipping
+    bool EnableGuardband = true;      // Enable guardband clipping
+    bool EnableBinIntersect = true;   // For large triangles, perform intersections with bins
 
     Rasterizer(uint32_t numThreads = 0);
     ~Rasterizer();
@@ -345,7 +346,7 @@ enum class PerfCounter {
     TrianglesProcessed,  // Meshlet primitive count
     TrianglesRasterized,
     TrianglesClipped,
-    BinQueueFlushes,  // Number of bins rasterized
+    BinsFlushed,         // Number of bins sent to rasterization
 
     CullingTime,
     DrawTime,
