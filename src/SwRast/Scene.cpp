@@ -77,7 +77,7 @@ static swr::RgbaTexture2D::Ptr LoadTextures(const std::string& basePath, const c
     if (!baseColorImg.Width) {
         const float* baseColor = mat->pbr_metallic_roughness.base_color_factor;
         auto tex = swr::CreateTexture<swr::RgbaTexture2D>(4, 4, 1, 1);
-        tex->WriteTile(swr::pixfmt::RGBA8u::Pack({ baseColor[0], baseColor[1], baseColor[2], baseColor[3] }), 0, 0);
+        tex->WriteTile({ baseColor[0], baseColor[1], baseColor[2], baseColor[3] }, 0, 0);
         return tex;
     }
     swr::StbImage normalImg = LoadImage(basePath, mat->normal_texture);
@@ -176,12 +176,11 @@ Model* Scene::ImportGltf(const std::string& path) {
 
     for (uint32_t i = 0; i < gltf->materials_count; i++) {
         cgltf_material* mat = &gltf->materials[i];
-        Textures.emplace_back(LoadTextures(basePath, mat));
 
         Materials[materialOffset + i] = {
-            .Texture = Textures[i].get(),
+            .Texture = Textures.emplace_back(LoadTextures(basePath, mat)).get(),
             .IsDoubleSided = mat->double_sided != 0,
-            .AlphaCutoff = (uint8_t)(mat->alpha_mode == cgltf_alpha_mode_mask  ? mat->alpha_cutoff * 255.0f + 0.5f : 255),
+            .AlphaCutoff = (uint8_t)(mat->alpha_mode == cgltf_alpha_mode_opaque ? 255 : mat->alpha_cutoff * 255.0f + 0.5f),
         };
     }
 
@@ -245,7 +244,7 @@ Model* Scene::ImportGltf(const std::string& path) {
 
                 om.NumVertices = m.vertex_count;
                 om.NumTriangles = m.triangle_count;
-                om.MaterialId = prim->material ? cgltf_material_index(gltf, prim->material) : UINT_MAX;
+                om.MaterialId = prim->material ? materialOffset + cgltf_material_index(gltf, prim->material) : UINT_MAX;
                 om.AlphaCutoff = prim->material ? Materials[om.MaterialId].AlphaCutoff : 255;
 
                 for (uint32_t i = 0; i < m.vertex_count; i++) {

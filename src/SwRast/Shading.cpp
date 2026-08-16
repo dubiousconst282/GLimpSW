@@ -52,6 +52,7 @@ static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& var
     if (vars.TileMask == 0) return;
 
     if constexpr (EnableAlphaTest) {
+        // TODO: try speeding up alpha tests with OMMs https://meshoptimizer.org/#opacity-micromaps
         const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
         const Material& material = ctx.Materials[mesh.MaterialId];
 
@@ -175,14 +176,15 @@ struct SurfaceAttribs {
 
 [[clang::always_inline]]
 static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId, v_float2 screenNdc, float2 screenSize) {
-    v_float3 pos[3];
-    v_uint packedTexCoord[3];
-    v_uint packedNormal[3];
-    v_uint packedTangent[3];
-    v_uint materialId = UINT_MAX;
-
     v_int v_exec = surfaceId != 0;
     if (!simd::any(v_exec)) return {};
+
+    // Better to zero init, otherwise clang loads stack garbage
+    v_float3 pos[3] = {};
+    v_uint packedTexCoord[3] = {};
+    v_uint packedNormal[3] = {};
+    v_uint packedTangent[3] = {};
+    v_uint materialId = UINT_MAX;
 
     simd_foreach_unique_lane(i, surfaceId, true) {
         const InstanceData& instance = ctx.Instances[i >> ShadingContext::VisbDrawShift];
@@ -204,7 +206,7 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
         }
     }
 
-    v_float transform[4][3];
+    v_float transform[4][3] = {};
     v_uint instanceId = surfaceId >> ShadingContext::VisbDrawShift;
 
     simd_foreach_unique_lane(i, instanceId, true) {
@@ -383,9 +385,7 @@ static v_float GetLightAttenuation(const Light& light, v_float3 surfacePosWS) {
 }
 
 [[clang::always_inline]]
-static v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_float3 worldPos, v_float3 irradiance, uint3 noisePos,
-                      uint32_t numShadowSamples) {
-    v_float3 finalColor = 0;
+v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_float3 worldPos, v_float3 irradiance, v_float shadowMask) {
     v_float reflectance = 0.5;  // parametized IOR
 
     v_float3 baseColor = v_float3(swr::pixfmt::RGBA8u::UnpackSrgb(surf.Albedo));
@@ -396,11 +396,14 @@ static v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& su
         simd::lerp(0.16f * reflectance * reflectance, baseColor.z, surf.Metallic),
     };
     v_float3 diffuseColor = baseColor * (1.0 - surf.Metallic);
+    v_float3 finalColor = diffuseColor * irradiance;
 
     v_float3 viewDir = simd::normalize(ctx.ViewPos - worldPos);
     v_float NoV = simd::abs(simd::dot(surf.Normal, viewDir)) + 1e-5f;
 
     // TODO: clustered lights?
+    // - https://www.aortiz.me/2018/12/21/CG.html
+    // - https://advances.realtimerendering.com/s2020/RenderingDoomEternal.pdf
     // - https://advances.realtimerendering.com/s2025/content/s2025_stb_lighting_v1.1_notes.pdf
 
     for (uint32_t i = 0; i < ctx.NumLights; i++) {
@@ -408,11 +411,9 @@ static v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& su
         v_float3 lightDir = light.Type == Light::kTypeDirectional ? -light.Direction : simd::normalize(light.Position - worldPos);
 
         v_float NoL = simd::dot(surf.Normal, lightDir);
-        if (simd::all(NoL < 1e-4)) continue;
+        if (i == 0) NoL *= shadowMask;
 
-        if (i == 0 && ctx.ShadowDepthMap != nullptr) {
-            NoL *= SampleShadowMap(ctx, worldPos, noisePos, numShadowSamples);
-        }
+        if (simd::all(NoL < 1e-4)) continue;
 
         v_float attenuation = GetLightAttenuation(light, worldPos) * light.Intensity;
         if (simd::all(NoL * attenuation < 1e-4)) continue;
@@ -430,48 +431,70 @@ static v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& su
 
         finalColor += (Fd + Fr) * light.Color * simd::max(NoL * attenuation, 0.0f);
     }
-    finalColor += diffuseColor * irradiance;
-
     return finalColor;
 }
 
 // TODO: Store border data for proper octahedron filtering
 static v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 15;
-    // TODO: blue noise works, but obviously noisy. Maybe with half-res + blurring.
-    // oct += GetTemporalBlueNoise(noisePos, 1);
 
     v_int2 q = simd::conv<int>(oct);
-    v_int idx00 = ((q.x + 0) & 15) | ((q.y + 0) & 15) << 4;
-    v_int idx01 = ((q.x + 0) & 15) | ((q.y + 1) & 15) << 4;
-    v_int idx10 = ((q.x + 1) & 15) | ((q.y + 0) & 15) << 4;
-    v_int idx11 = ((q.x + 1) & 15) | ((q.y + 1) & 15) << 4;
+    v_uint d00 = v_uint(((q.x + 0) & 15) | ((q.y + 0) & 15) << 4);
+    v_uint d10 = v_uint(((q.x + 1) & 15) | ((q.y + 0) & 15) << 4);
+    v_uint d01 = v_uint(((q.x + 0) & 15) | ((q.y + 1) & 15) << 4);
+    v_uint d11 = v_uint(((q.x + 1) & 15) | ((q.y + 1) & 15) << 4);
 
-    v_float2 d00 = swr::pixfmt::RG16f::Unpack(simd::gather(field.Depth[0], probeIdx * 256 + idx00));
-    v_float2 d10 = swr::pixfmt::RG16f::Unpack(simd::gather(field.Depth[0], probeIdx * 256 + idx10));
-    v_float2 d01 = swr::pixfmt::RG16f::Unpack(simd::gather(field.Depth[0], probeIdx * 256 + idx01));
-    v_float2 d11 = swr::pixfmt::RG16f::Unpack(simd::gather(field.Depth[0], probeIdx * 256 + idx11));
+#if 1
+    v_uint2 tmp1 = simd::gather2(field.Depth[0], probeIdx * 256 + d00);
+    v_uint2 tmp2 = simd::gather2(field.Depth[0], probeIdx * 256 + d01);
+    d00 = tmp1.x, d10 = tmp1.y;
+    d01 = tmp2.x, d11 = tmp2.y;
+#else
+    d00 = simd::gather(field.Depth[0], probeIdx * 256 + d00);
+    d10 = simd::gather(field.Depth[0], probeIdx * 256 + d10);
+    d01 = simd::gather(field.Depth[0], probeIdx * 256 + d01);
+    d11 = simd::gather(field.Depth[0], probeIdx * 256 + d11);
+#endif
 
-    v_float2 A = d00 + (d10 - d00) * simd::fract(oct.x);
-    v_float2 B = d01 + (d11 - d01) * simd::fract(oct.x);
+    v_float2 v00 = swr::pixfmt::RG16f::Unpack(d00);
+    v_float2 v10 = swr::pixfmt::RG16f::Unpack(d10);
+    v_float2 A = v00 + (v10 - v00) * simd::fract(oct.x);
+
+    v_float2 v01 = swr::pixfmt::RG16f::Unpack(d01);
+    v_float2 v11 = swr::pixfmt::RG16f::Unpack(d11);
+    v_float2 B = v01 + (v11 - v01) * simd::fract(oct.x);
+
     return A + (B - A) * simd::fract(oct.y);
 }
 static v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 7;
 
     v_int2 q = simd::conv<int>(oct);
-    v_int idx00 = ((q.x + 0) & 7) | ((q.y + 0) & 7) << 3;
-    v_int idx01 = ((q.x + 0) & 7) | ((q.y + 1) & 7) << 3;
-    v_int idx10 = ((q.x + 1) & 7) | ((q.y + 0) & 7) << 3;
-    v_int idx11 = ((q.x + 1) & 7) | ((q.y + 1) & 7) << 3;
+    v_uint d00 = v_uint(((q.x + 0) & 7) | ((q.y + 0) & 7) << 3);
+    v_uint d10 = v_uint(((q.x + 1) & 7) | ((q.y + 0) & 7) << 3);
+    v_uint d01 = v_uint(((q.x + 0) & 7) | ((q.y + 1) & 7) << 3);
+    v_uint d11 = v_uint(((q.x + 1) & 7) | ((q.y + 1) & 7) << 3);
 
-    v_float3 d00 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx00));
-    v_float3 d10 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx10));
-    v_float3 d01 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx01));
-    v_float3 d11 = swr::pixfmt::R11G11B10f::Unpack(simd::gather(field.Irradiance[0], probeIdx * 64 + idx11));
+#if 1
+    simd_foreach_unique_lane(i, probeIdx, true) {
+        simd::cmov(d00, simd::gather_preload64(field.Irradiance[i], d00), v_exec);
+        simd::cmov(d10, simd::gather_preload64(field.Irradiance[i], d10), v_exec);
+        simd::cmov(d01, simd::gather_preload64(field.Irradiance[i], d01), v_exec);
+        simd::cmov(d11, simd::gather_preload64(field.Irradiance[i], d11), v_exec);
+    }
+#else
+    d00 = simd::gather(field.Irradiance[0], probeIdx * 64 + d00);
+    d10 = simd::gather(field.Irradiance[0], probeIdx * 64 + d10);
+    d01 = simd::gather(field.Irradiance[0], probeIdx * 64 + d01);
+    d11 = simd::gather(field.Irradiance[0], probeIdx * 64 + d11);
+#endif
+    v_float3 v00 = swr::pixfmt::R11G11B10f::Unpack(d00);
+    v_float3 v10 = swr::pixfmt::R11G11B10f::Unpack(d10);
+    v_float3 A = v00 + (v10 - v00) * simd::fract(oct.x);
 
-    v_float3 A = d00 + (d10 - d00) * simd::fract(oct.x);
-    v_float3 B = d01 + (d11 - d01) * simd::fract(oct.x);
+    v_float3 v01 = swr::pixfmt::R11G11B10f::Unpack(d01);
+    v_float3 v11 = swr::pixfmt::R11G11B10f::Unpack(d11);
+    v_float3 B = v01 + (v11 - v01) * simd::fract(oct.x);
     return A + (B - A) * simd::fract(oct.y);
 }
 
@@ -562,22 +585,13 @@ static v_float3 Tonemap_Unreal(v_float3 x) {
     // Gamma 2.2 correction is baked in, don't use with sRGB conversion!
     return x / (x + 0.155) * 1.019;
 }
-
-// https://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences
-static v_float DitherRoberts(v_float2 pos) {
-    v_float r = simd::fract(pos.x * 0.7548776662 + pos.y * 0.56984029);
-    return simd::abs(r * 2.0 - 1.0);
+static v_float3 TonemapInv_Unreal(v_float3 x) {
+    x /= 1.019;
+    return (x * 0.155) / (1.0 - x);
 }
 
-// Standard "source over" alpha blending. Not gamma correct.
-static v_uint AlphaBlendU8(v_uint bg, v_uint fg) {
-    v_uint t = (fg >> 1) & 0x7F80'0000;
-    t |= (t >> 16) | 0x0040'0040;
-
-    v_uint rb = simd::lerp16((bg >> 0 & 0x00FF'00FF), (fg >> 0 & 0x00FF'00FF), t);
-    v_uint ag = simd::lerp16((bg >> 8 & 0x00FF'00FF), (fg >> 8 & 0x00FF'00FF), t);
-    return rb | (ag << 8);
-}
+// Most of the framebuffer iteration code assumes 4x4 tiles with 16-wide vectors
+static_assert(simd::vec_width == 16);
 
 void ShadingContext::Resolve(swr::Rasterizer& raster) {
     assert(Instances[0].Meshlets == nullptr);  // 0th instance id must be reserved for "null"
@@ -593,32 +607,6 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
     raster.DispatchGroups(fbSize, GroupSize, [&](uint4 groupRect) {
         v_float lumaSum = 1e-7;
 
-        v_uint3 surfaceData[(GroupSize * GroupSize) / simd::vec_width];
-        uint32_t surfaceDataOffset = 0;
-
-        for (uint32_t y = groupRect.y; y < groupRect.w; y += 4) {
-            uint32_t tileOffset = ColorBuffer->GetTexelOffset(groupRect.x, y, 0);
-
-            for (uint32_t x = groupRect.x; x < groupRect.z; x += 4, tileOffset += 16) {
-                v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets;
-                v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
-
-                // TODO: https://filmicworlds.com/blog/decoupled-visibility-multisampling/
-                // TODO: could we also do some sort of VRS here?
-                v_uint surfaceId = simd::load(&ColorBuffer->Data[tileOffset]);
-                SurfaceAttribs surf = ResolveSurface(*this, surfaceId, screenNdc, fbSize);
-
-                v_int3 qnorm = simd::conv<int>(surf.Normal * 511.5 + 511.5);
-                surfaceData[surfaceDataOffset++] = {
-                    surf.Albedo, surf.PackedNMR,
-                    v_uint(qnorm.x | qnorm.y << 10 | qnorm.z << 20),
-                };
-            }
-        }
-
-        // TODO: half-res shadow + probe sample (+ SSAO/GTAO?)
-
-        surfaceDataOffset = 0;
         for (uint32_t y = groupRect.y; y < groupRect.w; y += 4) {
             uint32_t tileOffset = ColorBuffer->GetTexelOffset(groupRect.x, y, 0);
 
@@ -631,20 +619,25 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
                 v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
                 v_float3 finalColor = 0;
 
-                v_uint3 packedSurf = surfaceData[surfaceDataOffset++];
-
                 if (simd::any(!skyMask)) {
-                    SurfaceAttribs surf = {
-                        .Albedo = packedSurf.x,
-                        .Normal = simd::normalize(swr::pixfmt::RGB10u::Unpack(packedSurf.z) * 2.0f - 1.0f),
-                        .Metallic = simd::conv<float>(packedSurf.y >> 16 & 255) / 255.0f,
-                        .Roughness = simd::conv<float>(packedSurf.y >> 24 & 255) / 255.0f,
-                    };
-                    v_float3 irradiance = Lights[0].Intensity * 0.01f;
+                    // TODO: https://filmicworlds.com/blog/software-vrs-with-visibility-buffer-rendering/
+                    v_uint surfaceId = simd::load(&ColorBuffer->Data[tileOffset]);
+                    SurfaceAttribs surf = ResolveSurface(*this, surfaceId, screenNdc, fbSize);
+
+                    v_float3 irradiance = 0;
+                    v_float shadowMask = 1;
+
                     if (ProbeField != nullptr) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, simd::normalize(ViewPos - worldPos));
+                    } else {
+                        // ambient hack
+                        v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
+                        irradiance = Lights[0].Intensity * 0.02f * (NdotL * NdotL + 0.2);
                     }
-                    finalColor = EvalLighting(*this, surf, worldPos, irradiance, int3(x, y, 0), 8);
+                    if (ShadowDepthMap != nullptr) {
+                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+                    }
+                    finalColor = EvalLighting(*this, surf, worldPos, irradiance, shadowMask);
                 }
                 if (simd::any(skyMask) && SkyboxTex != nullptr) {
                     v_float3 skyColor = SkyboxTex->SampleOctLevel<EnvSampler>(worldPos - ViewPos, 1);
@@ -667,8 +660,171 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
             __atomic_fetch_add(&AutoExp->Hist[bin], 1, __ATOMIC_RELAXED);
         }
     });
+}
 
-    // Draw lights in a kind of shitty way
+constexpr uint32_t ResolveGroupSize = 64;
+
+static v_uint DownSample8x8(const uint32_t* data, uint32_t rowStride, v_uint quadOffset) {
+    v_uint v00 = simd::load(&data[0]);
+    v_uint v10 = simd::load(&data[16]);
+    v_uint v01 = simd::load(&data[0 + rowStride]);
+    v_uint v11 = simd::load(&data[16 + rowStride]);
+
+    constexpr v_uint ix00 = { 0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30 };
+    constexpr v_uint iy00 = { 0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27 };
+    v_uint row0 = _mm512_permutex2var_epi32(v00, ix00 + (quadOffset & 1), v10);
+    v_uint row1 = _mm512_permutex2var_epi32(v01, ix00 + (quadOffset & 1), v11);
+    return _mm512_permutex2var_epi32(row0, iy00 + (quadOffset >> 1) * 4, row1);
+}
+static v_uint UpSample8x8(const v_uint* data, uint2 pos) {
+    constexpr uint32_t rowStride = ResolveGroupSize / 8;
+    uint2 tilePos = (pos % ResolveGroupSize) / 8u;
+    data += tilePos.x + tilePos.y * rowStride;
+
+    v_uint v00 = data[0];
+    v_uint v10 = data[16];
+    v_uint v01 = data[0 + rowStride];
+    v_uint v11 = data[16 + rowStride];
+
+    v_uint x = pos.x + (simd::lane_idx<v_uint> & 3);
+    v_uint y = pos.y + (simd::lane_idx<v_uint> >> 2);
+    x /= 2, y /= 2;
+    v_uint idx = (x & 3) + (y & 3) * 4;
+    return _mm512_permutexvar_epi32(idx, v00);
+}
+
+void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
+    assert(Instances[0].Meshlets == nullptr);  // 0th instance id must be reserved for "null"
+
+    uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
+    float4x4 invProj = glm::inverse(WorldToClipMat);
+
+    float2 scaleNdc = 2.0f / float2(fbSize);
+    float2 centerNdc = 0.5f * scaleNdc - 1.0f;
+
+    constexpr uint32_t TilesPerGroup = (ResolveGroupSize * ResolveGroupSize) / simd::vec_width;
+
+    raster.DispatchGroups(fbSize, ResolveGroupSize, [&](uint4 groupRect) {
+        v_float lumaSum = 1e-7;
+
+        v_uint2 surfaceAlbedoMR[TilesPerGroup];
+        v_uint surfaceNormal[TilesPerGroup];
+
+        simd::vec<uint8_t> halfShadowMap[TilesPerGroup / 4];
+        v_uint halfDiffuseMap[TilesPerGroup / 4];
+
+        uint32_t surfaceDataOffset = 0;
+
+        // Vis-buffer resolve
+        for (uint32_t y = groupRect.y; y < groupRect.w; y += 4) {
+            uint32_t tileOffset = ColorBuffer->GetTexelOffset(groupRect.x, y, 0);
+
+            for (uint32_t x = groupRect.x; x < groupRect.z; x += 4, tileOffset += 16) {
+                v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets;
+                v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
+
+                v_uint surfaceId = simd::load(&ColorBuffer->Data[tileOffset]);
+                SurfaceAttribs surf = ResolveSurface(*this, surfaceId, screenNdc, fbSize);
+
+                v_int3 qnorm = simd::conv<int>(surf.Normal * 511.5 + 511.5);
+
+                surfaceAlbedoMR[surfaceDataOffset] = v_uint2(surf.Albedo, surf.PackedNMR);
+                surfaceNormal[surfaceDataOffset] = v_uint(qnorm.x | qnorm.y << 10 | qnorm.z << 20);
+                surfaceDataOffset++;
+            }
+        }
+
+        // Half-res shadow and diffuse
+        for (uint32_t y = groupRect.y; y < groupRect.w; y += 8) {
+            for (uint32_t x = groupRect.x; x < groupRect.z; x += 8) {
+                uint32_t tileOffset = DepthBuffer->GetTexelOffset(x, y, 0);
+                v_float depth = simd::as<v_float>(DownSample8x8(&DepthBuffer->Data[tileOffset], DepthBuffer->Width * 4, 0));
+                if (simd::all(depth <= 0)) continue;
+
+                v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets * 2;
+                v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
+                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, depth, 1.0f))));
+
+                // v_float visibility = SampleShadowMap(*this, worldPos, uint3(x / 2, y / 2, 0), 8);
+
+                uint2 groupTilePos = uint2(x, y) % ResolveGroupSize / 8u;
+                uint32_t groupTileOffset = groupTilePos.x + groupTilePos.y * (ResolveGroupSize / 8);
+                // halfShadowMap[groupTileOffset] = simd::conv<uint8_t>(visibility * 255);
+
+                if (ProbeField != nullptr) {
+                    uint2 groupTilePos = uint2(x, y) % ResolveGroupSize / 4u;
+                    uint32_t groupTileOffset2 = groupTilePos.x + groupTilePos.y * (ResolveGroupSize / 4);
+
+                    v_uint packedNormal = DownSample8x8((uint32_t*)&surfaceNormal[groupTileOffset2], ResolveGroupSize * 4, 0);
+                    v_float3 normal = swr::pixfmt::RGB10u::Unpack(packedNormal) * 2.0f - 1.0f; // don't need to normalize here
+                    v_float3 irradiance = SampleDiffuse(*ProbeField, worldPos, normal, simd::normalize(ViewPos - worldPos));
+
+                    halfDiffuseMap[groupTileOffset] = swr::pixfmt::R11G11B10f::Pack(irradiance);
+                }
+            }
+        }
+
+        // Lighting
+        surfaceDataOffset = 0;
+        for (uint32_t y = groupRect.y; y < groupRect.w; y += 4) {
+            uint32_t tileOffset = ColorBuffer->GetTexelOffset(groupRect.x, y, 0);
+
+            for (uint32_t x = groupRect.x; x < groupRect.z; x += 4, tileOffset += 16, surfaceDataOffset++) {
+                v_float depth = simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
+                v_int skyMask = depth <= 0.0f;
+
+                v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets;
+                v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
+                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
+                v_float3 finalColor = 0;
+
+                if (simd::any(!skyMask)) {
+                    SurfaceAttribs surf = {
+                        .Albedo = surfaceAlbedoMR[surfaceDataOffset].x,
+                        .Normal = simd::normalize(swr::pixfmt::RGB10u::Unpack(surfaceNormal[surfaceDataOffset]) * 2.0f - 1.0f),
+                        .Metallic = simd::conv<float>(surfaceAlbedoMR[surfaceDataOffset].y >> 16 & 255) / 255.0f,
+                        .Roughness = simd::conv<float>(surfaceAlbedoMR[surfaceDataOffset].y >> 24 & 255) / 255.0f,
+                    };
+                    //v_float shadowMask = simd::conv<float>(FbLoadUpsample8x8_U8(halfShadowMap, uint2(x, y))) / 255.0;
+                    v_float shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+
+                    v_float3 irradiance = 0;
+
+                    if (ProbeField != nullptr) {
+                        irradiance = swr::pixfmt::R11G11B10f::Unpack(UpSample8x8(halfDiffuseMap, uint2(x, y)));
+                    } else {
+                        // ambient hack
+                        v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
+                        irradiance = Lights[0].Intensity * 0.02f * (NdotL * NdotL + 0.2);
+                    }
+                    finalColor = EvalLighting(*this, surf, worldPos, irradiance, shadowMask);
+                }
+                if (simd::any(skyMask) && SkyboxTex != nullptr) {
+                    v_float3 skyColor = SkyboxTex->SampleOctLevel<EnvSampler>(worldPos - ViewPos, 1);
+                    simd::cmov(finalColor, skyColor, skyMask);
+                }
+
+                lumaSum += simd::dot(finalColor, v_float3(0.2127, 0.7152, 0.0722));
+                finalColor = Tonemap_Unreal(finalColor * Exposure);
+
+                v_uint packedColor = swr::pixfmt::RGBA8u::Pack({ finalColor, 1.0f });
+                simd::store(&ColorBuffer->Data[tileOffset], packedColor);
+            }
+        }
+        if (AutoExp != nullptr) {
+            uint32_t sampleCount = ((groupRect.z - groupRect.x) * (groupRect.w - groupRect.y)) / simd::vec_width;
+            float lumaAvg = _mm512_reduce_add_ps(simd::approx_log2(lumaSum / sampleCount)) / simd::vec_width;
+
+            float normBin = (lumaAvg - AutoExp->HistRange.x) / (AutoExp->HistRange.y - AutoExp->HistRange.x);
+            int bin = glm::clamp((int)(normBin * AutoExposureData::NumHistBins), 0, AutoExposureData::NumHistBins - 1);
+            __atomic_fetch_add(&AutoExp->Hist[bin], 1, __ATOMIC_RELAXED);
+        }
+    });
+}
+
+void ShadingContext::DrawPointLightsDebug() {
+    uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
+
     for (uint32_t i = 0; i < NumLights; i++) {
         const Light& light = Lights[i];
         if (light.Type == Light::kTypeDirectional) continue;
@@ -680,6 +836,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
         float2 screenPos = float2(clipPos) / clipPos.w;
 
         screenPos = screenPos * 0.5f + 0.5f;
+
         float radius = (glm::max(fbSize.x, fbSize.y) / 30.0f) / clipPos.w;
 
         float2 centerPos = screenPos * float2(fbSize);
@@ -690,22 +847,26 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
             uint32_t tileOffset = ColorBuffer->GetTexelOffset(uint32_t(startTilePos.x), uint32_t(y), 0);
 
             for (int x = startTilePos.x; x < endTilePos.x; x += 4, tileOffset += 16) {
-                v_int depthMask = depth > simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
+                v_float currDepth = simd::load<v_float>(&DepthBuffer->Data[tileOffset]);
 
                 v_int2 tilePos = int2(x, y) + swr::TilePixelOffsets;
-                v_float2 relPos = simd::conv<float>(tilePos) + 0.5f - centerPos;
-                v_float distSq = simd::dot(relPos, relPos) - radius * radius;
+                v_float2 relPos = centerPos - simd::conv<float>(tilePos) + 0.5f;
+                v_float distSq = simd::dot(relPos, relPos);
 
-                if (!simd::any(distSq < 0 && depthMask)) continue;
+                simd_if(depth > currDepth && distSq < radius * radius) {
+                    uint32_t* colorData = &ColorBuffer->Data[tileOffset];
+                    v_float3 currColor = v_float3(swr::pixfmt::RGBA8u::Unpack(simd::load(colorData)));
 
-                uint32_t* colorData = &ColorBuffer->Data[tileOffset];
-                v_uint bgColor = simd::load(colorData);
+                    v_float factor = distSq / (radius * radius);
+                    v_float smoothFactor = simd::max(1.0 - factor * factor, 0.0);
+                    v_float attenuation = (smoothFactor * smoothFactor) * simd::approx_rcp(simd::max(factor * 100, 1e-4));
 
-                v_float a = 1 - (-distSq / (radius * radius));
-                v_uint fgColor = swr::pixfmt::RGBA8u::Pack({ light.Color, 1 - a * a });
-                v_uint finalColor = AlphaBlendU8(bgColor, fgColor);
+                    v_float3 finalColor = TonemapInv_Unreal(currColor);
+                    finalColor += v_float3(light.Color * light.Intensity) * (attenuation * Exposure);
+                    finalColor = Tonemap_Unreal(finalColor);
 
-                simd::store(colorData, depthMask ? finalColor : bgColor);
+                    simd::store(colorData, swr::pixfmt::RGBA8u::Pack({ finalColor, 1 }), v_exec);
+                }
             }
         }
     }
@@ -838,6 +999,7 @@ static bool ProjectSphere(float3 c, float r, float3 proj, float4& bb) {
     return true;
 }
 
+// TODO: two-pass culling - https://medium.com/@mil_kru/two-pass-occlusion-culling-4100edcad501
 uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
                                       float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap) {
     float4 frustumPlanes[6];
@@ -966,7 +1128,7 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
     uint32_t numRays = ProbeField->RaysPerProbe;
     float maxDist = ProbeField->MaxRayDist;
 
-    assert(numRays < MaxRays);
+    assert(numRays < ProbeMaxRays);
 
     // Generate primary rays
     auto rand = simd::XoRandom();
@@ -1066,7 +1228,8 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
                     if (ProbeField->MultiBounce) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
                     }
-                    simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, int3(0), 1), v_exec);
+                    v_float shadowMask = SampleShadowMap(*this, worldPos, uint3(0, 0, 0), 1);
+                    simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, shadowMask), v_exec);
                 }
                 simd_if(isMiss) {
                     constexpr swr::SamplerDesc sampler = { .MagFilter = swr::FilterMode::Nearest, .MinFilter = swr::FilterMode::Nearest };
@@ -1126,8 +1289,7 @@ void ShadingContext::DrawProbesDebug() {
 
     for (uint32_t i = 0; i < GIProbeField::ProbesPerCascade; i++) {
         float3 center = ProbeField->Positions[i];
-
-        float radius = 0.15f;
+        float radius = 0.1f;
 
         float4 clipBounds;
         if (!ProjectSphere(ViewMat * float4(center, 1), radius, projFactors, clipBounds)) continue;

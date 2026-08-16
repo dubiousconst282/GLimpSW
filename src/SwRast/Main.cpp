@@ -25,9 +25,9 @@ namespace {
 
 GLFWwindow* _window;
 
-swr::FramebufferPtr2D<swr::pixfmt::RGBA8u> _colorFb;
-swr::FramebufferPtr2D<swr::pixfmt::R32f> _depthFb;
-swr::FramebufferPtr2D<swr::pixfmt::R32f> _shadowDepthFb;
+swr::FramebufferPtr<swr::pixfmt::RGBA8u> _colorFb;
+swr::FramebufferPtr<swr::pixfmt::R32f> _depthFb;
+swr::FramebufferPtr<swr::pixfmt::R32f> _shadowDepthFb;
 
 std::unique_ptr<swr::Rasterizer> _rast;
 swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
@@ -65,6 +65,7 @@ void CreateFramebuffer(uint32_t width, uint32_t height) {
     _fbTexture = CreateTexture(_colorFb->Width, _colorFb->Height, 1, GL_RGBA8);
 }
 void LoadScene(const std::string& path) {
+    ZoneScoped;
     _scene = std::make_unique<Scene>();
     _scene->ImportGltf(path);
 
@@ -83,6 +84,7 @@ void LoadScene(const std::string& path) {
     _brickmap->VoxelizeScene(*_scene, float3(0));
 }
 void LoadSkybox(const std::string& path) {
+    ZoneScoped;
     _skyboxTex = swr::texutil::LoadOctahedronFromPanoramaHDR(path.c_str()); //
 }
 
@@ -260,10 +262,12 @@ void RenderFrame() {
     ImGui::SeparatorText("Renderer");
 
     static bool s_OcclusionCulling = true;
-    static bool s_EnableDDGI = true;
+    static bool s_EnableDDGI = false;
+    static bool s_EnableShadows = false;
     static bool s_DrawProbes = true;
     ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
     ImGui::Checkbox("DDGI", &s_EnableDDGI);
+    ImGui::Checkbox("Shadows", &s_EnableShadows);
     ImGui::Checkbox("Draw Probes", &s_DrawProbes);
 
     static DebugLayer s_DebugView = DebugLayer::None;
@@ -332,12 +336,12 @@ void RenderFrame() {
 
     Light* sunLight = _scene->Lights[0].Type == Light::kTypeDirectional ? &_scene->Lights[0] : nullptr;
 
-    if (sunLight != nullptr) {
+    if (sunLight != nullptr && s_EnableShadows) {
         ZoneScopedN("ShadowMap");
         SWR_PERF_BEGIN(ShadowRender);
 
         float3 dir = sunLight->Direction;
-        float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
+        static float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
         if (ImGui::DragFloat2("Sun angle", &angle.x, 0.01f)) {
             float r = cosf(angle.y);
             sunLight->Direction = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
@@ -397,10 +401,18 @@ void RenderFrame() {
     shader.DepthBuffer = _depthFb.get();
     shader.Instances = instances.data();
 
+    static bool s_HalfRes = true;
+    ImGui::Checkbox("Half Res Resolve", &s_HalfRes);
+
     if (s_DebugView == DebugLayer::None) {
         ZoneScopedN("Resolve");
 
-        shader.Resolve(*_rast);
+        if (s_HalfRes && s_EnableShadows) {
+            shader.ResolveHalfRes(*_rast);
+        } else {
+            shader.Resolve(*_rast);
+        }
+        shader.DrawPointLightsDebug();
 
         if (autoExposure) {
             s_ExposureData.UpdateExposure(ImGui::GetIO().DeltaTime, 1.1f);
@@ -424,6 +436,8 @@ void RenderFrame() {
     static float skyboxIntensity = 1;
     ImGui::DragFloat("Skybox Intensity", &skyboxIntensity, 0.01, 0.001f, 100.0f);
     shader.SkyboxIntensity = skyboxIntensity;
+
+    if (sunLight) ImGui::DragFloat("Sun Intensity", &sunLight->Intensity, 0.1f, 0, 1000);
 
     ImGui::Checkbox("Multi-Bounce", &_probes->MultiBounce);
     ImGui::Checkbox("Force Update All", &forceUpdateAll);

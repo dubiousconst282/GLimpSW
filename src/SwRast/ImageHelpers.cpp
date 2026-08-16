@@ -135,10 +135,10 @@ struct Downsampler {
 
             constexpr v_uint idx0 = { 0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29 };
             constexpr v_uint idx1 = { 2, 6, 10, 14, 18, 22, 26, 30, 3, 7, 11, 15, 19, 23, 27, 31 };
-            _mm512_store_ps(&dst[0], _mm512_permutex2var_ps(data[0], idx0, data[2]));
-            _mm512_store_ps(&dst[16], _mm512_permutex2var_ps(data[0], idx1, data[2]));
-            _mm512_store_ps(&dst[32], _mm512_permutex2var_ps(data[1], idx0, data[3]));
-            _mm512_store_ps(&dst[48], _mm512_permutex2var_ps(data[1], idx1, data[3]));
+            _mm512_stream_ps(&dst[0], _mm512_permutex2var_ps(data[0], idx0, data[2]));
+            _mm512_stream_ps(&dst[16], _mm512_permutex2var_ps(data[0], idx1, data[2]));
+            _mm512_stream_ps(&dst[32], _mm512_permutex2var_ps(data[1], idx0, data[3]));
+            _mm512_stream_ps(&dst[48], _mm512_permutex2var_ps(data[1], idx1, data[3]));
         } else {
             Dst.WriteTile(data[0], x + 0, y + 0, 0, level);
             Dst.WriteTile(data[1], x + 4, y + 0, 0, level);
@@ -197,7 +197,9 @@ struct Downsampler {
 void texutil::DownsampleDepth(Framebuffer<pixfmt::R32f>& src, Texture2D<pixfmt::R32f>& dest) {
     uint32_t rootLevel = 32 - simd::lzcnt(std::max(src.Width, src.Height));
     v_float r = Downsampler{ src, dest }.ReduceNxN(0, 0, rootLevel);
-    dest.WriteTile(r, 0, 0, 0, rootLevel - 3);
+    if (rootLevel - 3 < dest.MipLevels) {
+        dest.WriteTile(r, 0, 0, 0, rootLevel - 3);
+    }
 }
 
 };  // namespace swr

@@ -98,8 +98,17 @@ struct R32f {
     using UnpackedTy = v_float;
     using LerpedTy = UnpackedTy;
 
-    static v_float Unpack(v_uint packed) { return simd::as<float>(packed); }
-    static v_uint Pack(const v_float& value) { return simd::as<uint32_t>(value); }
+    static v_float Unpack(v_uint packed) { return simd::as<v_float>(packed); }
+    static v_uint Pack(const v_float& value) { return simd::as<v_uint>(value); }
+};
+
+// R x 32-bit uint
+struct R32ui {
+    using UnpackedTy = v_uint;
+    using LerpedTy = UnpackedTy;
+
+    static v_uint Unpack(v_uint packed) { return packed; }
+    static v_uint Pack(const v_uint& value) { return value; }
 };
 
 // RG x 16-bit float
@@ -114,10 +123,8 @@ struct RG16f {
             2,  3,  6,  7,  10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31,  //
             34, 35, 38, 39, 42, 43, 46, 47, 50, 51, 54, 55, 58, 59, 62, 63,
         };
-        // permb is faster than vpmovdw. asm to workaround https://github.com/llvm/llvm-project/issues/160348
-        v_uint split;
-        asm("vpermb %2, %1, %0" : "=v"(split) : "v"(shuf), "v"(packed));
-        // split = _mm512_permutexvar_epi8(shuf, packed);
+        // permb is faster than vpmovdw. uncanon to workaround https://github.com/llvm/llvm-project/issues/160348
+        v_uint split = _mm512_permutexvar_epi8(simd::uncanon(shuf), packed);
 
         return {
             _mm512_cvtph_ps(_mm512_extracti32x8_epi32(split, 0)),
@@ -154,16 +161,15 @@ private:
     // Note that these don't follow denorm/NaN/Inf rules. Only clamping is applied.
     // This code was based on clang's output for the scalar version, as it doesn't seem to optimize the SIMD version well.
     static v_uint PackF11(v_float x) {
-        x = simd::max(x, 1.0f / (1 << 15));
-        x = simd::min(x, 130048.0f); // UnpackF11(2047)
-
-        return (simd::as<uint32_t>(x) >> 17 & 0x3FFF) - 0x1C00;
+        // 0x38000000 = (127 - 15) << 23
+        v_int q = simd::as<v_int>(x);
+        q = simd::clamp(q, 0x38000000, 0x57FC0000);  // 2**-15  ..  130048
+        return v_uint(q - 0x38000000) >> 17;
     }
     static v_uint PackF10(v_float x) {
-        x = simd::max(x, 1.0f / (1 << 15));
-        x = simd::min(x, 129024.0f);  // UnpackF10(1023)
-
-        return (simd::as<uint32_t>(x) >> 18 & 0x1FFF) - 0x0E00;
+        v_int q = simd::as<v_int>(x);
+        q = simd::clamp(q, 0x38000000, 0x47FC0000);  // 2**-15  ..  129024
+        return v_uint(q - 0x38000000) >> 18;
     }
 
     // 5-bit exp, 6-bit mantissa
@@ -172,13 +178,11 @@ private:
         // int frc = x & 0x3F;
         // return (exp - 15 + 127) << 23 | frc << (23 - 6);
 
-        x = x << 17;
-        return simd::as<float>((x & 0x0FFE0000) + 0x38000000);
+        return simd::as<v_float>(((x << 17) & 0x0FFE0000) + 0x38000000);
     }
     // 5-bit exp, 5-bit mantissa
     static v_float UnpackF10(v_uint x) {
-        x = x << 18;
-        return simd::as<float>((x & 0x0FFC0000) + 0x38000000);
+        return simd::as<v_float>(((x << 18) & 0x0FFC0000) + 0x38000000);
     }
 
     // static uint32_t PackFloat(float x, uint32_t fracBits) {
@@ -219,7 +223,7 @@ template<pixfmt::TexelFormat Format>
 using Framebuffer = Texture2D<Format, TextureLayout::TiledX4>;
 
 template<pixfmt::TexelFormat Format>
-using FramebufferPtr2D = TexturePtr2D<Format, TextureLayout::TiledX4>;
+using FramebufferPtr = TexturePtr2D<Format, TextureLayout::TiledX4>;
 
 using RgbaTexture2D = Texture2D<pixfmt::RGBA8u>;
 using HdrTexture2D = Texture2D<pixfmt::R11G11B10f>;
@@ -511,7 +515,9 @@ struct Texture2D {
         offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
 
         // Sample
-        if (filter == FilterMode::Nearest) [[likely]] {
+        if (filter == FilterMode::Linear) [[unlikely]] {
+            return SampleLinear(ix, iy, offset, mipLevel);
+        } else {
             v_uint res = simd::gather(Data, offset + GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, mipLevel));
 
             if constexpr (std::is_same<typename Format::LerpedTy, v_uint>()) {
@@ -520,7 +526,6 @@ struct Texture2D {
                 return Format::Unpack(res);
             }
         }
-        return SampleLinear(ix, iy, offset, mipLevel);
     }
 
     template<SamplerDesc SD>

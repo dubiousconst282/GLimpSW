@@ -73,7 +73,10 @@ struct ShadingContext {
                           float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap);
 
     void Resolve(swr::Rasterizer& raster);
+    void ResolveHalfRes(swr::Rasterizer& raster);
     void ResolveDebug(swr::Rasterizer& raster, DebugLayer layer);
+
+    void DrawPointLightsDebug();
 
     void UpdateProbes(swr::Rasterizer& raster);
     void DrawProbesDebug();
@@ -99,8 +102,8 @@ struct GIProbeField {
     float NormalBias = 0.12;
 
     float3 Positions[ProbesPerCascade];
-    uint32_t Irradiance[ProbesPerCascade][8 * 8];  // R11_G11_B10F
-    uint32_t Depth[ProbesPerCascade][16 * 16];     // 2x float16 (depth, depth²)
+    alignas(64) uint32_t Irradiance[ProbesPerCascade][8 * 8];  // R11_G11_B10F
+    alignas(64) uint32_t Depth[ProbesPerCascade][16 * 16];     // 2x float16 (depth, depth²)
 
     uint8_t SampleCounts[ProbesPerCascade];            // Accumulated updates per probe, used to derive hysteresis
     uint64_t CurrActiveBitmap[ProbesPerCascade / 64];  // Has probe been sampled in the current frame?
@@ -125,7 +128,7 @@ struct AutoExposureData {
         uint32_t histSum = 0, histWeight = 0;
 
         for (uint32_t i = 0; i < NumHistBins; i++) {
-            histSum += i * Hist[i];
+            histSum += (i + 1) * Hist[i];
             histWeight += Hist[i];
         }
         float meanBin = histSum / (float)histWeight - 1;

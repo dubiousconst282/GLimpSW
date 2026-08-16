@@ -182,7 +182,7 @@ SIMD_INLINE T load(const void* ptr) {
     struct [[gnu::packed, gnu::may_alias]] load_buf { T v; };
     return ((const load_buf*)ptr)->v;
 }
-template<typename E, int N = sizeof(__m512) / sizeof(E)>
+template<typename E, int N = vec_width>
 SIMD_INLINE vec<E, N> load(const E* ptr) {
     return load<vec<E, N>>(ptr);
 }
@@ -258,7 +258,7 @@ SIMD_TFN_MASK constexpr bitmask<T> movemask(T mask) {
 }
 template<is_vector T = v_int>
 SIMD_INLINE constexpr mask_vec<T> unmovemask(bitmask<T> mask) {
-    return __builtin_bit_cast(vec<bool, width_of<T>>, mask) ? -1 : 0;
+    return __builtin_bit_cast(vec<bool, width_of<T>>, mask) ? mask_vec<T>(-1u) : 0;
 }
 
 // Checks if any lane of the given mask vector is true.
@@ -577,9 +577,14 @@ SIMD_INLINE v_uint rotr(v_uint a, int b) { return (a >> b) | (a << (32 - b)); }
 
 // Prevents clang's smart ass from canonicalizing/folding/instcombining the given value.
 template<is_vector T>
-[[gnu::const]] SIMD_INLINE T uncanon(T x) {
-    asm("" : "+v"(x) : :);
+SIMD_INLINE T uncanon(T x) {
+    asm("" : "+v"(x));
     return x;
+}
+// Returns mask in a k-mask register.
+SIMD_INLINE v_mask uncanon_kreg(v_mask mask) {
+    asm("" : "+Yk"(mask));
+    return mask;
 }
 
 struct AlignedDeleter {
@@ -671,21 +676,42 @@ private:
     }
 };
 
+template<is_vector T> requires(sizeof(elem_type<T>) == 4)
+struct UniqueLaneIter {
+    T SrcVec;
+    v_mask PendingMask;
+
+    SIMD_INLINE bool Next(v_int& activeMask, elem_type<T>& laneValue) {
+        if (PendingMask == 0) return false;
+
+        // kmovd  eax, k1
+        // tzcnt  eax, eax
+        v_mask pendingMask = uncanon_kreg(PendingMask);
+        volatile auto* lanePtr = &((elem_type<T>*)&SrcVec)[simd::tzcnt(pendingMask)];
+
+        // vpcmpeqd k2 {k1}, zmm0, dword ptr [rsp + 4*rax + 0x600]{1to16}
+        // mov    r10d, dword ptr [rsp + 4*rax + 0x600]
+        v_mask k_active = _mm512_mask_cmpeq_epi32_mask(pendingMask, SrcVec, _mm512_set1_epi32((int)*lanePtr));
+        activeMask = _mm512_movm_epi32(k_active);
+        laneValue = *lanePtr;
+
+        // kxorw  k1, k1, k2
+        // kortestw k1, k1
+        // jne    .Loop
+        PendingMask = uncanon_kreg(pendingMask ^ k_active);
+        return true;
+    }
+};
+
 };  // namespace simd
 
 //////////////////////////////////////// Questionable Utility Macros ////////////////////////////////////////
 
 constexpr v_int v_exec = -1;
 
-// Notes:
-// - Widening mask to uint32 saves redundant trunc/moves
-// - Ptr cast avoids redundant re-spills, https://github.com/llvm/llvm-project/issues/190725)
-#define simd_foreach_unique_lane(lane, vec, cond)                                   \
-    if (v_int v__prev_exec = v_exec && (cond), v_exec; true)                        \
-        if (simd::elem_type<decltype(vec)> lane; true)                              \
-            for (uint32_t v_pending_exec = simd::movemask(v__prev_exec);            \
-                 (lane = ((decltype(lane)*)&vec)[simd::tzcnt(v_pending_exec)], /**/ \
-                  v_exec = v__prev_exec && (vec == lane), v_pending_exec != 0);     \
-                 v_pending_exec ^= simd::movemask(v_exec))
+#define simd_foreach_unique_lane(lane, vec, cond)            \
+    if (v_int v__prev_exec = v_exec && (cond), v_exec; true) \
+        if (simd::elem_type<decltype(vec)> lane; true)       \
+            for (simd::UniqueLaneIter v__iter = { vec, simd::movemask(v__prev_exec) }; v__iter.Next(v_exec, lane);)
 
 #define simd_if(cond) if (v_int v__prev_exec = v_exec, v_exec = v__prev_exec && (cond); simd::any(v_exec))
