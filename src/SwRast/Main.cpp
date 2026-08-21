@@ -6,6 +6,7 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <ImGuizmo.h>
+
 #include <tracy/Tracy.hpp>
 
 #include <nfd.h>
@@ -38,6 +39,9 @@ std::unique_ptr<Scene> _scene;
 swr::HdrTexture2D::Ptr _skyboxTex;
 std::unique_ptr<BrickMap> _brickmap;
 std::unique_ptr<GIProbeField> _probes;
+
+SWR_PERF_DEF_COUNTER(MeshCull);
+SWR_PERF_DEF_COUNTER(FrameElapsed);
 
 GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
     GLuint handle;
@@ -122,11 +126,11 @@ void DrawModel(Model& model, ShadingContext& shader, const swr::ShaderDispatchTa
         for (uint32_t i = 0; i < node.MeshCount; i += batchSize) {
             uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
 
-            SWR_PERF_BEGIN(Culling);
+            SWR_PERF_BEGIN(MeshCull);
             uint32_t visibleCount =
                 shader.CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount, node.GlobalTransform,
                                     float2(_colorFb->Width, _colorFb->Height), enableOcclusionCull ? _prevDepthMap.get() : nullptr);
-            SWR_PERF_END(Culling);
+            SWR_PERF_END(MeshCull);
 
             if (visibleCount > 0) {
                 shader.InstanceMeshlets = &_scene->Meshlets[node.MeshOffset + i];
@@ -316,7 +320,7 @@ void RenderFrame() {
     float4x4 camViewMat = _cam.GetViewMatrix(true);
     float4x4 camProjViewMat = camProjMat * camViewMat;
 
-    SWR_PERF_BEGIN(Frame);
+    SWR_PERF_BEGIN(FrameElapsed);
 
     ShadingContext shader = {
         .ColorBuffer = _colorFb.get(),
@@ -338,7 +342,9 @@ void RenderFrame() {
 
     if (sunLight != nullptr && s_EnableShadows) {
         ZoneScopedN("ShadowMap");
-        SWR_PERF_BEGIN(ShadowRender);
+
+        SWR_PERF_DEF_COUNTER(ShadowElapsed);
+        SWR_PERF_BEGIN(ShadowElapsed);
 
         float3 dir = sunLight->Direction;
         static float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
@@ -369,7 +375,7 @@ void RenderFrame() {
         for (auto& model : _scene->Models) {
             DrawModel(*model, shader, ShadingContext::ShadowGenShader, nullptr, false);
         }
-        SWR_PERF_END(ShadowRender);
+        SWR_PERF_END(ShadowElapsed);
     }
 
     bool debugOverdraw = s_DebugView == DebugLayer::OverdrawPixel || s_DebugView == DebugLayer::OverdrawQuad;
@@ -396,6 +402,7 @@ void RenderFrame() {
         DrawModel(*model, shader, dispatchTable, &instances, s_OcclusionCulling);
     }
 
+    SWR_PERF_DEF_COUNTER(Resolve);
     SWR_PERF_BEGIN(Resolve);
 
     shader.DepthBuffer = _depthFb.get();
@@ -447,9 +454,10 @@ void RenderFrame() {
     if (s_EnableDDGI) {
         ZoneScopedN("ProbeUpdate");
 
-        SWR_PERF_BEGIN(ProbeUpdate);
+        SWR_PERF_DEF_COUNTER(ProbeUpdateElapsed);
+        SWR_PERF_BEGIN(ProbeUpdateElapsed);
         shader.UpdateProbes(*_rast);
-        SWR_PERF_END(ProbeUpdate);
+        SWR_PERF_END(ProbeUpdateElapsed);
 
         if (s_DrawProbes) {
             shader.DrawProbesDebug();
@@ -474,9 +482,10 @@ void RenderFrame() {
 
     if (s_OcclusionCulling) {
         ZoneScopedN("BuildHiZ");
-        SWR_PERF_BEGIN(Culling);
+
+        SWR_PERF_BEGIN(MeshCull);
         swr::texutil::DownsampleDepth(*_depthFb, *_prevDepthMap);
-        SWR_PERF_END(Culling);
+        SWR_PERF_END(MeshCull);
     }
     {
         ZoneScopedN("UploadFrameToGPU");
@@ -496,7 +505,7 @@ void RenderFrame() {
         glDeleteBuffers(1, &pbo);
     }
 
-    SWR_PERF_END(Frame);
+    SWR_PERF_END(FrameElapsed);
 
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
     drawList->AddImage((ImTextureID)_fbTexture, drawList->GetClipRectMin(), drawList->GetClipRectMax(), ImVec2(0, 0), ImVec2(1, 1));
@@ -507,25 +516,26 @@ void RenderFrame() {
     ImGui::SetNextWindowBgAlpha(0.5f);
     ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize);
 
+    swr::perf::EndFrame();
+
+    double frameElapsedAvg = swr::perf::GetAverage("FrameElapsed");
     ImGui::Text("Frame: %.1fms (%.0f FPS), Cull: %.2fms, Resolve: %.2fms",   //
-                swr::perf::GetAverage(swr::PerfCounter::FrameTime) / 1e6,    //
-                1e9 / swr::perf::GetAverage(swr::PerfCounter::FrameTime),    //
-                swr::perf::GetAverage(swr::PerfCounter::CullingTime) / 1e6,  //
-                swr::perf::GetAverage(swr::PerfCounter::ResolveTime) / 1e6);
+                frameElapsedAvg / 1e6,                                       //
+                1e9 / frameElapsedAvg,                                       //
+                swr::perf::GetAverage("MeshCull") / 1e6,  //
+                swr::perf::GetAverage("Resolve") / 1e6);
 
-    ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",         //
-                swr::perf::GetAverage(swr::PerfCounter::DrawTime) / 1e6,             //
-                swr::perf::GetCurrent(swr::PerfCounter::TrianglesRasterized) / 1e3,  //
-                swr::perf::GetCurrent(swr::PerfCounter::TrianglesProcessed) / 1e3,   //
-                swr::perf::GetCurrent(swr::PerfCounter::TrianglesClipped) / 1e3,     //
-                swr::perf::GetCurrent(swr::PerfCounter::BinsFlushed) / 1e3);
+    ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",  //
+                swr::perf::GetAverage("RastTotalElapsed") / 1e6,              //
+                swr::perf::GetCurrent("RastTrisDrawn") / 1e3,                 //
+                swr::perf::GetCurrent("RastTrisProcessed") / 1e3,             //
+                swr::perf::GetCurrent("RastTrisClipped") / 1e3,               //
+                swr::perf::GetCurrent("RastBinsDispatched") / 1e3);
 
-    ImGui::Text("Shadows: %.2fms, Probes: %.2fms",                                //
-                swr::perf::GetAverage(swr::PerfCounter::ShadowRenderTime) / 1e6,  //
-                swr::perf::GetAverage(swr::PerfCounter::ProbeUpdateTime) / 1e6);
+    ImGui::Text("Shadows: %.2fms, Probes: %.2fms",             //
+                swr::perf::GetAverage("ShadowElapsed") / 1e6,  //
+                swr::perf::GetAverage("ProbeUpdateElapsed") / 1e6);
     ImGui::End();
-
-    swr::perf::Reset();
 }
 
 };

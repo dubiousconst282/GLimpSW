@@ -342,41 +342,47 @@ ShaderDispatchTable GetDispatchTable() {
     return d;
 }
 
-enum class PerfCounter {
-    TrianglesProcessed,  // Meshlet primitive count
-    TrianglesRasterized,
-    TrianglesClipped,
-    BinsFlushed,         // Number of bins sent to rasterization
-
-    CullingTime,
-    DrawTime,
-    ResolveTime,
-
-    ProbeUpdateTime,
-    ShadowRenderTime,
-    FrameTime,
-
-    Count_,
-};
-
 namespace perf {
 
-extern uint64_t g_GlobalAccum[];
-extern uint64_t g_RunningAvg[];
-extern thread_local uint64_t g_LocalAccum[];
+constexpr uint32_t SampleHistSize = 32;
 
-inline uint64_t GetCurrent(PerfCounter key) { return g_GlobalAccum[(int)key]; }
-inline uint64_t GetAverage(PerfCounter key) { return g_RunningAvg[(int)key]; }
+struct Counter {
+    const char* Name;
+    int64_t* GlobalAccum;
+    void (*FlushLocalAccum)();
 
-void Reset();
+    int64_t Samples[SampleHistSize];
+};
 
-uint64_t GetTimestamp();
+extern std::vector<Counter> CounterRegistry;
+extern uint32_t FrameNo;
+
+int64_t RegisterCounter(const char* name, int64_t* globalAccum, void (*flushLocalAccum)());
+
+Counter* GetCounter(const char* name);
+
+inline int64_t GetCurrent(const char* name) {
+    Counter* pc = GetCounter(name);
+    return pc ? pc->Samples[FrameNo % SampleHistSize] : 0;
+}
+double GetAverage(const char* name);
+
+void EndFrame();
+
+int64_t GetTimestamp();
 void FlushThreadCounters();
 
 };  // namespace perf
 
-#define SWR_PERF_INC(key, amount) (swr::perf::g_LocalAccum[(int)swr::PerfCounter::key] += amount)
-#define SWR_PERF_BEGIN(key) uint64_t _pc_##key = swr::perf::GetTimestamp()
-#define SWR_PERF_END(key) (swr::perf::g_LocalAccum[(int)swr::PerfCounter::key##Time] += swr::perf::GetTimestamp() - _pc_##key)
+#define SWR_PERF_DEF_COUNTER(name)                                                              \
+    static thread_local int64_t _swr_lpc_##name;                                                \
+    static int64_t _swr_gpc_##name = swr::perf::RegisterCounter(#name, &_swr_gpc_##name, []() { \
+        __atomic_fetch_add(&_swr_gpc_##name, _swr_lpc_##name, __ATOMIC_RELAXED);                \
+        _swr_lpc_##name = 0;                                                                    \
+    });
+
+#define SWR_PERF_INC(name, amount) (_swr_lpc_##name += amount)
+#define SWR_PERF_BEGIN(name) int64_t _swr_ts1_##name = swr::perf::GetTimestamp()
+#define SWR_PERF_END(name) (_swr_lpc_##name += (swr::perf::GetTimestamp() - _swr_ts1_##name))
 
 };  // namespace swr

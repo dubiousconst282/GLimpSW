@@ -6,12 +6,18 @@
 #include <tracy/Tracy.hpp>
 #include <tracy/TracyC.h>
 
-#define TracyCoalescedZoneBegin(ctx, name, color) if (!ctx.active) { TracyCZoneNC(zone, name, color, true); ctx = zone; }
-#define TracyCoalescedZoneEnd(ctx) if (ctx.active) { TracyCZoneEnd(ctx); ctx.active = false; }
+#define TracyZoneSpanBegin(ctx, name, color) if (!ctx.active) { TracyCZoneNC(zone, name, color, true); ctx = zone; }
+#define TracyZoneSpanEnd(ctx) if (ctx.active) { TracyCZoneEnd(ctx); ctx.active = false; }
 
 // #undef assert
 // static void assert_fail(const char* expr) { fprintf(stderr, "Assert failure: %s\n", expr); abort(); }
 // #define assert(expr) ((expr) || (__builtin_debugtrap(), assert_fail(#expr), 0))
+
+SWR_PERF_DEF_COUNTER(RastTrisProcessed);    // Number of input triangles given by mesh shader
+SWR_PERF_DEF_COUNTER(RastTrisDrawn);        // Number of triangles drawn
+SWR_PERF_DEF_COUNTER(RastTrisClipped);      // Number of triangles clipped
+SWR_PERF_DEF_COUNTER(RastBinsDispatched);   // Number of bins covered and dispatched to rasterizer
+SWR_PERF_DEF_COUNTER(RastTotalElapsed);     // Total time spent by rasterizer
 
 namespace swr {
 
@@ -165,7 +171,7 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
             shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
             if (mesh.PrimCount == 0) continue;
 
-            SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
+            SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
 
             for (uint32_t primOffset = 0; primOffset < mesh.PrimCount; primOffset += simd::vec_width) {
                 v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
@@ -232,7 +238,7 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                             uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
                             drawFn(shader.Context, vars, i, boundRect);
                         }
-                        SWR_PERF_INC(TrianglesRasterized, simd::popcnt(drawMask));
+                        SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
                     }
                 }
                 if (cc.AcceptMask != 0) {
@@ -261,7 +267,7 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                         uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
                         drawFn(shader.Context, vars, i, boundRect);
                     }
-                    SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
+                    SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
                 }
             }
         }
@@ -426,7 +432,7 @@ void Clipper::Setup(v_float4 v0, v_float4 v1, v_float4 v2) {
     OutIdx = 0;
 }
 void Clipper::ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode) {
-    SWR_PERF_INC(TrianglesClipped, simd::popcnt(cc.NonTrivialMask));
+    SWR_PERF_INC(RastTrisClipped, simd::popcnt(cc.NonTrivialMask));
 
     for (uint32_t primId : simd::BitIter(cc.NonTrivialMask)) {
         uint8_t indices[32];
@@ -518,11 +524,11 @@ void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
 
 void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     ZoneScoped;
-    SWR_PERF_BEGIN(Draw);
+    SWR_PERF_BEGIN(RastTotalElapsed);
 
     if (!EnableBinning) {
         DrawMeshletsST(meshCount, shader);
-        SWR_PERF_END(Draw);
+        SWR_PERF_END(RastTotalElapsed);
         return;
     }
     float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
@@ -563,7 +569,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
 
             // Fetch another meshlet
             if (nextMeshIdx < meshCount && primOffset >= mesh.PrimCount && !clipPending) {
-                TracyCoalescedZoneBegin(meshZone, "FetchMeshlet", 0x55BB55);
+                TracyZoneSpanBegin(meshZone, "FetchMeshlet", 0x55BB55);
                 isIdle = false;
 
                 meshIdx = nextMeshIdx;
@@ -573,7 +579,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                 shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
                 if (mesh.PrimCount == 0) continue;
 
-                SWR_PERF_INC(TrianglesProcessed, mesh.PrimCount);
+                SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
                 primOffset = 0;
             }
 
@@ -608,7 +614,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                         memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
                         memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                        SWR_PERF_INC(TrianglesRasterized, simd::popcnt(drawMask));
+                        SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
                     }
                     clipPending = true;
                     clipReadOffset = 0;
@@ -623,7 +629,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     acceptMask &= cc.AcceptMask;
                     if (acceptMask == 0) continue;
 
-                    SWR_PERF_INC(TrianglesRasterized, simd::popcnt(acceptMask));
+                    SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
 
                     tris.MeshletId = meshIdx;
                     tris.BasePrimId = primOffset;
@@ -640,7 +646,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                 }
             }
 
-            // Process pending clip primitives
+            // Process pending clipper output
             for (; !batchFull && clipReadOffset < clipper.OutIdx; clipReadOffset += simd::vec_width) {
                 isIdle = false;
 
@@ -660,7 +666,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
 
             // Rasterize
             if (batchFull || isIdle) {
-                TracyCoalescedZoneEnd(meshZone);
+                TracyZoneSpanEnd(meshZone);
                 DBG("Commit m=%d p=%d b=%d", batchMeshCount, nextPacketIdx, batchId % BatchesInFlight);
 
                 // Commit bins
@@ -671,7 +677,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                         uint64_t mask = simd::movemask(counts != 0);
                         _queue->ReadyBitmap[batchId][i / 64u] = mask;
 
-                        SWR_PERF_INC(BinsFlushed, simd::popcnt(mask));
+                        SWR_PERF_INC(RastBinsDispatched, simd::popcnt(mask));
                     }
                     _mm_mfence();
                 }
@@ -708,7 +714,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
         DBG("Exit");
         perf::FlushThreadCounters();
     });
-    SWR_PERF_END(Draw);
+    SWR_PERF_END(RastTotalElapsed);
 
     memset(_queue->BinCounts.get(), 0, _queue->BinCountBatchStride * _queue->NumWorkers * BatchesInFlight);
 }
@@ -732,7 +738,7 @@ void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
         }
         if (batchMask == 0) continue;
 
-        TracyCoalescedZoneBegin(rasterZone, "RasterBin", 0xEE5555);
+        TracyZoneSpanBegin(rasterZone, "RasterBin", 0xEE5555);
 
         for (uint32_t batchId : simd::BitIter(batchMask)) {
             for (uint32_t binMaskOffset : simd::BitIter(binMasks[batchId])) {
@@ -787,7 +793,7 @@ void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
         }
     }
 
-    TracyCoalescedZoneEnd(rasterZone);
+    TracyZoneSpanEnd(rasterZone);
 }
 
 static uint32_t ReduceMin_U16x2(v_uint value, v_mask mask) {
@@ -1020,28 +1026,61 @@ void Barrier::Wait() {
     }
 }
 
-uint64_t perf::g_GlobalAccum[(int)PerfCounter::Count_];
-uint64_t perf::g_RunningAvg[(int)PerfCounter::Count_];
-thread_local uint64_t perf::g_LocalAccum[(int)PerfCounter::Count_];
+std::vector<perf::Counter> perf::CounterRegistry = {};
+uint32_t perf::FrameNo = 0;
 
-uint64_t perf::GetTimestamp() {
-    auto time = std::chrono::high_resolution_clock::now();
-    return (uint64_t)time.time_since_epoch().count();
+static std::vector<void(*)()> CounterLocalFlusherRegistry;
+
+int64_t perf::RegisterCounter(const char* name, int64_t* globalAccum, void (*flushLocalAccum)()) {
+    CounterRegistry.push_back({
+        .Name = name,
+        .GlobalAccum = globalAccum,
+        .FlushLocalAccum = flushLocalAccum,
+    });
+    CounterLocalFlusherRegistry.push_back(flushLocalAccum);
+    return 0;
+}
+
+perf::Counter* perf::GetCounter(const char* name) {
+    for (Counter& counter : CounterRegistry) {
+        if (strcmp(counter.Name, name) == 0) return &counter;
+    }
+    return nullptr;
+}
+double perf::GetAverage(const char* name) {
+    Counter* pc = GetCounter(name);
+    if (!pc) return 0;
+
+    double sum = 0;
+    for (uint32_t i = 0; i < SampleHistSize; i++) {
+        sum += pc->Samples[i];
+    }
+    return sum / SampleHistSize;
+}
+
+void perf::EndFrame() {
+    FrameNo++;
+
+    for (Counter& counter : CounterRegistry) {
+        counter.Samples[FrameNo % SampleHistSize] = *counter.GlobalAccum;
+        *counter.GlobalAccum = 0;
+    }
+}
+
+int64_t perf::GetTimestamp() {
+#ifdef CLOCK_MONOTONIC
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t(ts.tv_sec * 1'000'000'000LL + ts.tv_nsec);
+#else
+    return std::chrono::high_resolution_clock::now().time_since_epoch().count();
+#endif
 }
 
 [[clang::noinline]]
 void perf::FlushThreadCounters() {
-    for (uint32_t i = 0; i < (int)PerfCounter::Count_; i++) {
-        __atomic_fetch_add(&g_GlobalAccum[i], g_LocalAccum[i], __ATOMIC_RELAXED);
-        g_LocalAccum[i] = 0;
-    }
-}
-
-void perf::Reset() {
-    for (uint32_t i = 0; i < (int)PerfCounter::Count_; i++) {
-        const uint64_t a = 95;
-        g_RunningAvg[i] = (g_RunningAvg[i] * a + g_GlobalAccum[i] * (100 - a)) / 100;
-        g_GlobalAccum[i] = 0;
+    for (auto& flusher : CounterLocalFlusherRegistry) {
+        flusher();
     }
 }
 
