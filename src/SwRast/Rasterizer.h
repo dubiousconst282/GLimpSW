@@ -85,6 +85,7 @@ struct TrianglePacket {
     uint8_t VertexId[3][simd::vec_width];
     uint8_t BasePrimId;
     uint8_t FragmentShaderId;
+    uint16_t BackfacingMask;
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
 
@@ -100,12 +101,11 @@ struct TriangleEdgeVars {
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
 
-    v_int Edge0, Edge1, Edge2;  // Start edge distances
-    v_int A01, A12, A20;        // Edge deltas on X axis
-    v_int B01, B12, B20;        // Edge deltas on Y axis
+    v_int3 OriginDist;      // Edge distances at viewport origin
+    v_int3 StepX, StepY;    // Edge increments on X and Y axis
 
-    v_float Z0, Z10, Z20;       // Z0, ((Z1, Z2) - Z0) * rcpArea 
-    v_float W0S, W1S, W2S;      // (W0, W1, W2) * rcpArea
+    v_float Z0, Z10, Z20;   // Z0, ((Z1, Z2) - Z0) * rcpArea
+    v_float W0S, W1S, W2S;  // (W0, W1, W2) * rcpArea
 
     void Setup(const TrianglePacket& tris, int2 vpHalfSize);
 };
@@ -235,9 +235,9 @@ struct Rasterizer {
         size_t offsetIncY = tri.TileStride * 16 - offsetExtentX;
 
         // Barycentric coordinates at start of row
-        v_int3 edgeStepX = v_int3(tri.A12[i], tri.A20[i], tri.A01[i]);
-        v_int3 edgeStepY = v_int3(tri.B12[i], tri.B20[i], tri.B01[i]);
-        v_int3 edgeOrigin = v_int3(tri.Edge0[i], tri.Edge1[i], tri.Edge2[i]);
+        v_int3 edgeStepX = v_int3(tri.StepX.x[i], tri.StepX.y[i], tri.StepX.z[i]);
+        v_int3 edgeStepY = v_int3(tri.StepY.x[i], tri.StepY.y[i], tri.StepY.z[i]);
+        v_int3 edgeOrigin = v_int3(tri.OriginDist.x[i], tri.OriginDist.y[i], tri.OriginDist.z[i]);
         edgeOrigin += edgeStepX * (minX + FragPixelOffsetsX);
         edgeOrigin += edgeStepY * (minY + FragPixelOffsetsY);
 
@@ -283,8 +283,10 @@ struct Rasterizer {
                     v_float rcpW = simd::approx_rcp(w);
                     // Newton-Raphson refinement, prevents some minor wavy/stripe patterns during closeups
                     rcpW *= simd::fma(-w, rcpW, 2.0f);
-                    u *= pw1 * rcpW;
-                    v *= pw2 * rcpW;
+                    // Unfortunately we also need to zap divs by zero to deal with tiny triangles that have almost no area.
+                    // Masking like this keeps some notion of derivatives, in case shader samples textures.
+                    u = w != 0 ? (u * pw1 * rcpW) : u;
+                    v = w != 0 ? (v * pw2 * rcpW) : v;
 
                     if constexpr (IsClipped) {
                         float3 ru = tri.ClipData->ClippedU[i];

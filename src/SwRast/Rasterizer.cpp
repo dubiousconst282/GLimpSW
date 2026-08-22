@@ -281,15 +281,14 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfS
     v1 = simd::perspective_div(v1);
     v2 = simd::perspective_div(v2);
 
-    v_float det = (v2.x - v0.x) * (v1.y - v0.y) - (v0.x - v1.x) * (v0.y - v2.y);
+    BackfacingMask = simd::movemask((v2.x - v0.x) * (v1.y - v0.y) <= (v0.x - v1.x) * (v0.y - v2.y));
 
-    if (cullMode != FaceCullMode::FrontCCW) {
-        v_int flip = (cullMode == FaceCullMode::FrontCW) ? -1 : (det < 0);
-        det = flip ? -det : det;
-    }
+    v_mask visibleMask = v_mask(~0u);
+    if (cullMode == FaceCullMode::FrontCCW) visibleMask = ~BackfacingMask;
+    if (cullMode == FaceCullMode::FrontCW) visibleMask = BackfacingMask;
+
     // Cull backfacing or degenerate triangles
-    v_mask mask = simd::movemask(det > 0);
-    if (mask == 0) return 0;
+    if (visibleMask == 0) return 0;
 
     float2 fixScale = vpHalfSize * 16;
     v_int x0 = simd::round2i(v0.x * fixScale.x), y0 = simd::round2i(v0.y * fixScale.y);
@@ -302,44 +301,51 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfS
 
     // Cull thin triangles covering no samples, or outside viewport (some of them will get here due to guard-band)
     v_uint2 boundBox = GetRenderBoundingBox(vpHalfSize);
-    mask &= _mm512_cmpeq_epi32_mask(_mm512_movm_epi16(_mm512_cmpge_epi16_mask(boundBox.x, boundBox.y)), _mm512_set1_epi32(0));
+    visibleMask &= _mm512_cmpeq_epi32_mask(_mm512_movm_epi16(_mm512_cmpge_epi16_mask(boundBox.x, boundBox.y)), _mm512_set1_epi32(0));
 
     Z0 = v0.z, Z1 = v1.z, Z2 = v2.z;
     W0 = v0.w, W1 = v1.w, W2 = v2.w;
 
-    return mask;
+    return visibleMask;
 }
 
+static v_int2 UnpackS16x2(v_int packed) {
+    // Slightly faster sign ext, https://fgiesen.wordpress.com/2024/10/23/zero-or-sign-extend/
+    //   return x << 16 >> 16;                  2c thr
+    //   return (val ^ sign_bit) - sign_bit;    0.5c thr
+    // Clang can actually get rid of the subtract / embed in following ones, which makes this even faster.
+    v_int x = packed & simd::uncanon<v_int>(0xFFFF);
+    return { (x ^ 0x8000) - 0x8000, packed >> 16 };
+}
 static v_int ComputeEdge(v_int a, v_int x, v_int b, v_int y) {
     v_int w = a * x + b * y;
-    w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1;  // top-left rule bias
+    // w += (a > 0 || (a == 0 && b > 0)) ? 0 : -1;  // top-left rule bias
+    w += ((a == 0 ? b : a) - 1) >> 31;
     return w >> 4;                               // normalize fixed point
 }
 void TriangleEdgeVars::Setup(const TrianglePacket& tris, int2 vpHalfSize) {
-    v_int x0 = tris.Pos0 << 16 >> 16, y0 = tris.Pos0 >> 16;
-    v_int x1 = tris.Pos1 << 16 >> 16, y1 = tris.Pos1 >> 16;
-    v_int x2 = tris.Pos2 << 16 >> 16, y2 = tris.Pos2 >> 16;
+    v_int2 v0 = UnpackS16x2(tris.Pos0);
+    v_int2 v1 = UnpackS16x2(tris.Pos1);
+    v_int2 v2 = UnpackS16x2(tris.Pos2);
+    v_int3 stepX = v_int3(v2.y, v0.y, v1.y) - v_int3(v1.y, v2.y, v0.y);
+    v_int3 stepY = v_int3(v1.x, v2.x, v0.x) - v_int3(v2.x, v0.x, v1.x);
 
-    A01 = y1 - y0, B01 = x0 - x1;
-    A12 = y2 - y1, B12 = x1 - x2;
-    A20 = y0 - y2, B20 = x2 - x0;
-    v_int det = B20 * A01 - B01 * A20;
-
-    if (simd::any(det < 0)) {
-        v_int flip = (det < 0);
-        A01 = flip ? -A01 : A01, B01 = flip ? -B01 : B01;
-        A12 = flip ? -A12 : A12, B12 = flip ? -B12 : B12;
-        A20 = flip ? -A20 : A20, B20 = flip ? -B20 : B20;
-        det = flip ? -det : det;
+    if (tris.BackfacingMask != 0) {
+        v_int flip = simd::unmovemask(tris.BackfacingMask);
+        simd::cmov(stepX, -stepX, flip);
+        simd::cmov(stepY, -stepY, flip);
     }
+    StepX = stepX, StepY = stepY;
 
     // Evaluate edge coeffs at screen origin (0.5, 0.5)
     v_int sampleX = (-vpHalfSize.x << 4) + 8, sampleY = (-vpHalfSize.y << 4) + 8;
-    Edge0 = ComputeEdge(A12, sampleX - x1, B12, sampleY - y1);
-    Edge1 = ComputeEdge(A20, sampleX - x2, B20, sampleY - y2);
-    Edge2 = ComputeEdge(A01, sampleX - x0, B01, sampleY - y0);
+    OriginDist.x = ComputeEdge(StepX.x, sampleX - v1.x, StepY.x, sampleY - v1.y);
+    OriginDist.y = ComputeEdge(StepX.y, sampleX - v2.x, StepY.y, sampleY - v2.y);
+    OriginDist.z = ComputeEdge(StepX.z, sampleX - v0.x, StepY.z, sampleY - v0.y);
 
-    v_float rcpArea = 16.0f / simd::conv<float>(det);
+    v_int det = OriginDist.x + OriginDist.y + OriginDist.z;
+    v_float rcpArea = det != 0 ? 1.0f / simd::conv<float>(det) : 0.0f;
+
     Z0 = tris.Z0;
     Z10 = (tris.Z1 - tris.Z0) * rcpArea;
     Z20 = (tris.Z2 - tris.Z0) * rcpArea;
@@ -832,6 +838,11 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
     uint32_t startX = startBB & 0xFFFF, startY = startBB >> 16;
     uint32_t endX = endBB & 0xFFFF, endY = endBB >> 16;
 
+    // Set `binMinPos > binMaxPos` for inactive tris, so loop cmp is never true.
+    v_int rejectMask = !simd::unmovemask(acceptMask);
+    simd::cmov(binMinPos, 0, rejectMask);
+    simd::cmov(binMaxPos, 0xFFFF'FFFF, rejectMask);
+
     bool underCap = true;
 
     // Fast path for medium triangles (spanning less than 3x3 bins)
@@ -841,7 +852,7 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
 
             for (uint32_t x = startX; x <= endX; x++, packedPos += 1) {
                 v_uint clampedPos = _mm512_min_epi16(_mm512_max_epi16(packedPos, binMinPos), binMaxPos);
-                v_mask mask = simd::movemask(clampedPos == packedPos) & acceptMask;
+                v_mask mask = simd::movemask(clampedPos == packedPos);
 
                 if (mask != 0) {
                     underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
@@ -850,11 +861,11 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
         }
         return underCap;
     }
-    TriangleEdgeVars tri;
-    [[clang::always_inline]] tri.Setup(_queue->PacketPool[packetIdx], _viewHalfSize);
+    TriangleEdgeVars edges;
+    [[clang::always_inline]] edges.Setup(_queue->PacketPool[packetIdx], _viewHalfSize);
 
-    v_int3 edgeStepX = v_int3(tri.A12, tri.A20, tri.A01);
-    v_int3 edgeStepY = v_int3(tri.B12, tri.B20, tri.B01);
+    v_int3 edgeStepX = edges.StepX;
+    v_int3 edgeStepY = edges.StepY;
 
     // Edge offsets at innermost tile corner
     v_int3 edgeOrigin = {
@@ -864,7 +875,7 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
     };
     edgeStepX *= BinSize, edgeStepY *= BinSize;
 
-    edgeOrigin += v_int3(tri.Edge0, tri.Edge1, tri.Edge2);
+    edgeOrigin += edges.OriginDist;
     edgeOrigin += edgeStepX * int(startX);
     edgeOrigin += edgeStepY * int(startY);
 
@@ -875,7 +886,7 @@ bool Rasterizer::DistributeToBins(uint32_t batchId, uint32_t packetIdx, v_mask a
         for (uint32_t x = startX; x <= endX; x++, packedPos += 1) {
             v_int insideTri = (edge.x | edge.y | edge.z) >= 0;
             v_uint clampedPos = _mm512_min_epi16(_mm512_max_epi16(packedPos, binMinPos), binMaxPos);
-            v_mask mask = simd::movemask(insideTri && clampedPos == packedPos) & acceptMask;
+            v_mask mask = simd::movemask(insideTri && clampedPos == packedPos);
 
             if (mask != 0) {
                 underCap &= _queue->InsertBin(batchId, uint2(x, y), packetIdx, mask);
