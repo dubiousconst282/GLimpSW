@@ -94,12 +94,6 @@ struct TrianglePacket {
     v_uint2 GetBoundingBox(int2 vpHalfSize, bool alignToTile) const;
 };
 struct TriangleEdgeVars {
-    uint8_t VertexId[3][simd::vec_width];
-    uint8_t BasePrimId;
-    uint16_t TileStride;
-    uint32_t MeshletId;
-    const TriangleClipData* ClipData = nullptr;
-
     v_int3 OriginDist;      // Edge distances at viewport origin
     v_int3 StepX, StepY;    // Edge increments on X and Y axis
 
@@ -113,7 +107,7 @@ struct ShaderDispatchTable {
     static constexpr uint32_t MaxFragmentEntryPoints = 4;
 
     using MeshFnPtr = void (*)(void* ctx, uint32_t idx, ShadedMeshlet& meshlet);
-    using DrawFnPtr = void (*)(void* ctx, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect);
+    using DrawFnPtr = void (*)(void* ctx, const TrianglePacket& tri, v_mask activeMask, uint64_t boundRect, int2 viewHalfSize);
 
     MeshFnPtr ShadeMeshlet = nullptr;
     DrawFnPtr DrawTriangle[MaxFragmentEntryPoints] = {};
@@ -151,7 +145,6 @@ struct Rasterizer {
     void SetViewport(uint2 size) {
         _viewSize = size;
         _viewHalfSize = size / 2u;
-        _tileStride = size.x / 4;
     }
 
     void DrawMeshlets(uint32_t count, ShaderBinding shader);
@@ -209,8 +202,9 @@ struct Rasterizer {
                 for (uint32_t y = y0; y < y1; y += 4) {
                     for (uint32_t x = x0; x < x1; x += 4) {
                         v_int2 tilePos = v_int2((int)x + FragPixelOffsetsX, (int)y + FragPixelOffsetsY);
-                        v_float2 tileNdc = conv<float>(tilePos) * scaleNdc + centerNdc;
-                        [[clang::noinline]] cb(uint2(x, y), tilePos, tileNdc);
+                        v_float2 tileNdc = simd::conv<float>(tilePos) * scaleNdc + centerNdc;
+                        uint2 baseTilePos = uint2(x, y);
+                        [[clang::noinline]] cb(baseTilePos, tilePos, tileNdc);
                     }
                 }
             }
@@ -221,93 +215,108 @@ struct Rasterizer {
     static constexpr v_int FragPixelOffsetsY = simd::lane_idx<v_int> >> 2;
 
     template<auto FragFn, bool IsClipped>
-    static void DrawTriangle(void* ctx, const TriangleEdgeVars& tri, uint32_t i, uint64_t boundRect) {
-        [[assume(i < simd::vec_width)]];  // avoids masking on vector indexing
+    [[clang::no_stack_protector]]
+    static void DrawTriangles(void* ctx, const TrianglePacket& tri, v_mask activeMask, uint64_t boundRect, int2 viewHalfSize) {
+        TriangleEdgeVars edges;
+        edges.Setup(tri, viewHalfSize);
 
-        uint16_t minX = boundRect >> 0, minY = boundRect >> 16;
-        uint16_t offsetExtentX = boundRect >> 30, offsetExtentY = boundRect >> 46;  // (max - min) / 4 * 16
+        // Late cull for very tiny triangles
+        activeMask &= simd::movemask((edges.OriginDist.x + edges.OriginDist.y + edges.OriginDist.z) >= 0);
+        if (activeMask == 0) return;
 
-        // Using offset for loop control saves 2 registers and a bit of sALU
-        // (unless shader uses `FragVars::TilePos`, which should otherwise be DCE'd)
-        size_t offset = (minX * 4) + (minY * 4) * tri.TileStride;
-        size_t endOffsetY = (minY * 4 + offsetExtentY) * tri.TileStride;
-        size_t offsetIncY = tri.TileStride * 16 - offsetExtentX;
+        v_uint2 boundBox = tri.GetBoundingBox(viewHalfSize, true);
+        v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)(boundRect >> 0)));
+        v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)(boundRect >> 32)));
+        v_uint bbExtent = bbMax - bbMin;
 
-        // Barycentric coordinates at start of row
-        v_int3 edgeStepX = v_int3(tri.StepX.x[i], tri.StepX.y[i], tri.StepX.z[i]);
-        v_int3 edgeStepY = v_int3(tri.StepY.x[i], tri.StepY.y[i], tri.StepY.z[i]);
-        v_int3 edgeOrigin = v_int3(tri.OriginDist.x[i], tri.OriginDist.y[i], tri.OriginDist.z[i]);
-        edgeOrigin += edgeStepX * (minX + FragPixelOffsetsX);
-        edgeOrigin += edgeStepY * (minY + FragPixelOffsetsY);
+        uint32_t tileStride = uint32_t(viewHalfSize.x / 2);
 
-        edgeStepX *= 4, edgeStepY *= 4;
+        for (uint32_t i : simd::BitIter(activeMask)) {
+            uint16_t minX = ((uint32_t*)&bbMin)[i] >> 0, minY = ((uint32_t*)&bbMin)[i] >> 16;
+            uint16_t offsetExtentX = ((uint32_t*)&bbExtent)[i] << 2;
+            uint16_t offsetExtentY = ((uint32_t*)&bbExtent)[i] >> 14;  // (max - min) / 4 * 16
 
-        uint32_t primId = IsClipped ? tri.ClipData->PrimId[i] : i;
+            // Using offset for loop control saves 2 registers and a bit of sALU
+            // (unless shader uses `FragVars::TilePos`, which should otherwise be DCE'd)
+            size_t offset = (minX * 4) + (minY * 4) * tileStride;
+            size_t endOffsetY = (minY * 4 + offsetExtentY) * tileStride;
+            size_t offsetIncY = tileStride * 16 - offsetExtentX;
 
-        FragmentVars vars = {
-            .MeshletId = tri.MeshletId,
-            .PrimId = uint8_t(tri.BasePrimId + primId),
-            .VertexId = { tri.VertexId[0][primId], tri.VertexId[1][primId], tri.VertexId[2][primId] },
-            .TilePos = uint2(minX, minY),
-        };
+            // Barycentric coordinates at start of row
+            v_int3 edgeStepX = v_int3(edges.StepX.x[i], edges.StepX.y[i], edges.StepX.z[i]);
+            v_int3 edgeStepY = v_int3(edges.StepY.x[i], edges.StepY.y[i], edges.StepY.z[i]);
+            v_int3 edgeOrigin = v_int3(edges.OriginDist.x[i], edges.OriginDist.y[i], edges.OriginDist.z[i]);
+            edgeOrigin += edgeStepX * (minX + FragPixelOffsetsX);
+            edgeOrigin += edgeStepY * (minY + FragPixelOffsetsY);
 
-        [[assume(offset < endOffsetY)]];  // avoids redundant early bounds check
+            edgeStepX *= 4, edgeStepY *= 4;
 
-        for (; offset < endOffsetY; offset += offsetIncY, vars.TilePos.y += 4) {
-            v_int3 edge = edgeOrigin;
+            uint32_t primId = IsClipped ? tri.ClipData->PrimId[i] : i;
 
-            vars.TilePos.x = minX;
-            size_t endOffsetX = offset + offsetExtentX;
-            [[assume(offset < endOffsetX)]];
+            FragmentVars vars = {
+                .MeshletId = tri.MeshletId,
+                .PrimId = uint8_t(tri.BasePrimId + primId),
+                .VertexId = { tri.VertexId[0][primId], tri.VertexId[1][primId], tri.VertexId[2][primId] },
+                .TilePos = uint2(minX, minY),
+            };
 
-            for (; offset < endOffsetX; offset += 16, vars.TilePos.x += 4) {
-                // v_mask tileMask = simd::movemask((a | b | c) >= 0); // llvm hoists const(-1) into extra zmm register
-                v_mask tileMask = _mm512_movepi32_mask(
-                    _mm512_ternarylogic_epi32(edge.x, edge.y, edge.z, ~(_MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C)));
+            [[assume(offset < endOffsetY)]];  // avoids redundant early bounds check
 
-                if (tileMask != 0) {
-                    v_float u = simd::conv<float>(edge.y);
-                    v_float v = simd::conv<float>(edge.z);
+            for (; offset < endOffsetY; offset += offsetIncY, vars.TilePos.y += 4) {
+                v_int3 edge = edgeOrigin;
 
-                    vars.Depth = simd::fma(u, tri.Z10[i], simd::fma(v, tri.Z20[i], tri.Z0[i]));
-                    vars.TileOffset = offset;
-                    vars.TileMask = tileMask;
+                vars.TilePos.x = minX;
+                size_t endOffsetX = offset + offsetExtentX;
+                [[assume(offset < endOffsetX)]];
 
-                    // Perspective correction - https://stackoverflow.com/a/24460895
-                    // (Relying on code motion to move this after depth-test branch in shader, flaky.)
-                    v_float pw0 = tri.W0S[i] * simd::conv<float>(edge.x);
-                    v_float pw1 = tri.W1S[i];  // (1/area) is baked in!
-                    v_float pw2 = tri.W2S[i];
-                    v_float w = simd::fma(u, pw1, simd::fma(v, pw2, pw0));
-                    v_float rcpW = simd::approx_rcp(w);
-                    // Newton-Raphson refinement, prevents some minor wavy/stripe patterns during closeups
-                    rcpW *= simd::fma(-w, rcpW, 2.0f);
-                    // Unfortunately we also need to zap divs by zero to deal with tiny triangles that have almost no area.
-                    // Masking like this keeps some notion of derivatives, in case shader samples textures.
-                    u = w != 0 ? (u * pw1 * rcpW) : u;
-                    v = w != 0 ? (v * pw2 * rcpW) : v;
+                for (; offset < endOffsetX; offset += 16, vars.TilePos.x += 4) {
+                    // v_mask tileMask = simd::movemask((a | b | c) >= 0); // llvm hoists const(-1) into extra zmm register
+                    v_mask tileMask = _mm512_movepi32_mask(
+                        _mm512_ternarylogic_epi32(edge.x, edge.y, edge.z, ~(_MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C)));
 
-                    if constexpr (IsClipped) {
-                        float3 ru = tri.ClipData->ClippedU[i];
-                        float3 rv = tri.ClipData->ClippedV[i];
-                        v_float cu = simd::fma(u, ru.y, simd::fma(v, ru.z, ru.x));
-                        v_float cv = simd::fma(u, rv.y, simd::fma(v, rv.z, rv.x));
-                        u = cu, v = cv;
+                    if (tileMask != 0) {
+                        v_float u = simd::conv<float>(edge.y);
+                        v_float v = simd::conv<float>(edge.z);
+
+                        vars.Depth = simd::fma(v, edges.Z20[i], simd::fma(u, edges.Z10[i], edges.Z0[i]));
+                        vars.TileOffset = offset;
+                        vars.TileMask = tileMask;
+
+                        // Perspective correction - https://stackoverflow.com/a/24460895
+                        // (Relying on code motion to move this after depth-test branch in shader, flaky.)
+                        v_float pw0 = edges.W0S[i] * simd::conv<float>(edge.x);
+                        v_float pw1 = edges.W1S[i];  // (1/area) is baked in!
+                        v_float pw2 = edges.W2S[i];
+                        v_float w = simd::fma(u, pw1, simd::fma(v, pw2, pw0));
+                        v_float rcpW = simd::approx_rcp(w);
+                        // Newton-Raphson refinement, prevents some minor wavy/stripe patterns during closeups
+                        rcpW *= simd::fma(-w, rcpW, 2.0f);
+                        // Unfortunately we also need to zap divs by zero to deal with tiny triangles that have almost no area.
+                        // Masking like this keeps some notion of derivatives, in case shader samples textures.
+                        u = w != 0 ? (u * pw1 * rcpW) : u;
+                        v = w != 0 ? (v * pw2 * rcpW) : v;
+
+                        if constexpr (IsClipped) {
+                            float3 ru = tri.ClipData->ClippedU[i];
+                            float3 rv = tri.ClipData->ClippedV[i];
+                            v_float cu = simd::fma(u, ru.y, simd::fma(v, ru.z, ru.x));
+                            v_float cv = simd::fma(u, rv.y, simd::fma(v, rv.z, rv.x));
+                            u = cu, v = cv;
+                        }
+                        vars.Bary = { 1 - u - v, u, v };
+
+                        using TContext = decltype(ShaderDispatchTable::GetContextType(FragFn));
+                        [[clang::always_inline]] FragFn(*(TContext*)ctx, vars);
                     }
-                    vars.Bary = { 1 - u - v, u, v };
-
-                    using TContext = decltype(ShaderDispatchTable::GetContextType(FragFn));
-                    [[clang::always_inline]] FragFn(*(TContext*)ctx, vars);
+                    edge += edgeStepX;
                 }
-                edge += edgeStepX;
+                edgeOrigin += edgeStepY;
             }
-            edgeOrigin += edgeStepY;
         }
     }
 
 private:
     uint2 _viewSize, _viewHalfSize;
-    uint32_t _tileStride;
     std::unique_ptr<BinQueue> _queue;
     std::unique_ptr<ThreadedRunner> _runner;
 
@@ -329,8 +338,8 @@ ShaderDispatchTable GetDispatchTable() {
     static_assert((std::is_invocable_v<decltype(FragFn), TContext&, FragmentVars&> && ...));
     static_assert(numEP < ShaderDispatchTable::MaxFragmentEntryPoints);
 
-    DrawFnPtr drawFns[] = { &Rasterizer::DrawTriangle<FragFn, false>... };
-    DrawFnPtr drawClippedFns[] = { &Rasterizer::DrawTriangle<FragFn, true>... };
+    DrawFnPtr drawFns[] = { &Rasterizer::DrawTriangles<FragFn, false>... };
+    DrawFnPtr drawClippedFns[] = { &Rasterizer::DrawTriangles<FragFn, true>... };
 
     ShaderDispatchTable d;
     d.ShadeMeshlet = (ShaderDispatchTable::MeshFnPtr)MeshFn;

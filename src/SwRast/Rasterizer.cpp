@@ -217,27 +217,17 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                         TrianglePacket& tris = clipper.OutTris[i / simd::vec_width];
                         v_mask drawMask = clipper.OutMasks[i / simd::vec_width];
 
-                        TriangleEdgeVars vars;
-                        vars.Setup(tris, _viewHalfSize);
+                        tris.MeshletId = meshIdx;
+                        tris.BasePrimId = primOffset;
+                        tris.ClipData = tris.ClipData;
 
-                        vars.MeshletId = meshIdx;
-                        vars.BasePrimId = primOffset;
-                        vars.TileStride = _tileStride;
-                        vars.ClipData = tris.ClipData;
-
-                        memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                        memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                        memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
-
-                        v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
-                        v_uint extent = boundBox.y - boundBox.x;
+                        memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                        memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                        memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
                         auto drawFn = shader.Dispatch.DrawClippedTriangle[mesh.FragmentShaderId];
+                        drawFn(shader.Context, tris, drawMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
 
-                        for (uint32_t i : simd::BitIter(drawMask)) {
-                            uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                            drawFn(shader.Context, vars, i, boundRect);
-                        }
                         SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
                     }
                 }
@@ -247,26 +237,15 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                     acceptMask &= cc.AcceptMask;
                     if (acceptMask == 0) continue;
 
-                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
-                    v_uint extent = boundBox.y - boundBox.x;
-
-                    TriangleEdgeVars vars;
-                    vars.Setup(tris, _viewHalfSize);
-
-                    vars.MeshletId = meshIdx;
-                    vars.BasePrimId = primOffset;
-                    vars.TileStride = _tileStride;
-
-                    memcpy(vars.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                    memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                    memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
+                    tris.MeshletId = meshIdx;
+                    tris.BasePrimId = primOffset;
+                    memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                    memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                    memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
                     auto drawFn = shader.Dispatch.DrawTriangle[mesh.FragmentShaderId];
+                    drawFn(shader.Context, tris, acceptMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
 
-                    for (uint32_t i : simd::BitIter(acceptMask)) {
-                        uint64_t boundRect = ((uint32_t*)&boundBox.x)[i] | uint64_t(((uint32_t*)&extent)[i]) << 32;
-                        drawFn(shader.Context, vars, i, boundRect);
-                    }
                     SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
                 }
             }
@@ -746,49 +725,25 @@ void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
             for (uint32_t binMaskOffset : simd::BitIter(binMasks[batchId])) {
                 uint32_t binId = binChunkOffset + binMaskOffset;
 
-                // volatile prevents clang from hoisting broadcastd pointlessly - https://github.com/llvm/llvm-project/issues/120015
                 uint32_t binY = (binId * _queue->BinsPerRowRcp) >> 32;
                 uint32_t binX = binId - binY * _queue->BinGridSize.x;
-                volatile uint32_t binPosMin = (binX | binY << 16) * BinSize;
-                volatile uint32_t binPosMax = binPosMin + (BinSize * 0x0001'0001);
 
-                uint8_t count = _queue->BinCounts[batchId * _queue->BinCountBatchStride + binId];
+                uint32_t binPosMin = (binX | binY << 16) * BinSize;
+                uint32_t binPosMax = binPosMin + (BinSize * 0x0001'0001);
+                uint64_t binRect = binPosMin | uint64_t(binPosMax) << 32;
+
+                uint32_t count = _queue->BinCounts[batchId * _queue->BinCountBatchStride + binId];
                 uint32_t* ids = _queue->BinPool[batchId * _queue->BinsPerFrame + binId].Ids;
 
                 for (uint32_t i = 0; i < count; i++) {
                     TrianglePacket& tris = _queue->PacketPool[ids[i] >> 16];
                     v_mask acceptMask = v_mask(ids[i] & 0xFFFF);
 
-                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
-                    v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)binPosMin));
-                    v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)binPosMax));
-                    v_uint bbExtent = bbMax - bbMin;
-
-                    TriangleEdgeVars edges;
-                    edges.Setup(tris, _viewHalfSize);
-
-                    memcpy(edges.VertexId, tris.VertexId, sizeof(edges.VertexId));
-                    edges.BasePrimId = tris.BasePrimId;
-                    edges.TileStride = _tileStride;
-                    edges.MeshletId = tris.MeshletId;
-                    edges.ClipData = tris.ClipData;
-
-                    {
-                        v_uint x0 = bbMin & 0xFFFF, y0 = bbMin >> 16;
-                        v_uint x1 = bbMax & 0xFFFF, y1 = bbMax >> 16;
-                        assert((simd::movemask(x0 > x1 || y0 > y1) & acceptMask) == 0);
-                    }
-
                     auto drawFn = shader.Dispatch.DrawTriangle[tris.FragmentShaderId];
-                    if (tris.ClipData != nullptr) {
+                    if (tris.ClipData != nullptr) [[unlikely]] {
                         drawFn = shader.Dispatch.DrawClippedTriangle[tris.FragmentShaderId];
                     }
-
-                    for (uint32_t j : simd::BitIter(acceptMask)) {
-                        // clang sometimes emits full vector reload when indexing (only for local vars?)
-                        uint64_t boundRect = ((uint32_t*)&bbMin)[j] | (uint64_t)((uint32_t*)&bbExtent)[j] << 32;
-                        drawFn(shader.Context, edges, j, boundRect);
-                    }
+                    drawFn(shader.Context, tris, acceptMask, binRect, _viewHalfSize);
                 }
             }
             __atomic_fetch_and(&_queue->ReadyBitmap[batchId][binChunkOffset / 64u], ~binMasks[batchId], __ATOMIC_RELAXED);
@@ -903,6 +858,7 @@ bool BinQueue::InsertBin(uint32_t batchId, uint2 binPos, uint32_t packetIdx, v_m
     assert(count < MaxPacketsPerBin);
     static_assert(simd::vec_width <= 16);
     static_assert(MaxPacketsPerBatch * MaxRasterBinWorkers < UINT16_MAX);
+    static_assert(MaxPacketsPerBin < UINT8_MAX);
 
     ids[count] = (packetIdx << 16) | mask;
     return count < MaxPacketsPerBin;
