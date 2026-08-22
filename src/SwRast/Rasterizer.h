@@ -91,8 +91,7 @@ struct TrianglePacket {
 
     v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfSize, FaceCullMode cullMode);
 
-    v_int2 GetBoundingBox() const;
-    v_uint2 GetRenderBoundingBox(int2 vpHalfSize) const;
+    v_uint2 GetBoundingBox(int2 vpHalfSize, bool alignToTile) const;
 };
 struct TriangleEdgeVars {
     uint8_t VertexId[3][simd::vec_width];

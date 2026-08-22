@@ -229,7 +229,7 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                         memcpy(vars.VertexId[1], &mesh.Indices[1][primOffset], 16);
                         memcpy(vars.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                        v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
+                        v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
                         v_uint extent = boundBox.y - boundBox.x;
 
                         auto drawFn = shader.Dispatch.DrawClippedTriangle[mesh.FragmentShaderId];
@@ -247,7 +247,7 @@ void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
                     acceptMask &= cc.AcceptMask;
                     if (acceptMask == 0) continue;
 
-                    v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
+                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
                     v_uint extent = boundBox.y - boundBox.x;
 
                     TriangleEdgeVars vars;
@@ -300,7 +300,7 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfS
     Pos2 = (x2 & 0xFFFF) | (y2 << 16);
 
     // Cull thin triangles covering no samples, or outside viewport (some of them will get here due to guard-band)
-    v_uint2 boundBox = GetRenderBoundingBox(vpHalfSize);
+    v_uint2 boundBox = GetBoundingBox(vpHalfSize, false);
     visibleMask &= _mm512_cmpeq_epi32_mask(_mm512_movm_epi16(_mm512_cmpge_epi16_mask(boundBox.x, boundBox.y)), _mm512_set1_epi32(0));
 
     Z0 = v0.z, Z1 = v1.z, Z2 = v2.z;
@@ -355,26 +355,22 @@ void TriangleEdgeVars::Setup(const TrianglePacket& tris, int2 vpHalfSize) {
     W2S = tris.W2 * rcpArea;
 }
 
-v_int2 TrianglePacket::GetBoundingBox() const {
+v_uint2 TrianglePacket::GetBoundingBox(int2 vpHalfSize, bool alignToTile) const {
     v_int minPos = _mm512_min_epi16(_mm512_min_epi16(Pos0, Pos1), Pos2);
     v_int maxPos = _mm512_max_epi16(_mm512_max_epi16(Pos0, Pos1), Pos2);
 
     minPos = _mm512_srai_epi16(minPos + 0x0007'0007, 4);  // round to pixel center
     maxPos = _mm512_srai_epi16(maxPos + 0x0007'0007, 4);
 
-    return { minPos, maxPos };
-}
-v_uint2 TrianglePacket::GetRenderBoundingBox(int2 vpHalfSize) const {
-    v_int2 packed = GetBoundingBox();
-
     v_int vpSize = vpHalfSize.x | (vpHalfSize.y << 16);
-    packed.x = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(packed.x, vpSize), v_int(0)), vpSize * 2);
-    packed.y = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(packed.y, vpSize), v_int(0)), vpSize * 2);
+    minPos = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(minPos, vpSize), v_int(0)), vpSize * 2);
+    maxPos = _mm512_min_epi16(_mm512_max_epi16(_mm512_add_epi16(maxPos, vpSize), v_int(0)), vpSize * 2);
 
-    packed.x = (packed.x + 0x0000'0000) & ~0x0003'0003;  // align to tile boundary
-    packed.y = (packed.y + 0x0003'0003) & ~0x0003'0003;
-
-    return v_uint2((v_uint)packed.x, (v_uint)packed.y);
+    if (alignToTile) {
+        minPos = (minPos + 0x0000'0000) & ~0x0003'0003;
+        maxPos = (maxPos + 0x0003'0003) & ~0x0003'0003;
+    }
+    return v_uint2((v_uint)minPos, (v_uint)maxPos);
 }
 
 ClipCodes Clipper::ComputeClipCodes(v_float4 v0, v_float4 v1, v_float4 v2, float2 guardBandFactor) {
@@ -646,7 +642,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
                     memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                    v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
+                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, false);
                     batchFull |= !DistributeToBins(batchId, packetId, acceptMask, boundBox.x, boundBox.y);
                     batchFull |= ++nextPacketIdx >= MaxPacketsPerBatch;
                 }
@@ -664,7 +660,7 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                 _queue->PacketPool[triPacketId].ClipData = &_queue->ClipDataPool[clipPacketId];
                 _queue->ClipDataPool[clipPacketId] = clipper.OutData[i];
 
-                v_uint2 boundBox = clipper.OutTris[i].GetRenderBoundingBox(_viewHalfSize);
+                v_uint2 boundBox = clipper.OutTris[i].GetBoundingBox(_viewHalfSize, false);
                 batchFull |= !DistributeToBins(batchId, triPacketId, clipper.OutMasks[i], boundBox.x, boundBox.y);
                 batchFull |= ++nextPacketIdx >= MaxPacketsPerBatch;
                 batchFull |= ++nextClipPacketIdx >= MaxClipPacketsPerBatch;
@@ -763,7 +759,7 @@ void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
                     TrianglePacket& tris = _queue->PacketPool[ids[i] >> 16];
                     v_mask acceptMask = v_mask(ids[i] & 0xFFFF);
 
-                    v_uint2 boundBox = tris.GetRenderBoundingBox(_viewHalfSize);
+                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, true);
                     v_uint bbMin = _mm512_max_epi16(boundBox.x, _mm512_set1_epi32((int)binPosMin));
                     v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)binPosMax));
                     v_uint bbExtent = bbMax - bbMin;
