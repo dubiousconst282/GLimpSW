@@ -77,17 +77,17 @@ struct TriangleClipData {
     uint8_t PrimId[simd::vec_width];
 };
 struct TrianglePacket {
-    v_int Pos0, Pos1, Pos2; // Fixed-point viewport coords (2 x s16)
-
-    v_float Z0, Z1, Z2;
-    v_float W0, W1, W2;
-
     uint8_t VertexId[3][simd::vec_width];
     uint8_t BasePrimId;
     uint8_t FragmentShaderId;
     uint16_t BackfacingMask;
     uint32_t MeshletId;
     const TriangleClipData* ClipData = nullptr;
+
+    v_int Pos0, Pos1, Pos2;  // Fixed-point viewport coords (2 x s16)
+
+    v_float Z0, Z1, Z2;
+    v_float W0, W1, W2;
 
     v_mask Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfSize, FaceCullMode cullMode);
 
@@ -122,10 +122,6 @@ struct ShaderBinding {
     const ShaderDispatchTable& Dispatch;
     void* Context;
 };
-
-// Internal
-struct BinQueue;
-struct ThreadedRunner;
 
 struct Rasterizer {
     static constexpr uint32_t MaxRenderSize = 2896;  // Determined by integer overflow bound around edge equations. 2**(31/2 - 4)
@@ -317,12 +313,12 @@ struct Rasterizer {
 
 private:
     uint2 _viewSize, _viewHalfSize;
-    std::unique_ptr<BinQueue> _queue;
-    std::unique_ptr<ThreadedRunner> _runner;
+    std::unique_ptr<struct BinQueue> _queue;
+    std::unique_ptr<struct ThreadedRunner> _runner;
 
     void DrawMeshletsST(uint32_t count, ShaderBinding shader);
 
-    bool DistributeToBins(uint32_t workerId, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos);
+    bool DistributeToBins(struct BinBatch* batch, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos);
     void RasterizeBins(ShaderBinding shader, uint32_t workerId);
 
     void WorkerFn(uint32_t workerId);
