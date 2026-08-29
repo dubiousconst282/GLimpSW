@@ -6,11 +6,17 @@ PointerAlignment: Left
 IndentAccessModifiers: false
 AccessModifierOffset: -4
 SpaceAfterTemplateKeyword: false
+SortIncludes: false
+IndentPPDirectives: BeforeHash
 
 AllowShortCaseLabelsOnASingleLine: true
 AllowShortEnumsOnASingleLine: true
 Cpp11BracedListStyle: false
+SpaceBeforeCpp11BracedList: true
 BreakBeforeBinaryOperators: None
 BreakBeforeTernaryOperators: false
+
+PenaltyBreakAssignment: 30
+PenaltyBreakBeforeFirstCallParameter: 1
 
 # https://clang.llvm.org/docs/ClangFormatStyleOptions.html

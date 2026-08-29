@@ -3,6 +3,8 @@
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include <nanobench.h>
 
+#include <tracy/Tracy.hpp>
+
 #include "../Rasterizer.h"
 #include "../Texture.h"
 #include "../Scene.h"
@@ -12,11 +14,13 @@
 #include <stb_image_write.h>
 
 // [model path] [(camera) <x> <y> <z> <yaw> <pitch>]
+//
+// ./build/src/SwRast/BenchmarkApp "../GraphicsAssets/Bistro_flat.glb" -8.87356 4.07373 2.37185 1.2531 -0.2071
 int main(int argc, const char** args) {
     Scene scene;
     scene.ImportGltf(argc >= 2 ? args[1] : "assets/models/Sponza/Sponza.gltf");
 
-    auto camera = Camera{ .Position = { -0.46608772755098471, 8.4925445559659511, -1.7022251220187172 }, .Euler = { -3.13643026, -1.4724431 } };
+    auto camera = Camera { .Position = { -8.80000, 1.30000, -0.25000 }, .Euler = { 1.5411, -0.1024 } };
 
     if (argc >= 6) {
         camera.Position = { atof(args[2]), atof(args[3]), atof(args[4]) };
@@ -25,15 +29,11 @@ int main(int argc, const char** args) {
 
     uint2 fbSize = uint2(1920, 1080);
     auto depthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(fbSize.x, fbSize.y);
-    auto colorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(fbSize.x, fbSize.y);
-
-    auto raster = swr::Rasterizer(1);
-    raster.EnableBinning = false;
-    raster.SetViewport(fbSize);
+    auto colorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(fbSize.x, fbSize.y, 1);
 
     camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = float2(fbSize) }, 0);
 
-    auto instances = std::vector<InstanceData>();
+    auto instances = std::vector<InstanceData>(1);
     auto instanceCounts = std::vector<uint32_t>();
 
     for (auto& model : scene.Models) {
@@ -48,11 +48,22 @@ int main(int argc, const char** args) {
             }
         }
     }
+    if (scene.Lights.size() == 0) {
+        uint32_t offset = scene.Lights.AllocRange(1);
+
+        scene.Lights[offset] = {
+            .Type = Light::kTypeDirectional,
+            .Direction = glm::normalize(-float3(0.589494, 0.684509, 0.428906)),
+            .Color = float3(1, 1, 1),
+            .Intensity = 5.0,
+        };
+    }
 
     ankerl::nanobench::Bench ctx;
     ctx.minEpochTime(std::chrono::milliseconds(50));
-    ctx.warmup(10).epochs(100);
+    ctx.warmup(10).epochs(50);
     ctx.unit("frame").timeUnit(std::chrono::microseconds(1), "us");
+    ctx.relative(true);
 
     ShadingContext shader = {
         .DepthBuffer = depthFb.get(),
@@ -65,18 +76,24 @@ int main(int argc, const char** args) {
         .Exposure = 1.0f,
     };
 
+    auto raster = swr::Rasterizer(1);
+    raster.SetViewport(fbSize);
+
     ctx.run("Rasterize", [&]() {
+        FrameMark;
         colorFb->Clear(0);
         depthFb->Clear(0);
 
-        for (uint32_t i = 0; i < instances.size(); i++) {
+        for (uint32_t i = 1; i < instances.size(); i++) {
             shader.InstanceMeshlets = instances[i].Meshlets;
             shader.InstanceId = i;
             shader.ObjectToWorldMat = instances[i].Transform;
             shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(instances[i].Transform);
 
-            raster.DrawMeshlets(instanceCounts[i], { ShadingContext::VisBufferShader, &shader });
+            raster.DrawMeshlets(instanceCounts[i - 1], { ShadingContext::VisBufferShader, &shader });
         }
+        // swr::perf::EndFrame();
+        // printf("Tris=%ld\n", swr::perf::GetCurrent("RastTrisDrawn"));
     });
 
     auto resolvedColorFb = swr::CreateFramebuffer<swr::pixfmt::RGBA8u>(fbSize.x, fbSize.y);
@@ -84,6 +101,7 @@ int main(int argc, const char** args) {
     shader.Instances = instances.data();
 
     ctx.run("VisResolve", [&]() {
+        FrameMark;
         memcpy(resolvedColorFb->Data, colorFb->Data, colorFb->LayerStride * 4);
         shader.Resolve(raster);
     });

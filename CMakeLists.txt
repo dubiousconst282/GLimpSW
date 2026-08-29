@@ -11,7 +11,7 @@ if(NOT DEFINED ENV{CPM_SOURCE_CACHE})
 endif()
 
 CPMAddPackage("gh:glfw/glfw#3.4")
-CPMAddPackage("gh:g-truc/glm#1.0.1")
+CPMAddPackage("gh:g-truc/glm#1.0.3")
 CPMAddPackage("gh:nothings/stb#master")
 
 CPMAddPackage("gh:jkuhlmann/cgltf#v1.15")
@@ -23,7 +23,7 @@ set(NFD_PORTAL ON)
 CPMAddPackage("gh:btzy/nativefiledialog-extended#v1.3.0")
 
 set(TRACY_ON_DEMAND ON)
-CPMAddPackage("gh:wolfpld/tracy#v0.13.1")
+CPMAddPackage("gh:wolfpld/tracy#v0.14.1")
 
 # Glad
 add_library(glad STATIC deps/glad/src/glad.c)

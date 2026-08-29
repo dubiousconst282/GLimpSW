@@ -97,7 +97,7 @@ void InitRenderer() {
     LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
     ShadingContext::LoadBlueNoise();
 
-    _cam = Camera{ .Position = { -9.38414, 1.63823, -0.00313 }, .Euler = { 0.7993, -0.0849 }, .MoveSpeed = 5.0f };
+    _cam = Camera { .Position = { -8.80000, 1.30000, -0.25000 }, .Euler = { 1.5411, -0.1024 }, .MoveSpeed = 5.0f };
 
     _rast = std::make_unique<swr::Rasterizer>(4);
     CreateFramebuffer(1920, 1080);
