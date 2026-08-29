@@ -4,34 +4,22 @@ High performance AVX512 software rasterizer
 ---
 
 <div>
-  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4528415d-14b4-42fd-90d3-e1e47d2d9c17" width="49%" alt="Crytek Sponza">
-  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/4508d3a1-562e-4cb7-b43c-51a18f57e75b" width="49%" alt="Damaged Helmet">
-  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/491bc38e-db84-408d-aa3f-2f2bf952d108" width="49%" alt="Polyhaven Ship Pinnace">
-  <img src="https://github.com/dubiousconst282/GLimpSW/assets/87553666/0e39e425-102d-4f69-9802-41b654cd6aea" width="49%" alt="Amazon Bistro">
+  <img width="49%" src="./docs/images/show_new_sponza.jpg" />
+  <img width="49%" src="./docs/images/show_new_bistro.jpg" />
 </div>
 
-_Sample screenshots of the [previous version](https://github.com/dubiousconst282/GLimpSW/tree/old-deferred) (deferred g-buffer), rendered at 1080p on a 4-core TigerLake CPU, running at ~3.5GHz_
+_Sample screenshots, rendered at 1080p on a 4 core TigerLake CPU, running at 2.8-3.2GHz_
+
 
 <div>
-  <img width="49%" src="https://github.com/user-attachments/assets/8be6debd-9f88-452d-89c9-4880a6c7a3f6" />
-  <img width="49%" src="https://github.com/user-attachments/assets/11c3aa4d-23dc-4f66-a2f2-6fd591ae41f6" />
+  <img src="./docs/images/show_old_sponza.jpg" width="49%" alt="Crytek Sponza">
+  <img src="./docs/images/show_old_helmet.jpg" width="49%" alt="Damaged Helmet">
+  <img src="./docs/images/show_old_pinnace.jpg" width="49%" alt="Polyhaven Ship Pinnace">
+  <img src="./docs/images/show_old_bistro.jpg" width="49%" alt="Amazon Bistro">
 </div>
 
-_Sample screenshots of the current version (deferred vis-buffer), showing performance improvements over the same config_
+_Sample screenshots from the [previous version](https://github.com/dubiousconst282/GLimpSW/tree/old-deferred), same config, +TAA, +SSAO, +IBL_
 
-## Features
-- Programmable mesh and pixel shading via concepts and template specialization
-- Fully SIMD-driven pipeline: mesh/pixel shading and internal processing all work on 16 elements in parallel, per thread
-- Texture sampling: bilinear filtering, mip mapping, octahedron mapping, generic pixel formats
-- Multi-threaded tiled rasterizer (binning)
-- Guard-band clipping
-
-### Missing/broken features
-- Clipping not implemented in binned rasterizer (to be rewritten)
-- Models with multiple leaf hierarchy nodes are slower to render, due to extra synchonization points between draw calls
-- Non-binned rasterizer does not synchronize, artifacts with multi-threading
-- Occlusion culling uses reprojection only, results in occasional disocclusion artifacts
-- IBL, SSAO, TAA not yet ported to meshlet branch
 
 ## Implementation Notes
 Some things I have and haven't tried.
@@ -88,94 +76,163 @@ void ShadeVertices(const swr::VertexReader& data, swr::ShadedVertexPacket& vars)
 The rest of the pipeline is pretty traditional, with a few details I find interesting:
 
 - Clipping
-  - Needed to prevent overflow in fixed-point edge equations (using 32-bit integers and 4-bit subpixel precision, max resolution is 2892x2892 (31/2-4 bits))
+  - Needed to prevent div by `w <= 0` and overflow in fixed-point edge equations (using 32-bit integers and 4-bit subpixel precision, max resolution is 2892x2892 (31/2-4 bits))
   - Packets that are fully inside the viewport are most common due to frustum culling, and accepted immediately (very cheap to test, `max_abs(x,y,z) < w` using `vrangeps`)
   - Otherwise, Cohen-Sutherland outcodes are computed to determine non-trivial triangles. Usually <0.1% tris need actual clipping (guardband is incredibly effective)
   - Clipped triangles go through specialized `DrawTriangle<IsClipped=true>()` function that can adjust shader barycentrics to clipped factors (vertex attribs can't/don't need to be clipped)
 - Binning
-  - Currently wastes up to 1/3 of time syncing mesh/raster (would probably be better to split batches per-bin rather than per-frame).
-  - Triangle setup is split in two steps to reduce size of binned batches
+  - Multi-threading with batch partitioning, and a sort of "scoreboard" for publishing/retiring batches
+    - Efficient load balancing has been a major undertaking
+      - Current approach is up to ~20% slower than immediate due to stalls, still lots of ideas to experiment with
+      - Batching worsens it, but allows for constant memory usage (bandwidth is expansive, but maybe still a better tradeoff?)
+      - Initially tried switching all threads between mesh and raster stages with global barriers. Was up to 1.7x slower, because some bins take much longer to rasterize and cause other threads to stall for a long time 
+    - [Static bin pattern](https://schmalstieg.github.io/pdf/Schmalstieg_338.pdf), worker threads rasterize every Nth bin
+    - Fixed number of batches, dynamically reserved by binners. Scoreboard is an array of per-batch statuses, unused(0)|reserved(~0)|committed(pending_mask). The pending_mask flags workers that are pending raster, which is progressively cleared after each (so bins are only rasterized once), until the batch becomes unused, when it can be reserved again for binning
+    - Doesn't preserve draw order (yet/ever), determinism is nice but mainly needed for alpha-blended and 2D stuff
+  - Triangle setup is split in two steps to reduce size of binned batches (40 bytes/tri)
     - Early: Perspective div, fixed-point snapping, bounding box, back-face/degenerate culling
     - Late: Edge equations
   - Bins store packet IDs + masks rather than individual triangle IDs, for significantly lower overhead
-  - Packets that are contained within a single bin are common (30~60%), slower path loops over entire packet's min/max bounding box (edge tests are overkill since bins are very large, 128x128)
-  - One bin queue per thread (probably scales poorly), bitmap helps skipping over empty bins
+  - Packets that are contained within a single bin are common (30~60%), slower path loops over entire packet's min/max bounding box, with conservative edge tests for packets spanning >=3x3 bins
+- Rasterization
+  - Just the standard Pineda inside/out half-edge tests over the bounding box, actually drawing the damn triangles makes up for probably less than 10% of the entire rasterizer.....
+  - `DrawTriangle()` is a template specialized over the fragment shader to minimize call overhead/vector reg spills
+    - i.e. `[[clang::always_inline]] ShaderFn();`, also lets compiler DCE unused stuff like barycentrics
+  - `ShaderDispatchTable` struct carries pointers to the specialized draw function and mesh shaders
+    - Instantiation: `shader = swr::GetDispatchTable<&ShadeMeshlet, &ShadePixels>();`
+    - Supports multiple fragment shader entry points, which can be changed per meshlet (useful for alpha tested materials)
 
 ### DDGI with Voxels
-I wanted to try implement probe-based GI using ray tracing. For that, I decided to use a voxelized representation of the scene, both because past experience and because they seem much faster to traverse than standard triangle BVHs. Tinybvh's AVX2 traversal had a throughput of ~7.7M camera and ~17.3M anyhit rays per sec on one thread, Embree's 16-wide packet traversal was a little better at 10-11M rays, but both still much slower than the 18-20M rays my previous brickmap voxel tracer could get up to, and which I thought could still be improved on.
 
-Good BVHs require fewer steps to traverse than a hierarchical voxel structure, since they can form a tighter (non-isotropic) fit around geometry, which minimizes redundant intersections and grazing rays. On the other hand, voxel occupancy can be represented very compactly throught bitmasks, which use far less memory traffic for traversal, in addition to simpler intersection tests.
+<div align="center"> 
+  <img width="49%" src="./docs/images/ddgi_on.jpg" />
+  <img width="49%" src="./docs/images/ddgi_off.jpg" />
+</div>
 
-The new implementation uses a compressed brickmap structure which is essentially a sparse contree/64-tree, but with only 3 levels and a flat top-level grid. This removes the need of a stack and long-latency chain of gathers during traversal, is easier to work with, and also more compact, since it can avoid/use smaller leaf node pointers.
+I wanted to try implement probe-based GI using ray tracing. For that, I decided to use a voxelized representation of the scene, both because past experience and because they are much faster to trace than standard triangle BVHs. Godot actually does the same for SDFGI/HDDAGI, and the results seemed reasonable.
 
-It is capable of around 25-30M camera rays/sec, although probe rays are much slower at 6-7M/sec. I haven't spent much time trying things apart from the obvious premature micro-opts, but that's still somewhat workable. Updating 2048 probes with 64 rays each takes ~6ms on 4 threads, with 20% being spent on convolution.
+#### Probes
+The idea behind DDGI is quite simple, but as usual with graphics techniques the details are devilish. It involves creating a grid of probes which capture irradiance and mean depth around their surfaces, into small octahedron-mapped textures (8x8 irradiance and 16x16 depth for each probe).
+
+To look up irradiance for a given surface, samples from the 8 nearest probes in the grid are weighted and summed (indexing a cage as in trilinear filtering). The irradiance texel is selected by the surface normal, and depth by the direction between the probe and surface. The depth value is used to reduce contribution of probes with no line of sight to the surface, using Chebyshev's inequality test in a similar way as variance shadow maps, as a way to mitigate light leaks.
+
+To update a probe, a small number of rays which are uniformly distributed around a sphere are traced into the world. The resulting hit radiance (shaded surface color) and distances are then convolved by `max(dot(RayDir, TexelDir), 0)` and temporally blended into all probe texels.
+
+Misc notes:
+- For reducing leaking: depth convolution sharpening power is VERY important to keep low texel spread (otherwise depth map resolution is wasted), as is the normal/view bias, and clamping ray distance
+- Noticeable flickering even at high hysteresis (probably need to stop updating after convergence, TODO: "Scaling DDGI for production")
+- Sampling irradiance without billinear can make surfaces look shiny and/or color banded
+- Probe convolution is rather expansive (30-40%), pre-computing weights gets it down to ~20%
+
+---
+
+Though ray tracing is obviously very intensive, the main expanse in our case actually comes from sampling and interpolating depth and irradiance texels, which is necessary for acceptable quality. It costs ~18ms at 1080p and 4 threads, over twice the cost of vis-buffer resolve and shading. [TODO: [VRS](https://geometrian.com/data/research/dacs/HPG2018_DeferredAdaptiveComputeShading.pdf)]
+
+#### Shadow Maps
+EnshittifiedVSM WIP
 
 #### Voxelization
-This is very straightforward, just the standard rasterization method using a fragment shader that writes into a 3D grid at the corresponding depth ([good explanation here](https://github.com/BoyBaykiller/IDKEngine#voxel-global-illumination)), except those writes go into a bump-allocated brickmap rather than a flat grid. Unexpectedly fast and effective for how simple it is. For Sponza at 512³, the entire process takes 20ms single-threaded and outputs a 24MB intermediate brickmap, which is immediatelly compressed into the accel struct (24MB -> 9MB).
+
+<img width="32%" src="./docs/images/ddgi_voxel.png" align="right"/>
+
+This is very straightforward, just the standard rasterization method using a fragment shader that writes into a 3D grid at the corresponding depth ([good explanation here](https://github.com/BoyBaykiller/IDKEngine#voxel-global-illumination) and [more details here](https://developer.nvidia.com/content/basics-gpu-voxelization)), except those writes go into a bump-allocated brickmap rather than a flat grid. Unexpectedly fast and effective for how simple it is. For Sponza at 512³, the entire process takes 20ms single-threaded and outputs a 24MB intermediate brickmap, which is immediatelly compressed into the accel struct (24MB -> 9MB).
+
+The voxel grid stores surface attributes in 32 bits: albedo (RGB554), normal (10 bit octahedron), and metallic/roughness (4 bits each). This provides good enough quality and avoids the extra cost from having to fetch and interpolate triangle attributes. A limitation is the lack of tie-breaking for triangles that intersect the same voxels, which can result in flipped normals/attributes around thin walls.
+
+---
 
 I ended up adding an extension flag in the rasterizer for swizzling triangles to the dominant axis, because this step would have been difficult to implement in the mesh shader as it could potentially generate up to 3x extra unique vertices, past the 64 output limit. It's a little hacky, but far simpler and more efficient than having a separate swizzling pass, or drawing the geometry 3 times.
 
-There are some occasional gaps in the output, resulting from thin/unaligned triangles that fail to cover samples. This could be fixed with conservative rasterization, which can be implemented by biasing the edge functions similarly to the accept/reject tile edges used for hierarchical raster. Though probably at a significant cost since it will force every triangle to generate/overdraw samples. [maybe TODO]
-
-Surfaces that intersect the same voxels, such as thin opposing walls, will result in randomly flipped normals and attributes. This wastes samples but doesn't seem to cause noticeable artifacts on GI.
+There are some occasional gaps in the output, resulting from thin/unaligned triangles that fail to cover samples. This could be fixed with either MSAA or conservative rasterization as described in the Nvidia article, the latter which would be simpler to implement by biasing the edge functions similarly to the accept/reject tile edges used for hierarchical raster. Though probably at a significant cost since it will force every triangle to generate/overdraw samples.
 
 [TODO: clipmap with partial updates]
 
-#### Probes
+#### Voxel Ray tracing
+Tinybvh's AVX2 traversal had a throughput of ~7.7M camera and ~17.3M anyhit rays per sec on one thread, Embree's 16-wide packet traversal was a little better at 10-11M rays, but both still much slower than the 18-20M rays my previous brickmap voxel tracer could get up to, and which I thought could still be improved on.
 
-- Leaking is very dependent on parameters. Depth sharpening power is VERY important (otherwise depth map resolution is wasted), as is the normal/view bias
-- Noticeable flickering even at high hysteresis
-- Probe convolution is rather expansive (30-40%), pre-computing weights gets it down to ~20%
+The new voxel tracer runs at around 25-30M camera rays/sec, though probe rays are much slower at 6-7M/sec due to divergence (where a few rays take much longer to finish). I haven't spent much time trying things apart from the obvious premature micro-opts, but that's still somewhat workable. Updating 2048 probes with 64 rays each takes ~6ms on 4 threads, with 20% being spent on convolution.
 
-#### Shadows
-Ray casting was unsurprisingly too expansive and blocky for shadows, so I couldn't avoid shadow maps. I ended up using the following derivative-based biasing method, which works very well (though false-shadowing still occurs on occasion, e.g. around rotated planes), and requires no changes for sampling:
+It uses a compressed brickmap structure which is essentially a sparse contree/64-tree, but with only 3 levels and a flat top-level grid. This removes the need of a stack and long-latency chain of gathers during traversal, is easier to work with, and also more compact, since it can avoid/use smaller leaf node pointers.
 
-```cpp
-    if constexpr (IsShadowRender) {
-        // Planar bias method, as described by Avelina9X: https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
-        v_float dx = swr::texutil::dFdx(vars.Depth);
-        v_float dy = swr::texutil::dFdy(vars.Depth);
-        vars.Depth -= simd::max(simd::abs(dx) + simd::abs(dy), 5e-6) * ctx.ShadowSampleRadius;
-    }
-```
-
-### Quad Inefficiency
-The rasterizer maps the 16 SIMD lanes into 4x4 pixel fragments. This works reasonably well, but suffers from the characteristic quad utilization problem, where small triangles will cover very few lanes.
-
-Still, measuring render times on Bistro after skipping triangles of certain sizes shows that the timings are very much lead by pixel count: 75% of all tris are smaller than 12x12 pixels on either axes, and the overall average is ~28ns per small triangle and ~200ns for larger tris.
-
-Fragment lane usage is indeed pretty bad even before the depth test, averaging at 11-14% for small, and 40-60% for large-ish tris. Looking at the floor brings it up to 80-95%. It's unclear whether rasterizing multiple triangles per SIMD would improve throughput considerably, due to the overhead in gathering and scattering framebuffer data while also handling conflicts.
+The naive SIMT-style packet traversal was up to 8x faster than scalar in early tests, though this model is typically suboptimal in the case of BVHs, as they are far more divergent-ey and memory intensive, whereas voxel occupancy is reasonably compact.
 
 ### Vis-buffer
-Both overdraw and the quad utilization issue can be mitigated by moving complexity out of the fragment shader using a vis-buffer. On Sponza, the complete raster+resolve passes take around 0.8-1.2x as long as just the deferred raster pass [TODO: more detailed comparison].
+The renderer uses a [visibility buffer](https://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/) to mitigate overdraw and poor quad utilization, where the fragment shader writes only the triangle ID, and all attribute fetch and shading is performed in a separate resolve pass.
 
-The resolve pass is very expansive, but the overall cost is quite consistent. It is largely compute bound.
+The resolve pass is very expansive as it needs to intersect triangles to derive barycentrics for attribute interpolation. It does not payoff for simple scenes, but the cost varies relatively little as scene complexity grows.
 
-Bistro rendering profile summary (680k tris, 1080p, single thread):
-- 37.4ms raster, 34.3ms resolve
-- 80.7%: ResolveSurface
-  - 17.6%: Gather vertex attribs
-  - ~>17.0%: Transform, project, intersect triangles
-  - ~>24.9%: Sample textures (albedo + packed normal_mr)
-  - 18.3%: Unpack normal+tangent, texture remapping
-    - TODO: 6x oct unmap, ~5% alone. Maybe best to use 2x RGB10 instead?
-- 11.1%: EvalLighting (for one directional light)
+The following benchmark with a G-buffer shader mock up (2x tex sample + normal mapping + 96-bit write out. single-thread, 1080p). The G-buffer timings only include rasterization, whereas vis-buffer also include resolve+shading (as annotated). Estimated shading cost is 4.5-7ms. Ultimately not very impressive, though the current vis-buffer implementation is not particularly clever and probably has room for some cost cutting (TAA/VRS).
 
-### Coarse Raster
-The rasterizer uses a basic bounding-box traversal to step over the triangle, which results in many redundant steps over empty space for larger triangles. These could be avoided with [one of the many smarter traversal algorithms](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/), but some profiling shows traversal is also not as problematic as it seems in theory: on a view with a bunch of moderately large tris, only ~14% of time is spent on the edge stepping loop for the vis-buffer shader which writes only the depth and surface ID:
+|us/frame|frame/s |    err% |       ins/frame |       cyc/frame |    IPC | #tris| benchmark
+|-------:|-------:|--------:|----------------:|----------------:|-------:|-----:|:----------
+|  2,089 | 478.57 |    0.5% |    5,273,435.50 |    4,969,507.00 |  1.061 |    3 | `FSQuad` Vis Rast
+| 37,875 |  26.40 |    0.2% |  127,637,231.00 |   90,954,890.00 |  1.403 |    3 | `FSQuad` Vis Rast+Resolve
+| 18,695 |  53.49 |    0.3% |   62,854,820.83 |   44,614,039.17 |  1.409 |    3 | `FSQuad` GBuffer Rast
+| |
+| 16,234 |  61.60 |    0.3% |   56,256,280.88 |   38,756,962.29 |  1.452 | 101k | `Sponza` Vis Rast
+| 55,272 |  18.09 |    0.2% |  176,972,226.50 |  132,081,917.50 |  1.340 | 101k | `Sponza` Vis Rast+Resolve
+| 51,701 |  19.34 |    0.3% |  178,413,704.00 |  123,338,020.00 |  1.447 | 101k | `Sponza` GBuffer Rast
+| |
+| 77,904 |  12.84 |    0.3% |  272,403,046.50 |  185,800,322.50 |  1.466 | 574k | `Bistro` Vis Rast
+|121,624 |   8.22 |    0.2% |  400,114,530.50 |  290,217,947.50 |  1.379 | 574k | `Bistro` Vis Rast+Resolve
+|130,462 |   7.67 |    0.2% |  472,210,218.50 |  311,326,665.00 |  1.517 | 574k | `Bistro` GBuffer Rast
 
-<div align="center"> 
-  <img width="400" alt="coarse_profile_drawtri" src="https://github.com/user-attachments/assets/43e2b3a1-8812-4168-baa6-5b3d235e9231" />
+Resolve profile summary for Bistro:
+- 83%: ResolveSurface
+  - 22%: Gather vertex attribs
+  - 17%: Transform, project, intersect triangles
+  - 26%: Sample textures (albedo + packed normal_mr)
+  - 12%: Unpack and texture-map normals
+- 9%: EvalLighting (for one directional light)
+
+### Rasterizer Micro-opts
+The performance profile between small and large triangles is obviously very different.
+
+Initially, most of the time will be spent fetching framebuffer data from RAM, in particular for depth tests. Fast clears could help, but unfortunately there seems to be [no way](https://blogs.fau.de/hager/archives/8997) to populate the cache without having the CPU fetch associated data from RAM, even for aligned and unmasked 512-bit stores that completely overwrite cachelines, due to the "read for ownership" [cache coherence](https://fgiesen.wordpress.com/2014/07/07/cache-coherency/) transaction. Although it may still be possible to save one memory trip by delaying and splitting framebuffer clears to the first bin rasterization step. [TODO]
+
+Small triangles spend most of the time going through the overall pipeline, when ultimately they will only cover a few pixels.
+
+As noted in [CudaRast11](https://research.nvidia.com/publication/2011-08_high-performance-software-rasterization-gpus), many small triangles fall in between samples and thus have no coverage, and can be culled early with a bounding box test. A mistake that made this ineffective was aligning the bounding box to 4x4 pixels, which wasted 9% on Bistro.
+
+They also incur less predictable branches (and lower ipc due to bad spec? and/or maybe fewer oooe opportunities) in traversal due to varying sizes and alignment, though the overall impact seems to be relatively small (~9% mispreds). It's not obvious how this could be avoided efficiently, perhaps short of dispatching specialized/unrolled rasterizers based on triangle sizes (similar to [CuRast26](https://github.com/m-schuetz/CuRast)). Hierarchical traversal might be less susceptible to mispreds, ignoring setup overhead, since traversal can simply loop over set bits in the tile coverage mask.
+
+<div align="center">
+  <img width="30%" src="./docs/images/rast_perf_bistro_annotated.png"/>
+  <img width="30%" src="./docs/images/rast_perf_largequad.png"/>
+  
+_Disassembly and Tracy profile for Bistro, vs. uniform grid of quads (~340x340 pixels across)_
 </div>
 
-Depth testing takes pretty much all drawing time with an awful high cache-miss rate, since at that point all framebuffer data has to come from RAM. Fast clears could help here, but unfortunately there seems to be no way to populate the cache without having the CPU fetch associdated data from RAM, even for aligned and unmasked 512-bit stores that completely overwrite cachelines. Although it might still be possible to save one memory trip by delaying and splitting framebuffer clears to the first bin rasterization step. [TODO]
+Annoyingly, Clang fails to hoist the vis-buffer instance ID and other values from the fragment shader, which I suspect may be to due to false aliasing checks with framebuffer writes. There doesn't seem to be a simple and reliable way to influence this, as support for __restrict attributes is very limited.
 
-The `tileMask != 0` branch also has a pretty high misprediction rate, which makes sense since edge intervals vary a lot across rows and triangles. The hierarchical traversal would probably help avoid this as well, since we could just loop over set bits in the coarse tile coverage mask. It would also be a good place to implement HiZ depth tests, but overdraw should be less of an issue with meshlet occlusion culling, so meh.
+#### Traversal
+To minimize traversal cost for larger triangles, where most part of the bounding box is empty, the binned rasterizer performs conservative edge tests for triangles that span more than a few bins (>128x128 pixels), which saves around 3-18% from raster time depending on the scene. This was more effective than some of the smarter [scan/hierarchical traversal algorithm](https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/), as it avoids [overhead](./src/SwRast/Benchmarks/CoarseRaster.cpp) for small triangles while adding very little complexity to the pipeline.
 
-TODO: write about how old benchmark was subtly broken due to stupidity, new results, and impl difficulties (buffering, vpmulld). [CoarseRaster.cpp](./src/SwRast/Benchmarks/CoarseRaster.cpp).
+---
+
+Deriving the third edge distance through `u = 1 - v - w` in the rasterizer loop saves setup and registers. The dependency chain latency can be improved as follows, though this is not actually benefitial on TigerLake because it can only dispatch one compare per cycle, which limits the inner loop throughput to ~1/2 cycles, down from ~1/1.5 cycles in the 3 edge loop. For the uniform mesh of small quads (4x4 pixel across), this provided a ~5% speedup, but had a slight negative result for real geometry.
+
+```cpp
+    v_int edgeNorm = edgeOrigin.x + edgeOrigin.y + edgeOrigin.z; // triangle area (invariant)
+
+    v_mask edgeMaskYZ = _mm512_movepi32_mask(edge.y | edge.z);                // or, add
+    v_mask edgeMaskX = _mm512_cmple_epi32_mask(edge.y + edge.z, edgeNorm);    // movd2m, cmp
+    if (!_ktestc_mask16_u8(edgeMaskYZ, edgeMaskX)) {                          // ktest
+        asm("" : "+Yk"(edgeMaskYZ), "+Yk"(edgeMaskX));
+        vars.TileMask = _mm512_kandn(edgeMaskYZ, edgeMaskX);
+```
+
+#### Quad Utilization
+The rasterizer maps the 16 SIMD lanes into 4x4 pixel fragments. This works reasonably well, but suffers from the characteristic quad utilization problem, where small triangles cover very few lanes, in addition to the already high setup overhead.
+
+<img height="200" src="./docs/images/frag_lane_usage_chart.svg" align="right">
+
+The chart shows the average pixel cost and percent of active lanes when rendering an uniform grid of quads at NxN size, indicating that drawing cost starts high but grows almost linearly past 70% lane usage. On Sponza, the typical number of fragments at 1080p ranges between 6.4-11.5M, with 66-73% lane usage before the depth test, and afterwards 4.7-5.8M fragments with 58-62% lane usage.
+
+An experiment rasterizing multiple small triangles (<= 4x4 pixels) at once using gather/scatter instructions per pixel provided relatively small improvements in real test scenes: ~ 3.5% for Sponza, 4% for Bistro, -2.8% for 4x4 quads, 76% for 1x1~2x2 quads. There was no attempt to resolve conflicting writes to the same pixel, which would likely have added considerable cost.
 
 ### Memory Gathers
-Memory gathers are fundamental for general SIMT-style programming, but they are not well accelerated on current x86 CPUs and always scalarized to one memory access per lane, providing significantly lower throughput compared to sequential vector loads. In some cases, they can be avoided in place of more efficient sequences like in-register permutes.
+Memory gathers are fundamental for general SIMT-style programming, but they are not well accelerated on current x86 CPUs and always scalarized to one memory access per lane, providing significantly lower throughput compared to sequential vector loads when the data is well localized in cache. In some cases, they can be avoided in place of more efficient sequences using in-register permutes.
 
 ---
 
@@ -195,7 +252,7 @@ static v_float GatherPreload64(const float data[64], v_int idx) {
 
 ---
 
-For strided accesses multiple of 2 x 32-bit components, 64-bit gathers can be used in combination with permutes. This runs at nearly double throughput for the reason above. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp) [TexGather64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
+For adjacent accesses multiple of 2 x 32-bit components, 64-bit gathers combined with permutes are ~1.6x faster. [GatherThroughput.cpp](./src/SwRast/Benchmarks/GatherThroughput.cpp) [TexGather64.cpp](./src/SwRast/Benchmarks/TexGather64.cpp)
 
 ```cpp
 auto lo = _mm512_i32gather_epi64(_mm512_extracti32x8_epi32(idx, 0), ptr, 4);
@@ -206,7 +263,7 @@ auto y = _mm512_permutex2var_epi32(lo, lane_idx<v_int> * 2 + 1, hi);
 
 ---
 
-For gathering multiple fields where duplicate indices are common, fetching unique lanes one at a time using a "waterfall/cascade" loop can be more efficient, since gathers have a significant and constant minimum cost. On Bistro, the vis-buffer resolve pass peaks at an average of 3.7 different triangles per 4x4 pixels, which shows this approach is effective even for reasonably detailed scenes. [GatherMany.cpp](./src/SwRast/Benchmarks/GatherMany.cpp)
+For gathering multiple fields where duplicate indices are common, fetching unique lanes one at a time using a "waterfall/cascade" loop can be more efficient, since gathers have a significant and constant minimum cost. On Bistro, the vis-buffer resolve pass peaks at an average of 3.7 different triangles per 4x4 pixels, which shows this is worthwhile even for reasonably detailed scenes. [GatherMany.cpp](./src/SwRast/Benchmarks/GatherMany.cpp)
 
 ```cpp
 v_int surfaceId = simd::load(tileData);
@@ -263,13 +320,13 @@ For RGBA8 textures, bilinear interpolation is done in 16-bit fixed-point using `
 A micro-optimization for sampling multiple textures of the same size is to pack them into a single layered texture, which can be implemented essentially for free using a single offset. When sample() calls are inlined (many functions are marked as `always_inline` to avoid stack spills of vector registers), the compiler can [eliminate](https://en.wikipedia.org/wiki/Common_subexpression_elimination) duplicated UV setup for all of those calls (wrapping, scaling, rounding, and mip selection), since it can more easily prove that all layers have the same size. This is currently done for the BaseColor + NormalMap/MetallicRoughness + Emission textures, and saves about 3-5% from rasterization time [old numbers].
 
 ### Texture Swizzling
-With the traditional row-major layout `x + y * stride`, texture accesses along the X and Y axis have dramatically different performance caracteristics due to poor cache locality. This is problematic for 3D rendering, since samples relative to object surfaces which are arbitrarily transformed by shear and rotations will often straddle across rows. GPUs have historically used swizzled/tiled layouts to improve spatial locality and minimize this issue.
+With the traditional row-major layout `x + y * stride`, texture accesses along the X and Y axis have dramatically different performance caracteristics due to cache locality. This is problematic for 3D rendering, since samples relative to object surfaces which are arbitrarily transformed by shear and rotations will often straddle across rows. GPUs have historically used swizzled/tiled layouts to improve spatial locality and minimize this issue.
 
-In my experiments, tiling provided relatively small improvements outside of artificial throughput benchmarks. After mip-mapping, sampling appears to get bound primarily by compute, rather than memory latency. [TexSwizzle.cpp](./src/SwRast/Benchmarks/TexSwizzle.cpp)
+In my experiments, tiling provided relatively small improvements outside of artificial throughput benchmarks. After mip-mapping, sampling appears to get bound primarily by overall compute latency, rather than memory. [TexSwizzle.cpp](./src/SwRast/Benchmarks/TexSwizzle.cpp)
 
 <div align="center">
-  <img width="40%" alt="heatmap_tiling_y8" src="https://github.com/user-attachments/assets/69764904-baa8-4a39-b36e-7067b11546b1" />
-  <img width="40%" alt="heatmap_tiling_linear" src="https://github.com/user-attachments/assets/2991af76-9b49-4c49-9ea2-0d5552adc482" />
+  <img width="40%" src="./docs/images/heatmap_tiling_y8.jpg" />
+  <img width="40%" src="./docs/images/heatmap_tiling_linear.jpg" />
   <br><i>Plot of pixel exec timings</i>
 </div>
 
@@ -299,6 +356,16 @@ It is a bit surprising that 8x8 tiling outperforms 4x4, considering each 4x4 til
 
 TODO: Measure impact of huge pages. Seems like texture allocs are implicitly promoted to 2MB pages via THP, but only on a fresh boot
 
+### Compiler optimization barriers
+Clang absolutely loves canonicalizing and folding things, which is convenient but sometimes pessimizes the input. Empty inline asm blocks can be used to a steer towards certain outputs given some trial and error. The trick is in choosing a proper read/write [operand constraint](https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html) to obscure the value's def-chain without worse side effects. Without the volatile modifier, opts like GVN/DCE/code motion can still be applied.
+
+I like to call this "uncanon" because it's short and distinct, but I've also seen it being referred to as ["value barriers"](https://mcyoung.xyz/2025/12/15/value-barriers/).
+
+- Prevent folding of vector into use: `asm("" : "+v"(value)); use(value);`
+  - e.g. `uncanon(constA) + constB` will disable constant folding. Useful for bit manip/permutes/avoiding redundant constant loads.
+- Enforce k-mask registers: `use(value); asm("" : "+Yk"(value)); use(value);`
+  - This is a bit flakier but can influence regalloc/domain reassignment into preferring k-mask regs and avoiding redundant gpr movs.
+
 ## Building
 The project uses CMake and CPM for build and dependency management. It depends on Clang's vector type extension and various related intrinsics.
 
@@ -311,7 +378,8 @@ cmake --build ./build/
 
 Controls: `WASD`, `Space/Shift` for up/down, `Q/E` to increase/decrease speed, `Left click + Drag` to pan camera.
 
-## Useful/interesting refs
+## Resources
+Not a complete reference list, mostly includes resources which originally introduced me to the main concepts or which I found interesting.
 
 Rasterization basics:
 - [Optimizing Software Occlusion Culling](https://fgiesen.wordpress.com/2013/02/17/optimizing-sw-occlusion-culling-index/)
@@ -321,20 +389,35 @@ Rasterization basics:
 Shading:
 - [Physically Based Rendering in Filament](https://google.github.io/filament/Filament.html)
 - [Image Based Lighting with Multiple Scattering](https://bruop.github.io/ibl/)
-- https://academysoftwarefoundation.github.io/OpenPBR/
-- https://github.com/AcademySoftwareFoundation/MaterialX/
 
 Meshlets:
 - [Visibility Buffer Rendering with Material Graphs – Filmic Worlds](https://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/)
 - [Modernizing Granite’s mesh rendering – Maister's Graphics Adventures](https://themaister.net/blog/2024/01/17/modernizing-granites-mesh-rendering/)
-- [Basic Meshlet Compression | Liam's Graphics Blog](https://liamtyler.github.io/posts/meshlet_compression/)
-- https://github.com/zeux/meshoptimizer?tab=readme-ov-file#mesh-shading
+- https://meshoptimizer.org/#mesh-shading
 - https://github.com/zeux/niagara
+
+VSM:
+- https://github.com/JuanDiegoMontoya/Frogfood/wiki/Virtual-Shadow-Maps
+- https://github.com/MatejSakmary/VSM_masters_thesis/blob/main/VSM_Thesis.pdf
+- https://ktstephano.github.io/rendering/stratusgfx/svsm
+
+GI:
+- [Dynamic Diffuse Global Illumination with Ray-Traced Irradiance Fields - Majercik et al, 2019](https://jcgt.org/published/0008/02/01/)
+- https://github.com/Sunset-Flock/Timberdoodle
+- https://github.com/BoyBaykiller/IDKEngine
 
 Other:
 - [Algorithms for Modern Hardware - Algorithmica](https://en.algorithmica.org/hpc/)
-- [High-Performance Software Rasterization on GPUs](https://research.nvidia.com/publication/2011-08_high-performance-software-rasterization-gpus)
-- [Cuda-Based Software Rasterization for Billions of Triangles](https://github.com/m-schuetz/CuRast)
+- [perf: Linux profiling with performance counters](https://perfwiki.github.io/main/top-down-analysis/)
+- [Intel Architecture Optimization Manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel64-and-ia32-architectures-optimization.html) (surprisingly approachable and good info)
+-
+- [High-Performance Software Rasterization on GPUs - Laine and Karras, 2011](https://research.nvidia.com/publication/2011-08_high-performance-software-rasterization-gpus) (more traditional tiled rasterizer in cuda, 2-stage binning, 8x8 coverage LUT)
+- [Cuda-Based Software Rasterization for Billions of Triangles - Schütz et al, 2026](https://github.com/m-schuetz/CuRast) (micropoly rasterizer using 64-bit atomics, 3 stages for promoting small/medium/large tris to lane/SIMD/workgroup, pre-orders meshes to reduce contention)
+- [Masked Software Occlusion Culling - Hasselgren et al, 2016](https://www.intel.com/content/dam/develop/external/us/en/documents/masked-software-occlusion-culling-779241.pdf) (scanline intervals + AVX2 vector edge tests to determine coverage of 32x8 pixels)
+-
+- [Larrabee: A Many-Core x86 Architecture for Visual Computing](https://www.intel.com/content/dam/develop/external/us/en/documents/larrabee-manycore-164179.pdf)
 - [Nyuzi - GPGPU microprocessor architecture](https://github.com/jbush001/NyuziProcessor)
-- https://github.com/BoyBaykiller/IDKEngine
-- https://github.com/Sunset-Flock/Timberdoodle
+- [SPMD Is Not Intel’s Cup Of Tea](http://www.joshbarczak.com/blog/?p=1120) (GPU kernel/SPMD abstraction can leave a lot of perf on the table)
+-
+- https://github.com/AcademySoftwareFoundation/MaterialX/ (PBR standard and GLSL implementation)
+- https://academysoftwarefoundation.github.io/OpenPBR/
