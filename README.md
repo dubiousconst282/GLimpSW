@@ -185,6 +185,40 @@ Resolve profile summary for Bistro:
   - 12%: Unpack and texture-map normals
 - 9%: EvalLighting (for one directional light)
 
+#### Triangle intersection
+A slightly more efficient way to intersect triangles in clip space is described in ["Triangle Scan Conversion using 2D Homogeneous Coordinates"](https://userpages.cs.umbc.edu/olano/papers/2dh-tri) by Olano and Greer. The following costs ~ 50 FLOPs compared to 70 in the snippet from the filmicworlds article, which sped resolve by 3-5%.
+
+```hlsl
+// Given a triangle in homogeneous space (before persp div), returns barycentrics
+// and derivatives at given screen coords [-1..+1]. Then, to interpolate `a`:
+//     a = a0*(1-u-v) + a1*u + a2*v
+//       = a0 + (a1-a0)*u + (a2-a0)*v
+//     ddx(a) = (a1-a0)*dx_u + (a2-a0)*dx_v
+//     ddy(a) = (a1-a0)*dy_u + (a2-a0)*dy_v
+// https://userpages.cs.umbc.edu/olano/papers/2dh-tri
+// https://www.cs.umd.edu/~zwicker/courses/computergraphics/Homogeneous_rasterization.pdf
+void IntersectTriangle(float4 v0, float4 v1, float4 v2, float2 screenNdc, float2 screenSize,
+                       out float2 uv, out float2 dx_uv, out float2 dy_uv) {
+    float3 m0 = cross(v2.xyw, v0.xyw);
+    float3 m1 = cross(v0.xyw, v1.xyw);
+    float3 m2 = cross(v1.xyw, v2.xyw);
+
+    float3 w = m0 + m1 + m2;
+    float3 e0 = float3(m0.x, m1.x, w.x);
+    float3 e1 = float3(m0.y, m1.y, w.y);
+    float3 e2 = float3(m0.z, m1.z, w.z);
+
+    float2 dd = 2.0 / screenSize;   // (may need to negate Y)
+    float3 a00 = screenPos.x * e0 + screenPos.y * e1 + e2;
+    float3 a10 = a00 + dd.x * e0;
+    float3 a01 = a00 + dd.y * e1;
+
+    uv = a00.xy * rcp(a00.z);
+    dx_uv = a10.xy * rcp(a10.z) - uv;
+    dy_uv = a01.xy * rcp(a01.z) - uv;
+}
+```
+
 ### Rasterizer Micro-opts
 The performance profile between small and large triangles is obviously very different.
 

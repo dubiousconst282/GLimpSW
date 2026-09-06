@@ -105,6 +105,7 @@ struct mdvec<T, 4> {
     SIMD_INLINE constexpr mdvec(T v_) : x(v_), y(v_), z(v_), w(v_) {}
     SIMD_INLINE constexpr mdvec(T x_, T y_, T z_, T w_) : x(x_), y(y_), z(z_), w(w_) {}
     SIMD_INLINE constexpr mdvec(mdvec<T, 2> v_, T z_, T w_) : x(v_.x), y(v_.y), z(z_), w(w_) {}
+    SIMD_INLINE constexpr mdvec(mdvec<T, 2> xy_, mdvec<T, 2> zw_) : x(xy_.x), y(xy_.y), z(zw_.x), w(zw_.y) {}
     SIMD_INLINE constexpr mdvec(mdvec<T, 3> v_, T w_) : x(v_.x), y(v_.y), z(v_.z), w(w_) {}
     SIMD_INLINE constexpr mdvec(const glm::vec<4, elem_type<T>>& v_) : x(v_.x), y(v_.y), z(v_.z), w(v_.w) {}
 
@@ -414,6 +415,7 @@ constexpr float inv_pi = 0.3183098861837907f;
 // Approximates sin(2πx) and cos(2πx)
 // Max abs error: sin=9.08735e-07 cos=7.07177e-06
 // https://publik-void.github.io/sin-cos-approximations
+// https://marc-b-reynolds.github.io/math/2020/03/11/SinCosPi.html
 SIMD_INLINE v_float2 sincos_2pi(v_float x) {
     // Reduce range to -1/4..1/4
     //   x = x + 0.25

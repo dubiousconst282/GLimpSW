@@ -105,66 +105,39 @@ const swr::ShaderDispatchTable
     ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();
 // clang-format on
 
-// http://filmicworlds.com/blog/visibility-buffer-rendering-with-material-graphs/
-static void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenNdc, float2 screenSize,  //
-                              v_float3& bary, v_float3& ddx, v_float3& ddy) {
-    v_float3 invW = 1.0f / v_float3(v0.w, v1.w, v2.w);
+// https://userpages.cs.umbc.edu/olano/papers/2dh-tri
+// https://www.cs.umd.edu/~zwicker/courses/computergraphics/Homogeneous_rasterization.pdf
+static void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 screenPos, float2 screenSize,  //
+                              v_float2& uv, v_float2& dx_uv, v_float2& dy_uv) {
+    v_float3 m0 = simd::cross(v_float3(v2.x, v2.y, v2.w), v_float3(v0.x, v0.y, v0.w));
+    v_float3 m1 = simd::cross(v_float3(v0.x, v0.y, v0.w), v_float3(v1.x, v1.y, v1.w));
+    v_float3 m2 = simd::cross(v_float3(v1.x, v1.y, v1.w), v_float3(v2.x, v2.y, v2.w));
 
-    v_float2 p0 = v_float2(v0) * invW.x;
-    v_float2 p1 = v_float2(v1) * invW.y;
-    v_float2 p2 = v_float2(v2) * invW.z;
+    v_float3 w = m0 + m1 + m2;
+    v_float3 e0 = v_float3(m0.x, m1.x, w.x);
+    v_float3 e1 = v_float3(m0.y, m1.y, w.y);
+    v_float3 e2 = v_float3(m0.z, m1.z, w.z);
+    
+    float2 dd = 2.0f / screenSize;
+    v_float3 a00 = screenPos.x * e0 + screenPos.y * e1 + e2;
+    v_float3 a10 = a00 + dd.x * e0;
+    v_float3 a01 = a00 + dd.y * e1;
 
-    v_float2 m0 = (p2 - p1), m1 = (p0 - p1);
-    v_float invDet = 1.0f / (m0.x * m1.y - m1.x * m0.y);
-
-    ddx = v_float3(p1.y - p2.y, p2.y - p0.y, p0.y - p1.y) * (invDet * invW);
-    ddy = v_float3(p2.x - p1.x, p0.x - p2.x, p1.x - p0.x) * (invDet * invW);
-    v_float ddxSum = ddx.x + ddx.y + ddx.z;
-    v_float ddySum = ddy.x + ddy.y + ddy.z;
-
-    v_float2 rel0 = screenNdc - p0;
-    v_float interpInvW = invW.x + rel0.x * ddxSum + rel0.y * ddySum;
-    v_float interpW = 1.0f / interpInvW;
-
-    bary.y = interpW * (rel0.x * ddx.y + rel0.y * ddy.y);
-    bary.z = interpW * (rel0.x * ddx.z + rel0.y * ddy.z);
-    bary.x = 1 - bary.y - bary.z;
-
-    // TODO: seems like this could be simplified a bit, see DAIS paper
-#if 0
-    ddx = v_float3(p1.y - p2.y, p2.y - p0.y, p0.y - p1.y) * invDet;
-    ddy = v_float3(p2.x - p1.x, p0.x - p2.x, p1.x - p0.x) * invDet;
-
-    v_float u = ddx.x * (screenUV.x - p2.x) + ddy.x * (screenUV.y - p2.y);
-    v_float v = ddx.y * (screenUV.x - p2.x) + ddy.y * (screenUV.y - p2.y);
-
-    v_float invW = 1.0f / simd::fma(u, p0.w, simd::fma(v, p1.w, p2.w * (1 - u - v)));
-    u *= p0.w * invW;
-    v *= p1.w * invW;
-#endif
-
-    ddx *= (2.0f / screenSize.x);
-    ddy *= -(2.0f / screenSize.y);
-    ddxSum *= (2.0f / screenSize.x);
-    ddySum *= -(2.0f / screenSize.y);
-
-    v_float interpW_ddx = 1.0f / (interpInvW + ddxSum);
-    v_float interpW_ddy = 1.0f / (interpInvW + ddySum);
-
-    ddx = interpW_ddx * (bary * interpInvW + ddx) - bary;
-    ddy = interpW_ddy * (bary * interpInvW + ddy) - bary;
+    uv = v_float2(a00) * (1.0f / a00.z);
+    dx_uv = v_float2(a10) * (1.0f / a10.z) - uv;
+    dy_uv = v_float2(a01) * (1.0f / a01.z) - uv;
 }
 
 static v_float3 ResolveNormal(v_uint packed[3], const v_float3& bary) {
-    // RGB10: 9141us  OctUnmap: 10568us  (1.15x)
-
-    // Folding snorm scaling after bary lerp saves 6 FMAs
-    // v_float3 v0 = swr::pixfmt::RGB10u::Unpack(packed[0]) * 2 - 1;
-
-    v_float3 v0 = simd::conv<float>(packed[0] >> v_uint3(0, 10, 20) & 1023);
-    v_float3 v1 = simd::conv<float>(packed[1] >> v_uint3(0, 10, 20) & 1023);
-    v_float3 v2 = simd::conv<float>(packed[2] >> v_uint3(0, 10, 20) & 1023);
-    return swr::BaryLerp(bary, v0, v1, v2) * (2.0f / 1023) - 1.0f;
+    // unorm10 -> [1..2)
+    v_float3 v[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        v_uint3 mant = packed[i] >> v_uint3(0, 10, 20) << 13;
+        mant = (mant & (1023 << 13)) | (127 << 23);
+        v[i] = simd::as<v_float3>(mant);
+    }
+    constexpr float scale = (1024.0f / 1023) * 2, bias = -(scale + 1);  // unorm * 2 - 1
+    return swr::BaryLerp(bary, v[0], v[1], v[2]) * scale + bias;
 }
 
 struct SurfaceAttribs {
@@ -229,19 +202,17 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     v_float4 ndc1 = simd::mul(ctx.WorldToClipMat, v_float4(pos[1], 1));
     v_float4 ndc2 = simd::mul(ctx.WorldToClipMat, v_float4(pos[2], 1));
 
-    v_float3 bary, ddx, ddy;
-    IntersectTriangle(ndc0, ndc1, ndc2, screenNdc, screenSize, bary, ddx, ddy);
+    v_float2 uv, dx_uv, dy_uv;
+    IntersectTriangle(ndc0, ndc1, ndc2, screenNdc, screenSize, uv, dx_uv, dy_uv);
 
     v_float2 texCoord0 = swr::pixfmt::RG16f::Unpack(packedTexCoord[0]);
     v_float2 texCoord10 = swr::pixfmt::RG16f::Unpack(packedTexCoord[1]) - texCoord0;
     v_float2 texCoord20 = swr::pixfmt::RG16f::Unpack(packedTexCoord[2]) - texCoord0;
 
-    v_float2 texCoord = texCoord0 + texCoord10 * bary.y + texCoord20 * bary.z;
+    v_float2 texCoord = texCoord0 + texCoord10 * uv.x + texCoord20 * uv.y;
     v_float4 texGrad = {
-        texCoord10.x * ddx.y + texCoord20.x * ddx.z,
-        texCoord10.y * ddx.y + texCoord20.y * ddx.z,
-        texCoord10.x * ddy.y + texCoord20.x * ddy.z,
-        texCoord10.y * ddy.y + texCoord20.y * ddy.z,
+        texCoord10 * dx_uv.x + texCoord20 * dx_uv.y,
+        texCoord10 * dy_uv.x + texCoord20 * dy_uv.y,
     };
 
     v_uint packedAlbedo = 0;
@@ -258,6 +229,7 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
         }
     }
 
+    v_float3 bary = { 1 - uv.x - uv.y, uv.x, uv.y };
     v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedNormal, bary), 0)));
     v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedTangent, bary), 0)));
     v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
