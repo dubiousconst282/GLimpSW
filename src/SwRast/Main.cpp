@@ -3,9 +3,9 @@
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
-#include <ImGuizmo.h>
 
 #include <tracy/Tracy.hpp>
 
@@ -22,6 +22,37 @@
 
 #include <vector>
 
+#define YSON_ENABLE_EXTRA_GLM
+#define YSON_ENABLE_EXTRA_STD_UNORDERED_MAP
+#include "Yson.h"
+
+#if __linux__
+    #include <sys/stat.h>
+#endif
+
+struct ModelDesc {
+    std::string Path;
+    glm::mat4x3 Transform;
+};
+struct RendererSettings {
+    bool OcclusionCulling = true;
+    bool EnableDDGI = false;
+    bool EnableShadows = false;
+    bool DrawProbes = false;
+
+    DebugLayer DebugView = DebugLayer::None;
+    float ExposureValue = -15.1f;
+    float2 ExposureRange = float2(-4.0f, +8.0f);
+
+    std::unordered_map<ImGuiID, bool> OpenCollapsingHeaders;
+};
+YSON_SERIALIZER_STRUCT_INLINE(ModelDesc, Path, Transform);
+YSON_SERIALIZER_STRUCT_INLINE(Camera, Position, Euler, MoveSpeed);
+YSON_SERIALIZER_STRUCT_INLINE(RendererSettings, OcclusionCulling, EnableShadows, EnableDDGI, DrawProbes, DebugView, ExposureValue,
+                              ExposureRange, OpenCollapsingHeaders);
+YSON_SERIALIZER_STRUCT_INLINE(GIProbeField, ProbeBaseOffset, ProbeSpacing, RaysPerProbe, MaxRayDist, MaxHysteresis, MultiBounce,
+                              ForceUpdateAll, NormalBias);
+
 namespace {
 
 GLFWwindow* _window;
@@ -35,6 +66,7 @@ swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
 GLuint _fbTexture = 0;
 
 Camera _cam;
+RendererSettings _settings;
 std::unique_ptr<Scene> _scene;
 swr::HdrTexture2D::Ptr _skyboxTex;
 std::unique_ptr<BrickMap> _brickmap;
@@ -68,10 +100,12 @@ void CreateFramebuffer(uint32_t width, uint32_t height) {
     if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
     _fbTexture = CreateTexture(_colorFb->Width, _colorFb->Height, 1, GL_RGBA8);
 }
-void LoadScene(const std::string& path) {
+void LoadScene(const std::vector<ModelDesc>& models) {
     ZoneScoped;
     _scene = std::make_unique<Scene>();
-    _scene->ImportGltf(path);
+    for (auto& model : models) {
+        _scene->ImportGltf(model.Path);
+    }
 
     if (_scene->Lights.size() == 0) {
         uint32_t offset = _scene->Lights.AllocRange(1);
@@ -93,24 +127,92 @@ void LoadSkybox(const std::string& path) {
 }
 
 void InitRenderer() {
-    LoadScene("assets/models/Sponza/Sponza.gltf");
     LoadSkybox("assets/skyboxes/sunflowers_puresky_4k.hdr");
     ShadingContext::LoadBlueNoise();
 
-    _cam = Camera { .Position = { -8.80000, 1.30000, -0.25000 }, .Euler = { 1.5411, -0.1024 }, .MoveSpeed = 5.0f };
-
-    _rast = std::make_unique<swr::Rasterizer>(4);
-    CreateFramebuffer(1920, 1080);
+    _rast = std::make_unique<swr::Rasterizer>(1);
 
     _shadowDepthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(1024, 1024, 1, 1);
     _probes = std::make_unique<GIProbeField>();
     _probes->ProbeBaseOffset = -float3(GIProbeField::GridSize) * _probes->ProbeSpacing / 2.0f;
 
-    // Adjustments for Sponza
-    _probes->ProbeBaseOffset.y = -0.5f;
-    _probes->ProbeBaseOffset.z -= 0.25f;
+    std::string rawSettings = R"({
+        Models: [{ Path: "assets/models/Sponza/Sponza.gltf" }],
+        Camera: {  Position: [-8.8, 1.3, -0.25],  Euler: [1.54, -0.10],  MoveSpeed: 5  },
+        Rasterizer: { NumThreads: 4,   Resolution: [1920, 1080] },
+        ProbeGI: { ProbeBaseOffset: [-12, -0.5, -12.25],  ProbeSpacing: 1.5, }
+    })";
+
+    if (FILE* fs = fopen("priv/settings.yml", "rb")) {
+        fseek(fs, 0, SEEK_END);
+        rawSettings.resize((size_t)ftell(fs));
+        fseek(fs, 0, SEEK_SET);
+
+        fread(rawSettings.data(), rawSettings.size(), 1, fs);
+        fclose(fs);
+    }
+
+    auto rd = yson::Reader(rawSettings);
+    rd.ReadExpect(yson::kTypeObject);
+
+    while (rd.ReadNext()) {
+        if (rd.MatchObject("Camera")) {
+            rd.Parse(_cam);
+        }  //
+        else if (rd.MatchObject("Renderer")) {
+            rd.Parse(_settings);
+        }  //
+        else if (rd.MatchArray("Models")) {
+            LoadScene(rd.Parse<std::vector<ModelDesc>>());
+        }  //
+        else if (rd.MatchObject("ProbeGI")) {
+            rd.Parse(*_probes);
+        }  //
+        else if (rd.MatchObject("Rasterizer")) {
+            while (rd.ReadNext()) {
+                if (rd.Match("NumThreads", yson::kTypeNumber)) _rast->SetThreadCount(rd.GetU32());
+                if (rd.Match("Resolution", yson::kTypeArray)) {
+                    uint2 res = rd.Parse<uint2>();
+                    CreateFramebuffer(res.x, res.y);
+                }
+            }
+        }
+    }
 
     _probes->Reset(true);
+}
+void SaveSettings() {
+    auto wr = yson::Writer();
+    wr.BeginObject();
+
+    wr.Write("Camera", _cam);
+    wr.Write("Renderer", _settings);
+    wr.Write("ProbeGI", *_probes);
+
+    wr.BeginObject("Rasterizer");
+    wr.WriteInt("NumThreads", _rast->GetThreadCount());
+    wr.Write("Resolution", uint2(_colorFb->Width, _colorFb->Height));
+    wr.EndObject();
+
+    wr.BeginArray("Models");
+    for (auto& model : _scene->Models) {
+        wr.Write(ModelDesc {
+            .Path = model->Path,
+            .Transform = model->RootNode.GlobalTransform,
+        });
+    }
+    wr.EndArray();
+
+    wr.EndObject();
+
+#if __linux__
+    mkdir("./priv", 0777);
+#endif
+
+    FILE* fs = fopen("priv/settings.yml", "wb");
+    if (!fs) return;
+    fwrite(wr.Buffer.data(), wr.Buffer.size(), 1, fs);
+    fclose(fs);
 }
 
 void DrawModel(Model& model, ShadingContext& shader, const swr::ShaderDispatchTable& dispatcher,
@@ -145,23 +247,6 @@ void DrawModel(Model& model, ShadingContext& shader, const swr::ShaderDispatchTa
                 _rast->DrawMeshlets(meshCount, { dispatcher, &shader });
             }
         }
-    }
-}
-
-void DrawTranslationGizmo(glm::vec3& pos) {
-    ImGuizmo::BeginFrame();
-
-    ImGuiIO& io = ImGui::GetIO();
-    ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
-
-    glm::mat4 projMat = _cam.GetProjMatrix();
-    glm::mat4 viewMat = _cam.GetViewMatrix(true);
-    float matrix[16];
-    float temp[3]{ 1.0f, 1.0f, 1.0f };
-    ImGuizmo::RecomposeMatrixFromComponents(&pos.x, temp, temp, matrix);
-
-    if (ImGuizmo::Manipulate(&viewMat[0].x, &projMat[0].x, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, matrix)) {
-        ImGuizmo::DecomposeMatrixToComponents(matrix, &pos.x, temp, temp);
     }
 }
 
@@ -217,6 +302,15 @@ void ComputeShadowMatrices(const Camera& cam, float3 lightDir, uint32_t renderSi
     }
 }
 
+// https://github.com/ocornut/imgui/issues/6215
+bool CollapsingHeaderWithSavedState(const char* label, bool defaultState) {
+    ImGuiID id = ImGui::GetID(label);
+    auto [savedState, firstTime] = _settings.OpenCollapsingHeaders.emplace(ImGui::GetID(label), false);
+
+    ImGui::SetNextItemOpen(firstTime ? defaultState : savedState->second, ImGuiCond_Once);
+    return savedState->second = ImGui::CollapsingHeader(label);
+}
+
 void RenderFrame() {
     FrameMark;
 
@@ -235,81 +329,80 @@ void RenderFrame() {
         nfdresult_t result = NFD_OpenDialogU8_With(&outPath, &args);
 
         if (result == NFD_OKAY) {
-            LoadScene(std::string(outPath));
+            LoadScene({ { .Path = std::string(outPath) } });
             NFD_FreePathU8(outPath);
         }
     }
 
-    ImGui::SeparatorText("Rasterizer");
+    if (CollapsingHeaderWithSavedState("Rasterizer", true)) {
+        char currRes[64];
+        snprintf(currRes, sizeof(currRes), "%dx%d", _colorFb->Width, _colorFb->Height);
+        if (ImGui::BeginCombo("Resolution", currRes)) {
+            if (ImGui::Selectable("Window Size")) {
+                int2 size;
+                glfwGetFramebufferSize(_window, &size.x, &size.y);
+                // Min alignment is 4x4 but GetPixels() will explode if the row stride isn't cache aligned, so ...16x4 it is.
+                size = glm::clamp((size + int2(15, 3)) & ~int2(15, 3), 32, (int)swr::Rasterizer::MaxRenderSize);
+                CreateFramebuffer((uint32_t)size.x, (uint32_t)size.y);
 
-    char currRes[64];
-    snprintf(currRes, sizeof(currRes), "%dx%d", _colorFb->Width, _colorFb->Height);
-    if (ImGui::BeginCombo("Resolution", currRes)) {
-        if (ImGui::Selectable("2880x1620")) CreateFramebuffer(2880, 1620);
-        if (ImGui::Selectable("2560x1440")) CreateFramebuffer(2560, 1440);
-        if (ImGui::Selectable("1920x1080")) CreateFramebuffer(1920, 1080);
-        if (ImGui::Selectable("1280x720")) CreateFramebuffer(1280, 720);
-        if (ImGui::Selectable("848x480")) CreateFramebuffer(848, 480);
-        if (ImGui::Selectable("320x240")) CreateFramebuffer(320, 240);
-        ImGui::EndCombo();
+                float2 scale;
+                glfwGetWindowContentScale(_window, &scale.x, &scale.y);
+                glfwSetWindowSize(_window, (int)(size.x / scale.x + 0.5f), (int)(size.y / scale.y + 0.5f));
+            }
+            if (ImGui::Selectable("2880x1620")) CreateFramebuffer(2880, 1620);
+            if (ImGui::Selectable("2560x1440")) CreateFramebuffer(2560, 1440);
+            if (ImGui::Selectable("1920x1080")) CreateFramebuffer(1920, 1080);
+            if (ImGui::Selectable("1280x720")) CreateFramebuffer(1280, 720);
+            if (ImGui::Selectable("848x480")) CreateFramebuffer(848, 480);
+            if (ImGui::Selectable("320x240")) CreateFramebuffer(320, 240);
+            ImGui::EndCombo();
+        }
+
+        int numThreads = (int)_rast->GetThreadCount();
+        if (ImGui::SliderInt("Threads", &numThreads, 1, (int)std::thread::hardware_concurrency())) {
+            _rast->SetThreadCount((uint32_t)numThreads);
+        }
+        ImGui::Checkbox("Binning", &_rast->EnableBinning);
+        ImGui::Checkbox("Clipping", &_rast->EnableClipping);
+        ImGui::Checkbox("Guardband", &_rast->EnableGuardband);
+        ImGui::Checkbox("Intersect Bins", &_rast->EnableBinIntersect);
     }
-
-    int numThreads = (int)_rast->GetThreadCount();
-    if (ImGui::SliderInt("Threads", &numThreads, 1, (int)std::thread::hardware_concurrency())) {
-        _rast->SetThreadCount((uint32_t)numThreads);
-    }
-    ImGui::Checkbox("Binning", &_rast->EnableBinning);
-    ImGui::Checkbox("Clipping", &_rast->EnableClipping);
-    ImGui::Checkbox("Guardband", &_rast->EnableGuardband);
-    ImGui::Checkbox("Intersect Bins", &_rast->EnableBinIntersect);
-
-    ImGui::SeparatorText("Renderer");
-
-    static bool s_OcclusionCulling = true;
-    static bool s_EnableDDGI = false;
-    static bool s_EnableShadows = false;
-    static bool s_DrawProbes = true;
-    ImGui::Checkbox("Occlusion Culling", &s_OcclusionCulling);
-    ImGui::Checkbox("DDGI", &s_EnableDDGI);
-    ImGui::Checkbox("Shadows", &s_EnableShadows);
-    ImGui::Checkbox("Draw Probes", &s_DrawProbes);
-
-    static DebugLayer s_DebugView = DebugLayer::None;
-    {
-        const int count = std::size(kDebugLayerNames);
-        ImGui::Combo("Debug View", (int*)&s_DebugView, kDebugLayerNames, count);
-
-        int idx = (int)s_DebugView;
-        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) s_DebugView = (DebugLayer)((idx == 0 ? count : idx) - 1);
-        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) s_DebugView = (DebugLayer)((idx + 1 < count ? idx + 1 : 0));
-    }
-    static int debugShadowLayerIdx = -1;
-    ImGui::SliderInt("Debug Shadows", &debugShadowLayerIdx, -1, MaxShadowCascades);
 
     static AutoExposureData s_ExposureData = {};
-    static float s_ExposureValue = -15.1f;
-    bool autoExposure = s_ExposureValue < -15.0f;
+    bool autoExposure = _settings.ExposureValue < -15.0f;
 
-    if (ImGui::SliderFloat("Exposure", &s_ExposureValue, -15.1f, 15.0f, autoExposure ? "Auto" : "%+.1f")) {
-        s_ExposureData.Exposure = 1.0f / exp2(-s_ExposureValue) * 1.2f; // EV100 -> Lmax
-    }
+    if (CollapsingHeaderWithSavedState("Renderer", true)) {
+        ImGui::Checkbox("Occlusion Culling", &_settings.OcclusionCulling);
 
-    ImGui::DragFloatRange2("LogRange", &s_ExposureData.HistRange.x, &s_ExposureData.HistRange.y, 0.1f, -12.0f, 12.0f, "%.3f");
+        {
+            const int count = std::size(kDebugLayerNames);
+            ImGui::Combo("Debug View", (int*)&_settings.DebugView, kDebugLayerNames, count);
 
-    ImGui::SeparatorText("Misc");
-    ImGui::SliderFloat("Cam Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+            int idx = (int)_settings.DebugView;
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_1)) _settings.DebugView = (DebugLayer)((idx == 0 ? count : idx) - 1);
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_2)) _settings.DebugView = (DebugLayer)((idx + 1 < count ? idx + 1 : 0));
+        }
 
-    ImGui::InputScalarN("Pos", ImGuiDataType_Double, &_cam.Position, 3);
-    if (ImGui::IsItemActive() && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
-        char text[128];
-        snprintf(text, sizeof(text), ".Position = { %.5f, %.5f, %.5f }, .Euler = { %.4f, %.4f }",  //
-                 _cam.Position.x, _cam.Position.y, _cam.Position.z, _cam.Euler.x, _cam.Euler.y);
-        ImGui::SetClipboardText(text);
-    }
-    ImGui::End();
+        ImGui::SliderFloat("Exposure", &_settings.ExposureValue, -15.1f, 15.0f, autoExposure ? "Auto" : "%+.1f");
+        ImGui::DragFloatRange2("Exposure Range", &_settings.ExposureRange.x, &_settings.ExposureRange.y, 0.1f, -12.0f, 12.0f, "%.3f");
 
-    if (ImGui::IsKeyPressed(ImGuiKey_C)) {
-        _cam.Mode = _cam.Mode == Camera::InputMode::FirstPerson ? Camera::InputMode::Arcball : Camera::InputMode::FirstPerson;
+        if (!autoExposure) {
+            s_ExposureData.Exposure = 1.0f / exp2f(-_settings.ExposureValue) * 1.2f;  // EV100 -> Lmax
+        }
+        s_ExposureData.HistRange = _settings.ExposureRange;
+
+        ImGui::SeparatorText("Camera");
+        ImGui::SliderFloat("Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+
+        ImGui::DragScalarN("Pos", ImGuiDataType_Double, &_cam.Position, 3, 0.01f * _cam.MoveSpeed, nullptr, nullptr, "%.4f");
+
+        if (ImGui::IsItemActive() && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
+            char text[128];
+            snprintf(text, sizeof(text), ".Position = { %.5f, %.5f, %.5f }, .Euler = { %.4f, %.4f }",  //
+                     _cam.Position.x, _cam.Position.y, _cam.Position.z, _cam.Euler.x, _cam.Euler.y);
+            ImGui::SetClipboardText(text);
+        }
+        ImGui::DragScalarN("Rot", ImGuiDataType_Float, &_cam.Euler, 2, 0.01f);
     }
 
     float4x4 prevCamViewMat = _cam.GetViewMatrix(true);
@@ -332,37 +425,68 @@ void RenderFrame() {
         .PrevViewMat = prevCamViewMat,
 
         .SkyboxTex = _skyboxTex.get(),
-        .ProbeField = s_EnableDDGI ? _probes.get() : nullptr,
         .BrickMap = _brickmap.get(),
         .Exposure = s_ExposureData.Exposure,
         .AutoExp = autoExposure ? &s_ExposureData : nullptr,
     };
 
     Light* sunLight = _scene->Lights[0].Type == Light::kTypeDirectional ? &_scene->Lights[0] : nullptr;
+    static float shadowSampleRadius = 3;
+    static int shadowCascadeIdx = 2;
+    static bool shadowDebug = false;
 
-    if (sunLight != nullptr && s_EnableShadows) {
+    if (CollapsingHeaderWithSavedState("Shadows", _settings.EnableShadows)) {
+        if (sunLight != nullptr) {
+            ImGui::Checkbox("Enabled##Shadows", &_settings.EnableShadows);
+
+            float3 dir = sunLight->Direction;
+            static float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
+            if (ImGui::DragFloat2("Direction", &angle.x, 0.01f)) {
+                float r = cosf(angle.y);
+                sunLight->Direction = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
+            }
+        }
+        ImGui::DragFloat("Sample Radius", &shadowSampleRadius, 0.01, 1, 10, "%.1f");
+        ImGui::SliderInt("Active Cascade", &shadowCascadeIdx, 0, 3);
+        ImGui::Checkbox("Debug", &shadowDebug);
+
+        ImGui::DragFloat("Intensity", &sunLight->Intensity, 0.1f, 0, 1000);
+    }
+
+    static bool s_HalfRes = false;
+
+    if (CollapsingHeaderWithSavedState("ProbeGI", _settings.EnableDDGI)) {
+        ImGui::Checkbox("Enabled##DDGI", &_settings.EnableDDGI);
+        ImGui::Checkbox("Draw Probes", &_settings.DrawProbes);
+        ImGui::Checkbox("HalfRes Resolve", &s_HalfRes);
+
+        bool reinitProbes = false;
+        reinitProbes |= ImGui::DragFloat3("Probe Offset", &_probes->ProbeBaseOffset.x, 0.1f);
+        reinitProbes |= ImGui::DragFloat("Probe Spacing", &_probes->ProbeSpacing, 0.1f, 0.1f, 5.0f);
+        if (reinitProbes) _probes->Reset(false);
+
+        ImGui::SliderInt("Rays/Probe", (int*)&_probes->RaysPerProbe, 16, 128);
+        ImGui::SliderInt("Max Hysteresis", (int*)&_probes->MaxHysteresis, 1, 128);
+        ImGui::DragFloat("Ray Max Dist", &_probes->MaxRayDist, 0.1f, 1.0f, 100.0f);
+        ImGui::DragFloat("Normal Bias", &_probes->NormalBias, 0.001, 0.01f, 0.5f);
+
+        static float skyboxIntensity = 1;
+        ImGui::DragFloat("Skybox Intensity", &skyboxIntensity, 0.01, 0.001f, 100.0f);
+        shader.SkyboxIntensity = skyboxIntensity;
+
+        ImGui::Checkbox("Multi-Bounce", &_probes->MultiBounce);
+        ImGui::Checkbox("Force Update All", &_probes->ForceUpdateAll);
+    }
+
+    if (sunLight != nullptr && _settings.EnableShadows) {
         ZoneScopedN("ShadowMap");
-
         SWR_PERF_DEF_COUNTER(ShadowElapsed);
         SWR_PERF_BEGIN(ShadowElapsed);
 
-        float3 dir = sunLight->Direction;
-        static float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
-        if (ImGui::DragFloat2("Sun angle", &angle.x, 0.01f)) {
-            float r = cosf(angle.y);
-            sunLight->Direction = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
-        }
-
-        static float sampleRadius = 3;
-        ImGui::DragFloat("Sample Radius", &sampleRadius, 0.01, 1, 10, "%.1f");
-
-        static int cascadeIdx = 2;
-        ImGui::SliderInt("Active Cascade", &cascadeIdx, 0, 3);
-
         ComputeShadowMatrices(_cam, sunLight->Direction, _shadowDepthFb->Width, shader.ShadowProjMatrices);
         shader.ShadowDepthMap = _shadowDepthFb.get();
-        shader.ShadowSampleRadius = sampleRadius;
-        shader.ShadowProjMatrices[0] = shader.ShadowProjMatrices[cascadeIdx];  // TODO: sample cascades
+        shader.ShadowSampleRadius = shadowSampleRadius;
+        shader.ShadowProjMatrices[0] = shader.ShadowProjMatrices[shadowCascadeIdx];  // TODO: sample cascades
 
         _shadowDepthFb->Clear(0);
         shader.DepthBuffer = _shadowDepthFb.get();
@@ -378,7 +502,7 @@ void RenderFrame() {
         SWR_PERF_END(ShadowElapsed);
     }
 
-    bool debugOverdraw = s_DebugView == DebugLayer::OverdrawPixel || s_DebugView == DebugLayer::OverdrawQuad;
+    bool debugOverdraw = _settings.DebugView == DebugLayer::OverdrawPixel || _settings.DebugView == DebugLayer::OverdrawQuad;
     auto& dispatchTable = debugOverdraw ? ShadingContext::OverdrawShader : ShadingContext::VisBufferShader;
 
     {
@@ -393,13 +517,14 @@ void RenderFrame() {
     shader.ProjMat = camProjMat;
     shader.ViewMat = camViewMat;
     shader.WorldToClipMat = camProjViewMat;
+    shader.ProbeField = _settings.EnableDDGI ? _probes.get() : nullptr;
 
     auto instances = std::vector<InstanceData>();
     instances.resize(1); // reserve 0th instance id for "null"
     instances.reserve(1024);
 
     for (auto& model : _scene->Models) {
-        DrawModel(*model, shader, dispatchTable, &instances, s_OcclusionCulling);
+        DrawModel(*model, shader, dispatchTable, &instances, _settings.OcclusionCulling);
     }
 
     SWR_PERF_DEF_COUNTER(Resolve);
@@ -408,13 +533,10 @@ void RenderFrame() {
     shader.DepthBuffer = _depthFb.get();
     shader.Instances = instances.data();
 
-    static bool s_HalfRes = true;
-    ImGui::Checkbox("Half Res Resolve", &s_HalfRes);
-
-    if (s_DebugView == DebugLayer::None) {
+    if (_settings.DebugView == DebugLayer::None) {
         ZoneScopedN("Resolve");
 
-        if (s_HalfRes && s_EnableShadows) {
+        if (s_HalfRes && _settings.EnableDDGI) {
             shader.ResolveHalfRes(*_rast);
         } else {
             shader.Resolve(*_rast);
@@ -424,34 +546,12 @@ void RenderFrame() {
         if (autoExposure) {
             s_ExposureData.UpdateExposure(ImGui::GetIO().DeltaTime, 1.1f);
         }
-    } else if (s_DebugView != DebugLayer::None) {
-        shader.ResolveDebug(*_rast, s_DebugView);
+    } else if (_settings.DebugView != DebugLayer::None) {
+        shader.ResolveDebug(*_rast, _settings.DebugView);
     }
     SWR_PERF_END(Resolve);
 
-    bool reinitProbes = false;
-    reinitProbes |= ImGui::DragFloat3("Probe Offset", &_probes->ProbeBaseOffset.x, 0.1f);
-    reinitProbes |= ImGui::DragFloat("Probe Spacing", &_probes->ProbeSpacing, 0.1f, 0.1f, 5.0f);
-    if (reinitProbes) _probes->Reset(false);
-
-    static bool forceUpdateAll = false;
-    ImGui::SliderInt("Rays/Probe", (int*)&_probes->RaysPerProbe, 16, 128);
-    ImGui::SliderInt("Max Hysteresis", (int*)&_probes->MaxHysteresis, 1, 128);
-    ImGui::DragFloat("Ray Max Dist", &_probes->MaxRayDist, 0.1f, 1.0f, 100.0f);
-    ImGui::DragFloat("Normal Bias", &_probes->NormalBias, 0.001, 0.01f, 0.5f);
-
-    static float skyboxIntensity = 1;
-    ImGui::DragFloat("Skybox Intensity", &skyboxIntensity, 0.01, 0.001f, 100.0f);
-    shader.SkyboxIntensity = skyboxIntensity;
-
-    if (sunLight) ImGui::DragFloat("Sun Intensity", &sunLight->Intensity, 0.1f, 0, 1000);
-
-    ImGui::Checkbox("Multi-Bounce", &_probes->MultiBounce);
-    ImGui::Checkbox("Force Update All", &forceUpdateAll);
-
-    if (forceUpdateAll) memset(_probes->CurrActiveBitmap, 255, sizeof(_probes->CurrActiveBitmap));
-
-    if (s_EnableDDGI) {
+    if (_settings.EnableDDGI) {
         ZoneScopedN("ProbeUpdate");
 
         SWR_PERF_DEF_COUNTER(ProbeUpdateElapsed);
@@ -459,12 +559,14 @@ void RenderFrame() {
         shader.UpdateProbes(*_rast);
         SWR_PERF_END(ProbeUpdateElapsed);
 
-        if (s_DrawProbes) {
+        if (_settings.DrawProbes) {
             shader.DrawProbesDebug();
         }
     }
 
-    if (debugShadowLayerIdx >= 0) {
+    ImGui::End();
+
+    if (shadowDebug) {
         uint2 size = uint2(_colorFb->Width / 3, _colorFb->Height / 3);
         uint2 offset = uint2(_colorFb->Width - size.x, _colorFb->Height - size.y) & ~3u;
 
@@ -480,7 +582,7 @@ void RenderFrame() {
         }
     }
 
-    if (s_OcclusionCulling) {
+    if (_settings.OcclusionCulling) {
         ZoneScopedN("BuildHiZ");
 
         SWR_PERF_BEGIN(MeshCull);
@@ -514,6 +616,7 @@ void RenderFrame() {
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::PushStyleVarY(ImGuiStyleVar_ItemSpacing, 0);
     ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize);
 
     swr::perf::EndFrame();
@@ -536,6 +639,7 @@ void RenderFrame() {
                 swr::perf::GetAverage("ShadowElapsed") / 1e6,  //
                 swr::perf::GetAverage("ProbeUpdateElapsed") / 1e6);
     ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 };
@@ -560,12 +664,41 @@ int main(int argc, char** args) {
 
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = "logs/imgui.ini";
+    io.IniFilename = "priv/imgui.ini";
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     io.Fonts->AddFontFromFileTTF("assets/Roboto-Medium.ttf", 16.0f);
 
     ImGui::StyleColorsDark();
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 2;
+    style.GrabRounding = 3;
+    style.ScrollbarSize = 8;
+    style.ScrollbarPadding = 1;
+    style.FramePadding.y = 2;
+    style.SeparatorTextBorderSize = 1;
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg]               = ImVec4(0.12f, 0.12f, 0.14f, 0.93f);
+    colors[ImGuiCol_PopupBg]                = ImVec4(0.19f, 0.19f, 0.22f, 0.93f);
+    colors[ImGuiCol_FrameBg]                = ImVec4(0.30f, 0.33f, 0.37f, 0.54f);
+    colors[ImGuiCol_FrameBgHovered]         = ImVec4(0.53f, 0.58f, 0.64f, 0.40f);
+    colors[ImGuiCol_FrameBgActive]          = ImVec4(0.53f, 0.58f, 0.64f, 0.54f);
+    colors[ImGuiCol_CheckboxSelectedBg]     = ImVec4(0.30f, 0.33f, 0.37f, 0.54f);
+    colors[ImGuiCol_TitleBg]                = ImVec4(0.16f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(0.00f, 0.00f, 0.00f, 0.31f);
+    colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.02f, 0.02f, 0.02f, 0.20f);
+
+    float scale;
+    glfwGetWindowContentScale(_window, &scale, nullptr);
+
+    if (scale != (int)scale) {
+        scale = 1.0f + (scale - (int)scale);
+        style.FontScaleDpi = scale;
+        style.ScaleAllSizes(scale);
+    }
 
     ImGui_ImplGlfw_InitForOpenGL(_window, true);
     ImGui_ImplOpenGL3_Init();
@@ -578,6 +711,33 @@ int main(int argc, char** args) {
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+
+        ImGuiIO& io = ImGui::GetIO();
+
+        // On platforms like Wayland, fractional FB scaling makes text and lines blurry and shimmery.
+        // We'll do a little hacking to force ImGui render everything at int scale, and adjust style at startup.
+        ImVec2 fbScale = io.DisplayFramebufferScale;
+        ImVec2 fbScaleI = ImVec2((int)fbScale.x, (int)fbScale.y);
+        if (fbScale.x != fbScaleI.x || fbScale.y != fbScaleI.y) {
+            fbScale.x = 1.0f + (fbScale.x - fbScaleI.x);
+            fbScale.y = 1.0f + (fbScale.y - fbScaleI.y);
+
+            io.DisplaySize.x *= fbScale.x;
+            io.DisplaySize.y *= fbScale.y;
+            io.DisplayFramebufferScale = fbScaleI;
+
+            for (auto& event : ImGui::GetCurrentContext()->InputEventsQueue) {
+                static ImU32 _lastRescaledMouseEventId = 0;
+                if (event.Type == ImGuiInputEventType_MousePos && event.EventId > _lastRescaledMouseEventId) {
+                    event.MousePos.PosX *= fbScale.x;
+                    event.MousePos.PosY *= fbScale.y;
+                    // ImGui will occasionally defer events due to the trickling rule (see ImGui::UpdateInputEvents()).
+                    // This ensures we only rewrite the same event once.
+                    _lastRescaledMouseEventId = event.EventId;
+                }
+            }
+        }
+
         ImGui::NewFrame();
 
         if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
@@ -610,7 +770,13 @@ int main(int argc, char** args) {
 
         glfwSwapBuffers(_window);
     }
+
+    SaveSettings();
     glDeleteTextures(1, &_fbTexture);
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     NFD_Quit();
     glfwTerminate();

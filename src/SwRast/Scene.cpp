@@ -171,6 +171,7 @@ Model* Scene::ImportGltf(const std::string& path) {
     std::string basePath = path.substr(0, path.find_last_of("/\\"));
 
     Model* model = Models.emplace_back(std::make_unique<Model>()).get();
+    model->Path = path;
 
     uint32_t materialOffset = Materials.AllocRange(gltf->materials_count);
 

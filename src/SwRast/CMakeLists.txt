@@ -18,6 +18,7 @@ add_executable(Playground
     Main.cpp
     Shading.cpp
     Voxel.cpp
+    Yson.cpp
 )
 target_link_libraries(Playground PRIVATE
     SwRast

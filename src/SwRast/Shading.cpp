@@ -490,7 +490,7 @@ static v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3
         gridPos.z = simd::clamp(gridPos.z, 0, gridSize.z - 1);
         v_int probeIdx = gridPos.x + (gridPos.z * gridSize.x) + (gridPos.y * (gridSize.x * gridSize.z));
 
-        v_float3 probePos;
+        v_float3 probePos = {};
         simd_foreach_unique_lane(i, probeIdx, true) {
             simd::cmov(probePos, field.Positions[i], v_exec);
 
@@ -599,15 +599,15 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
                     v_float3 irradiance = 0;
                     v_float shadowMask = 1;
 
+                    if (ShadowDepthMap != nullptr) {
+                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+                    }
                     if (ProbeField != nullptr) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, simd::normalize(ViewPos - worldPos));
                     } else {
                         // ambient hack
                         v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
                         irradiance = Lights[0].Intensity * 0.02f * (NdotL * NdotL + 0.2);
-                    }
-                    if (ShadowDepthMap != nullptr) {
-                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
                     }
                     finalColor = EvalLighting(*this, surf, worldPos, irradiance, shadowMask);
                 }
@@ -757,11 +757,13 @@ void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
                         .Metallic = simd::conv<float>(surfaceAlbedoMR[surfaceDataOffset].y >> 16 & 255) / 255.0f,
                         .Roughness = simd::conv<float>(surfaceAlbedoMR[surfaceDataOffset].y >> 24 & 255) / 255.0f,
                     };
-                    //v_float shadowMask = simd::conv<float>(FbLoadUpsample8x8_U8(halfShadowMap, uint2(x, y))) / 255.0;
-                    v_float shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
-
                     v_float3 irradiance = 0;
+                    v_float shadowMask = 1;
+                    //v_float shadowMask = simd::conv<float>(FbLoadUpsample8x8_U8(halfShadowMap, uint2(x, y))) / 255.0;
 
+                    if (ShadowDepthMap != nullptr) {
+                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+                    }
                     if (ProbeField != nullptr) {
                         irradiance = swr::pixfmt::R11G11B10f::Unpack(UpSample8x8(halfDiffuseMap, uint2(x, y)));
                     } else {
@@ -920,7 +922,7 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
         } else if (layer == DebugLayer::ProbeIrradiance && ProbeField != nullptr) {
             v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(tileNdc, skyMask ? 1.0f : depth, 1.0f))));
             finalColor = SampleDiffuse(*ProbeField, worldPos, surface.Normal, simd::normalize(ViewPos - worldPos));
-            finalColor = Tonemap_Unreal(finalColor);
+            finalColor = Tonemap_Unreal(finalColor * Exposure);
         }
 
         if (layer == DebugLayer::VisResolveHeatmap || layer == DebugLayer::RaycastHeatmap) {
@@ -1158,6 +1160,10 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
         }
     }
 
+    if (ProbeField->ForceUpdateAll) {
+        memset(ProbeField->CurrActiveBitmap, 255, sizeof(ProbeField->CurrActiveBitmap));
+    }
+
     // Trace probes
     raster.Dispatch([&](uint32_t workerId) {
         uint32_t probesPerThread = GIProbeField::ProbesPerCascade / raster.GetThreadCount();
@@ -1200,18 +1206,23 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
                     if (ProbeField->MultiBounce) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
                     }
-                    v_float shadowMask = SampleShadowMap(*this, worldPos, uint3(0, 0, 0), 1);
+                    v_float shadowMask = 0;
+                    if (ShadowDepthMap != nullptr) {
+                        shadowMask = SampleShadowMap(*this, worldPos, uint3(0, 0, 0), 1);
+                    }
                     simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, shadowMask), v_exec);
                 }
                 simd_if(isMiss) {
                     constexpr swr::SamplerDesc sampler = { .MagFilter = swr::FilterMode::Nearest, .MinFilter = swr::FilterMode::Nearest };
-                    simd::cmov(radiance, SkyboxTex->SampleOctLevel<sampler>(rayDir, 4) * SkyboxIntensity, v_exec);
-                }
+                    v_float3 skyColor = SkyboxTex->SampleOctLevel<sampler>(rayDir, 4);
 
-                // Clamp fireflies (mostly coming from skybox)
-                v_float luminance = simd::dot(radiance, 1);
-                const float maxLuminance = 20;
-                radiance *= simd::min(1.0f, (maxLuminance * 2) * simd::approx_rcp(maxLuminance + luminance));
+                    // Clamp fireflies
+                    const float maxLuminance = 15;
+                    v_float luminance = simd::dot(skyColor, 1);
+                    skyColor *= simd::min(1.0f, (maxLuminance * 2) * simd::approx_rcp(maxLuminance + luminance));
+
+                    simd::cmov(radiance, skyColor * SkyboxIntensity, v_exec);
+                }
 
                 simd::store(&rayRadiance[0][i], radiance.x);
                 simd::store(&rayRadiance[1][i], radiance.y);
@@ -1299,7 +1310,7 @@ void ShadingContext::DrawProbesDebug() {
 
 #if 1
                 v_float3 color = SampleProbeIrradiance(*ProbeField, (int)i, surfacePos - center);
-                color = Tonemap_Unreal(color);
+                color = Tonemap_Unreal(color * Exposure);
 #else
                 v_float2 moments = SampleProbeDepth(*ProbeField, (int)i, surfacePos - center);
                 v_float variance = simd::abs(moments.x * moments.x - moments.y);

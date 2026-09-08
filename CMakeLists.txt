@@ -10,7 +10,7 @@ if(NOT DEFINED ENV{CPM_SOURCE_CACHE})
     set(CPM_SOURCE_CACHE "${CMAKE_BINARY_DIR}/deps/")  # speeds up cmake configures
 endif()
 
-CPMAddPackage("gh:glfw/glfw#3.4")
+CPMAddPackage("gh:glfw/glfw#3.5.1")
 CPMAddPackage("gh:g-truc/glm#1.0.3")
 CPMAddPackage("gh:nothings/stb#master")
 
@@ -22,7 +22,7 @@ CPMAddPackage("gh:martinus/nanobench#v4.3.11")
 set(NFD_PORTAL ON)
 CPMAddPackage("gh:btzy/nativefiledialog-extended#v1.3.0")
 
-set(TRACY_ON_DEMAND ON)
+set(TRACY_ENABLE ON)
 CPMAddPackage("gh:wolfpld/tracy#v0.14.1")
 
 # Glad
@@ -30,8 +30,8 @@ add_library(glad STATIC deps/glad/src/glad.c)
 target_include_directories(glad PUBLIC deps/glad/include/)
 
 # ImGui
-CPMAddPackage("gh:ocornut/imgui#v1.92.7")
-CPMAddPackage(GITHUB_REPOSITORY "CedricGuillemet/ImGuizmo" GIT_TAG "1.9" DOWNLOAD_ONLY TRUE)
+CPMAddPackage("gh:ocornut/imgui#v1.92.9b-docking")
+# CPMAddPackage(GITHUB_REPOSITORY "CedricGuillemet/ImGuizmo" GIT_TAG "1.10" DOWNLOAD_ONLY TRUE)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -43,7 +43,7 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     
-    ${ImGuizmo_SOURCE_DIR}/src/ImGuizmo.cpp
+    # ${ImGuizmo_SOURCE_DIR}/src/ImGuizmo.cpp
 )
 target_include_directories(imgui PUBLIC 
     ${imgui_SOURCE_DIR} 

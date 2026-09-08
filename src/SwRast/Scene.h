@@ -80,7 +80,7 @@ struct Animation;
 struct Scene;
 
 struct Model {
-    Scene* ParentScene;
+    std::string Path;
     std::vector<Animation> Animations;
 
     std::vector<ModelNode> Nodes;

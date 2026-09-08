@@ -97,6 +97,7 @@ struct GIProbeField {
     float MaxRayDist = 10;
     uint32_t MaxHysteresis = 64;
     bool MultiBounce = false;
+    bool ForceUpdateAll = false;    // Disable culling and update all probes
 
     // Sampling
     float NormalBias = 0.12;
