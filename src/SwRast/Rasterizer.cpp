@@ -444,7 +444,11 @@ void Clipper::ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode
                 if (da >= 0) outIndices[outCount++] = ia;
 
                 // Calculate intersection if one of the vertices are inside
-                if ((da >= 0) != (db >= 0)) {
+                if ((simd::as<int>(da) ^ simd::as<int>(db)) < 0) {
+                    // Interpolate from inside -> outside to prevent cracks from rounding error
+                    // https://fgiesen.wordpress.com/2011/07/05/a-trip-through-the-graphics-pipeline-2011-part-5
+                    if (!(da >= 0)) std::swap(ia, ib), std::swap(da, db);
+
                     float t = da / (da - db);
 
                     for (uint32_t k = 0; k < 6; k++) {
@@ -516,6 +520,7 @@ void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
 // - release batches as soon as possible (sort smaller batches first?)
 // - dynamic / work steal mesh indices (atomics are WAY too slow)
 // - dynamic bin distribution (replace static pattern with atomics)?
+// - https://www.siliceum.com/en/blog/post/spinning-around
 void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     ZoneScoped;
     SWR_PERF_BEGIN(RastTotalElapsed);

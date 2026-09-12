@@ -57,6 +57,8 @@ struct FragmentVars {
     v_float3 Bary;
     v_float Depth;
 
+    float MaxDepthSlope;
+
     // Interpolates vertex attributes using the fragment's barycentric weights.
     template<typename T>
     T Interpolate(T v0, T v1, T v2) const { return BaryLerp(Bary, v0, v1, v2); }
@@ -225,6 +227,11 @@ struct Rasterizer {
         v_uint bbMax = _mm512_min_epi16(boundBox.y, _mm512_set1_epi32((int)(boundRect >> 32)));
         v_uint bbExtent = bbMax - bbMin;
 
+        // max_abs(ddx(z), ddy(z))
+        v_float maxDepthSlope = simd::max_abs(
+            edges.Z10 * simd::conv<float>(edges.StepX.y) + edges.Z20 * simd::conv<float>(edges.StepX.z),  //
+            edges.Z10 * simd::conv<float>(edges.StepY.y) + edges.Z20 * simd::conv<float>(edges.StepY.z));
+
         uint32_t tileStride = uint32_t(viewHalfSize.x / 2);
 
         for (uint32_t i : simd::BitIter(activeMask)) {
@@ -254,6 +261,7 @@ struct Rasterizer {
                 .PrimId = uint8_t(tri.BasePrimId + primId),
                 .VertexId = { tri.VertexId[0][primId], tri.VertexId[1][primId], tri.VertexId[2][primId] },
                 .TilePos = uint2(minX, minY),
+                .MaxDepthSlope = maxDepthSlope[i],
             };
 
             [[assume(offset < endOffsetY)]];  // avoids redundant early bounds check

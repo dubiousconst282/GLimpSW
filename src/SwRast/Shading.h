@@ -26,8 +26,7 @@ struct InstanceData {
     glm::mat4x3 Transform;
 };
 
-// https://google.github.io/filament/Filament.html
-// https://bruop.github.io/ibl/
+// TODO: split into Drawing/Shading/Resolve contexts
 struct ShadingContext {
     static constexpr uint32_t  //
         VisbMeshletBits = 11,  //
@@ -70,7 +69,7 @@ struct ShadingContext {
     struct AutoExposureData* AutoExp = nullptr;
 
     uint32_t CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
-                          float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap);
+                          float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* screenHiz);
 
     void Resolve(swr::Rasterizer& raster);
     void ResolveHalfRes(swr::Rasterizer& raster);

@@ -271,8 +271,9 @@ inline v_int CalcMipLevel(v_float4 grad) {
     return simd::ilog2(simd::max(dx, dy)) >> 1;
 }
 inline v_int CalcMipLevel(v_float4 grad, v_float2 scale) {
-    v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y) * (scale.x * scale.x);
-    v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w) * (scale.y * scale.y);
+    grad *= v_float4(scale, scale);
+    v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y);
+    v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w);
     return simd::ilog2(simd::max(dx, dy)) >> 1;
 }
 

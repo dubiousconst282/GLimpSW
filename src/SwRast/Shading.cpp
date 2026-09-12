@@ -46,6 +46,12 @@ static float2 UnpackHalf2x16(uint32_t x) {
 
 template<bool EnableAlphaTest, bool IsShadowRender>
 static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
+    if constexpr (IsShadowRender) {
+        // Planar bias method, as described by Avelina9X
+        // https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
+        vars.Depth -= glm::max(vars.MaxDepthSlope, 5e-6f) * ctx.ShadowSampleRadius;
+    }
+
     // Depth test
     v_float oldDepth = vars.LoadTile(ctx.DepthBuffer);
     vars.TileMask &= simd::movemask(vars.Depth > oldDepth);
@@ -63,13 +69,6 @@ static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& var
         v_uint color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
 
         vars.TileMask &= simd::movemask(color >= uint32_t(material.AlphaCutoff << 24));
-    }
-    if constexpr (IsShadowRender) {
-        // Planar bias method, as described by Avelina9X
-        // https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
-        v_float dx = swr::texutil::dFdx(vars.Depth);
-        v_float dy = swr::texutil::dFdy(vars.Depth);
-        vars.Depth -= simd::max(simd::abs(dx) + simd::abs(dy), 5e-6) * ctx.ShadowSampleRadius;
     }
     vars.StoreTile(ctx.DepthBuffer, vars.Depth);
 
@@ -127,17 +126,15 @@ static void IntersectTriangle(v_float4 v0, v_float4 v1, v_float4 v2, v_float2 sc
     dx_uv = v_float2(a10) * (1.0f / a10.z) - uv;
     dy_uv = v_float2(a01) * (1.0f / a01.z) - uv;
 }
-
 static v_float3 ResolveNormal(v_uint packed[3], const v_float3& bary) {
-    // unorm10 -> [1..2)
-    v_float3 v[3];
+    v_float3 v[3]; // unorm10 -> [1..2)
     for (uint32_t i = 0; i < 3; i++) {
         v_uint3 mant = packed[i] >> v_uint3(0, 10, 20) << 13;
         mant = (mant & (1023 << 13)) | (127 << 23);
         v[i] = simd::as<v_float3>(mant);
     }
-    constexpr float scale = (1024.0f / 1023) * 2, bias = -(scale + 1);  // unorm * 2 - 1
-    return swr::BaryLerp(bary, v[0], v[1], v[2]) * scale + bias;
+    constexpr float halfBias = (511 / 1023.0f) + 1;
+    return simd::normalize(swr::BaryLerp(bary, v[0], v[1], v[2]) - halfBias);
 }
 
 struct SurfaceAttribs {
@@ -230,8 +227,8 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     }
 
     v_float3 bary = { 1 - uv.x - uv.y, uv.x, uv.y };
-    v_float3 normalWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedNormal, bary), 0)));
-    v_float3 tangentWS = simd::normalize(simd::mul(transform, v_float4(ResolveNormal(packedTangent, bary), 0)));
+    v_float3 normalWS = ResolveNormal(packedNormal, bary);
+    v_float3 tangentWS = ResolveNormal(packedTangent, bary);
     v_float3 bitangentWS = simd::cross(normalWS, tangentWS);
     simd::cmov(bitangentWS, -bitangentWS, v_int(packedTangent[0]) < 0);
 
@@ -240,11 +237,12 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     normalTS.z = simd::approx_sqrt(1.0f - (normalTS.x * normalTS.x + normalTS.y * normalTS.y));
 
     // simd::normalize(simd::mul(normalTS, float3x3(tangentWS, bitangentWS, normalWS)));
-    v_float3 normalRemapped = simd::normalize({
+    v_float3 normalRemapped = {
         normalTS.x * tangentWS.x + normalTS.y * bitangentWS.x + normalTS.z * normalWS.x,
         normalTS.x * tangentWS.y + normalTS.y * bitangentWS.y + normalTS.z * normalWS.y,
         normalTS.x * tangentWS.z + normalTS.y * bitangentWS.z + normalTS.z * normalWS.z,
-    });
+    };
+    normalRemapped = simd::normalize(simd::mul(transform, v_float4(normalRemapped, 0)));
 
     return {
         .Albedo = packedAlbedo,
@@ -356,6 +354,8 @@ static v_float GetLightAttenuation(const Light& light, v_float3 surfacePosWS) {
     return attenuation;
 }
 
+// https://google.github.io/filament/Filament.html
+// https://bruop.github.io/ibl/
 [[clang::always_inline]]
 v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_float3 worldPos, v_float3 irradiance, v_float shadowMask) {
     v_float reflectance = 0.5;  // parametized IOR
@@ -374,7 +374,7 @@ v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_f
     v_float NoV = simd::abs(simd::dot(surf.Normal, viewDir)) + 1e-5f;
 
     // TODO: clustered lights?
-    // - https://www.aortiz.me/2018/12/21/CG.html
+    // - https://themaister.net/blog/2020/01/10/clustered-shading-evolution-in-granite/
     // - https://advances.realtimerendering.com/s2020/RenderingDoomEternal.pdf
     // - https://advances.realtimerendering.com/s2025/content/s2025_stb_lighting_v1.1_notes.pdf
 
@@ -569,7 +569,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
     assert(Instances[0].Meshlets == nullptr);  // 0th instance id must be reserved for "null"
 
     uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
-    float4x4 invProj = glm::inverse(WorldToClipMat);
+    float4x4 clipToWorldMat = glm::inverse(WorldToClipMat);
 
     float2 scaleNdc = 2.0f / float2(fbSize);
     float2 centerNdc = 0.5f * scaleNdc - 1.0f;
@@ -588,7 +588,7 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
 
                 v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets;
                 v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
-                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
+                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
                 v_float3 finalColor = 0;
 
                 if (simd::any(!skyMask)) {
@@ -669,7 +669,7 @@ void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
     assert(Instances[0].Meshlets == nullptr);  // 0th instance id must be reserved for "null"
 
     uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
-    float4x4 invProj = glm::inverse(WorldToClipMat);
+    float4x4 clipToWorldMat = glm::inverse(WorldToClipMat);
 
     float2 scaleNdc = 2.0f / float2(fbSize);
     float2 centerNdc = 0.5f * scaleNdc - 1.0f;
@@ -715,7 +715,7 @@ void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
 
                 v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets * 2;
                 v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
-                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, depth, 1.0f))));
+                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(screenNdc, depth, 1.0f))));
 
                 // v_float visibility = SampleShadowMap(*this, worldPos, uint3(x / 2, y / 2, 0), 8);
 
@@ -747,7 +747,7 @@ void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
 
                 v_int2 screenPos = int2(x, y) + swr::TilePixelOffsets;
                 v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
-                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
+                v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(screenNdc, skyMask ? 1.0f : depth, 1.0f))));
                 v_float3 finalColor = 0;
 
                 if (simd::any(!skyMask)) {
@@ -872,7 +872,7 @@ static v_float3 GetCameraRayDir(v_float2 screenNdc, const float3x3& m) {
 
 void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
     uint2 fbSize = uint2(ColorBuffer->Width, ColorBuffer->Height);
-    float4x4 invProj = glm::inverse(WorldToClipMat);
+    float4x4 clipToWorldMat = glm::inverse(WorldToClipMat);
 
     raster.DispatchPass(fbSize, [&](uint2 tileBasePos, v_int2 tilePos, v_float2 tileNdc) {
         uint32_t tileOffset = ColorBuffer->GetTexelOffset(tileBasePos.x, tileBasePos.y, 0);
@@ -920,7 +920,7 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
             skyMask = 0;
             finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(attribs.Albedo));
         } else if (layer == DebugLayer::ProbeIrradiance && ProbeField != nullptr) {
-            v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(invProj, v_float4(tileNdc, skyMask ? 1.0f : depth, 1.0f))));
+            v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(tileNdc, skyMask ? 1.0f : depth, 1.0f))));
             finalColor = SampleDiffuse(*ProbeField, worldPos, surface.Normal, simd::normalize(ViewPos - worldPos));
             finalColor = Tonemap_Unreal(finalColor * Exposure);
         }
@@ -975,7 +975,7 @@ static bool ProjectSphere(float3 c, float r, float3 proj, float4& bb) {
 
 // TODO: two-pass culling - https://medium.com/@mil_kru/two-pass-occlusion-culling-4100edcad501
 uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
-                                      float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* depthMap) {
+                                      float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* screenHiz) {
     float4 frustumPlanes[6];
     float4x4 objectToPrevViewMat = PrevViewMat * modelMat;
     float4x4 objectToClipMatT = glm::transpose(WorldToClipMat * modelMat);
@@ -1009,7 +1009,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
         }
 
         // Occlusion culling
-        if (depthMap != nullptr && simd::any(visible)) {
+        if (screenHiz != nullptr && simd::any(visible)) {
             v_float3 boundCenterVS = v_float3(simd::mul(objectToPrevViewMat, v_float4(boundCenter, 1)));
             v_float boundRadiusVS = boundRadius * objectToWorldScale;
 
@@ -1019,7 +1019,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
             if (simd::any(projMask)) {
                 v_float2 bbSize = v_float2(screenBB.z - screenBB.x, screenBB.w - screenBB.y) * frameSize;
                 v_int mipLevel = simd::ilog2(simd::max(bbSize.x, bbSize.y));
-                mipLevel = simd::clamp(mipLevel, 1, (int)depthMap->MipLevels - 1);
+                mipLevel = simd::clamp(mipLevel, 1, (int)screenHiz->MipLevels - 1);
 
                 v_int x0 = simd::max(simd::conv<int>(screenBB.x * frameSize.x), 0) >> mipLevel;
                 v_int y0 = simd::max(simd::conv<int>(screenBB.y * frameSize.y), 0) >> mipLevel;
@@ -1032,7 +1032,7 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
                 for (v_int y = y0; simd::any(y <= y1); y += 1) {
                     for (v_int x = x0; simd::any(x <= x1); x += 1) {
                         v_int activeMask = projMask && x <= x1 && y <= y1;
-                        v_uint value = depthMap->Fetch(v_int2(x, y), 0, mipLevel - 1, activeMask);
+                        v_uint value = screenHiz->Fetch(v_int2(x, y), 0, mipLevel - 1, activeMask);
                         simd::cmov(depthVisible, simd::min(depthVisible, simd::as<v_float>(value)), activeMask);
                     }
                 }
