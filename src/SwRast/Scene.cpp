@@ -187,8 +187,7 @@ Model* Scene::ImportGltf(const std::string& path) {
 
     std::vector<uint32_t> indices;
     std::vector<float3> positions;
-    std::vector<float3> normals;
-    std::vector<float3> tangents;
+    std::vector<float2> texcoords;
 
     std::vector<glm::uvec2> primMeshletRanges;
 
@@ -214,6 +213,12 @@ Model* Scene::ImportGltf(const std::string& path) {
             positions.resize(positionsAcc->count);
             cgltf_accessor_unpack_floats(positionsAcc, &positions[0].x, positionsAcc->count * 3);
 
+            const cgltf_accessor* texcoordAcc = cgltf_find_accessor(prim, cgltf_attribute_type_texcoord, 0);
+            if (texcoordAcc) {
+                texcoords.resize(texcoordAcc->count);
+                cgltf_accessor_unpack_floats(texcoordAcc, &texcoords[0].x, positionsAcc->count * 2);
+            }
+
             const float cone_weight = 0.0f;
 
             size_t maxMeshlets = meshopt_buildMeshletsBound(indices.size(), swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims);
@@ -225,7 +230,6 @@ Model* Scene::ImportGltf(const std::string& path) {
                                                        indices.size(), &positions[0].x, positions.size(), sizeof(float3),
                                                        swr::ShadedMeshlet::MaxVertices, swr::ShadedMeshlet::MaxPrims, cone_weight);
 
-            const cgltf_accessor* texcoordAcc = cgltf_find_accessor(prim, cgltf_attribute_type_texcoord, 0);
             const cgltf_accessor* normalAcc = cgltf_find_accessor(prim, cgltf_attribute_type_normal, 0);
             const cgltf_accessor* tangentAcc = cgltf_find_accessor(prim, cgltf_attribute_type_tangent, 0);
 
@@ -257,9 +261,7 @@ Model* Scene::ImportGltf(const std::string& path) {
                     om.Positions[2][i] = pos.z;
 
                     if (texcoordAcc) {
-                        float2 texcoord;
-                        cgltf_accessor_read_float(texcoordAcc, vertIdx, &texcoord.x, 2);
-                        om.Attribs[i].x = glm::packHalf2x16(texcoord);
+                        om.Attribs[i].x = glm::packHalf2x16(texcoords[vertIdx]);
                     }
                     if (normalAcc) {
                         float3 normal;
@@ -279,6 +281,57 @@ Model* Scene::ImportGltf(const std::string& path) {
                     om.Indices[2][i] = meshletTriangles[j + 2];
                 }
             }
+
+            // if (prim->material && prim->material->alpha_mode != cgltf_alpha_mode_opaque) {
+            //     const int max_level = 6;         // max subdivision level
+            //     const float target_edge = 3.0f;  // target 3x3px area for each microtriangle
+
+            //     std::vector<uint8_t> levels(indices.size() / 3);
+            //     std::vector<uint32_t> sources(indices.size() / 3);
+            //     std::vector<int> omm_indices(indices.size() / 3);
+
+            //     auto* texture = Materials[materialOffset + cgltf_material_index(gltf, prim->material)].Texture;
+            //     // Copy nearest mip to 256x256
+            //     uint32_t srcMip = texture->MipLevels > 8 ? texture->MipLevels - 8 : 0;
+            //     uint32_t texW = texture->Width >> srcMip;
+            //     uint32_t texH = texture->Height >> srcMip;
+
+            //     auto alphaPixels = std::make_unique<uint8_t[]>(texW * texH);
+            //     for (uint32_t y = 0; y < texH; y++) {
+            //         for (uint32_t x = 0; x < texW; x += 32) {
+            //             v_int tx0 = simd::min((int)x + simd::lane_idx<v_int> + 0, (int)(texW - 1));
+            //             v_int tx1 = simd::min((int)x + simd::lane_idx<v_int> + 16, (int)(texW - 1));
+            //             v_uint color0 = texture->Fetch(v_int2(tx0, (int)y), 0, (int)srcMip);
+            //             v_uint color1 = texture->Fetch(v_int2(tx1, (int)y), 0, (int)srcMip);
+
+            //             auto alphaOffset = simd::lane_idx<simd::vec<uint8_t, 64>> * 4 + 3;
+            //             v_uint alpha = _mm512_permutex2var_epi8(color0, alphaOffset, color1);
+            //             _mm256_storeu_epi8(&alphaPixels[x + y * texW], _mm512_castsi512_si256(alpha));
+            //         }
+            //     }
+
+            //     size_t omm_count = meshopt_opacityMapMeasure(&levels[0], &sources[0], &omm_indices[0], &indices[0], indices.size(),
+            //                                                  &texcoords[0].x, texcoords.size(), sizeof(float2), texW, texH, max_level,
+            //                                                  target_edge);
+
+            //     std::vector<uint32_t> offsets(omm_count);
+            //     std::vector<uint8_t> oom_data(omm_count);
+            //     size_t data_size = 0;
+
+            //     for (size_t i = 0; i < omm_count; ++i) {
+            //         offsets[i] = uint32_t(data_size);
+            //         data_size += meshopt_opacityMapEntrySize(levels[i], 4);
+            //     }
+
+            //     for (size_t i = 0; i < omm_count; ++i) {
+            //         uint32_t tri = sources[i];
+            //         const float* uv0 = &texcoords[indices[tri * 3 + 0]].x;
+            //         const float* uv1 = &texcoords[indices[tri * 3 + 1]].x;
+            //         const float* uv2 = &texcoords[indices[tri * 3 + 2]].x;
+
+            //         meshopt_opacityMapRasterize(&data[offsets[i]], levels[i], 4, uv0, uv1, uv2, alphaPixels.get(), 4, texW, texW, texH);
+            //     }
+            // }
         }
 
         if (nextMeshletOffset < startMeshletOffset + numMeshletsBound) {
@@ -313,7 +366,7 @@ Model* Scene::ImportGltf(const std::string& path) {
             node.MeshCount = range.y - range.x;
         }
         if (srcNode->skin) {
-            // MaxJointMatrices += srcNode->skin->joints_count;
+            model->MaxJointMatrices += srcNode->skin->joints_count;
 
             node.Joints.resize(srcNode->skin->joints_count);
             for (uint32_t i = 0; i < srcNode->skin->joints_count; i++) {
@@ -368,8 +421,17 @@ Model* Scene::ImportGltf(const std::string& path) {
 
 Model::~Model() = default;
 
-#if 0
-void Model::UpdatePose(Animation* anim, double timestamp, std::span<float3x4> globalTransforms, std::span<float3x4> jointMatrices) {
+static float4x4 InverseAffine(const float4x4& matrix) {
+    float3x3 inv = glm::inverse(float3x3(matrix));
+    float3 invOfs = -inv * float3(matrix[3]);
+    return {
+        inv[0].x, inv[0].y, inv[0].z, 0.0f,  //
+        inv[1].x, inv[1].y, inv[1].z, 0.0f,  //
+        inv[2].x, inv[2].y, inv[2].z, 0.0f,  //
+        invOfs.x, invOfs.y, invOfs.z, 1.0f   //
+    };
+}
+void Model::UpdatePose(Animation* anim, double timestamp, glm::mat4x3* transforms, glm::mat4x3* joints) {
     float cyclingTimestamp = fmod(timestamp, anim->Duration);
 
     for (uint32_t nodeIdx : NodeIndicesPreDFS) {
@@ -381,30 +443,24 @@ void Model::UpdatePose(Animation* anim, double timestamp, std::span<float3x4> gl
             anim->Interpolate(cyclingTimestamp, anim->NodeToChannelMap[nodeIdx], localTRS);
             localTransform = localTRS.ToMatrix();
         }
-        float4x4 parentTransform = node.ParentIdx != UINT_MAX ? float4x4(Nodes[node.ParentIdx].GlobalTransform) : float4x4(1);
-        globalTransforms[nodeIdx] = parentTransform * localTransform;
+        float4x4 parentTransform = node.ParentIdx != UINT_MAX ? float4x4(transforms[node.ParentIdx]) : float4x4(1);
+        transforms[nodeIdx] = parentTransform * localTransform;
 
-        if (node.Joints.size() > 0 && jointMatrices.size() >= node.Joints.size()) {
-            float4x4 inverseTransform = InverseAffine(node.GlobalTransform);
+        if (node.Joints.size() > 0 && joints != nullptr) {
+            float4x4 inverseTransform = InverseAffine(transforms[nodeIdx]);
 
             for (uint32_t i = 0; i < node.Joints.size(); i++) {
-                float4x4 jointMatrix = inverseTransform * float4x4(Nodes[node.Joints[i]].GlobalTransform);
+                float4x4 jointMatrix = inverseTransform * float4x4(transforms[node.Joints[i]]);
 
                 if (i < node.InverseBindMatrices.size()) {
                     jointMatrix *= float4x4(node.InverseBindMatrices[i]);
                 }
-                jointMatrices[i] = TruncateMatrixCM34(jointMatrix);
+                joints[i] = jointMatrix;
             }
-            jointMatrices.bump_slice(node.Joints.size());
+            joints += node.Joints.size();
         }
     }
-    for (Light& light : Lights) {
-        ModelNode& node = Nodes[light.ParentNodeIdx];
-        light.Position = node.GlobalTransform[3];
-        light.Direction = glm::normalize(-node.GlobalTransform[2]);  // T * float3(0, 0, -1)
-    }
 }
-#endif
 
 void Animation::Interpolate(float timestamp, uint32_t channelIdx, TransformTRS& transform) {
     Channel& ch = Channels[channelIdx];

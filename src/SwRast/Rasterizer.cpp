@@ -24,10 +24,9 @@ namespace swr {
 static constexpr uint32_t         // mem per batch
     MaxPacketsPerBatch = 384,     // 240KB
     MaxClipPacketsPerBatch = 64,  // 25KB
-    MaxPacketsPerBin = 254,       // 510KB (at 1080p)
-    BinShift = 6, BinSize = 1 << BinShift;
+    MaxPacketsPerBin = 254;       // 510KB (at 1080p)
 
-static constexpr uint32_t MaxBinGridSize = (Rasterizer::MaxRenderSize + BinSize - 1) / BinSize;
+static constexpr uint32_t MaxBinGridSize = Rasterizer::MaxBinGridSize;
 static constexpr uint32_t MaxRasterBinWorkers = 32;
 static constexpr uint32_t MaxBatches = 64;
 static constexpr uint64_t BatchScore_Reserved = ~0ull;
@@ -516,11 +515,9 @@ void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
 
 // TODO:
 // - scoreboard contention (swizzle indices to different cachelines % workerId)
-// - futex wait instead of mm_pause (for batch stall and worker exit checks)
+// - futex wait instead of mm_pause (for batch stall and worker exit checks, https://www.siliceum.com/en/blog/post/spinning-around)
 // - release batches as soon as possible (sort smaller batches first?)
 // - dynamic / work steal mesh indices (atomics are WAY too slow)
-// - dynamic bin distribution (replace static pattern with atomics)?
-// - https://www.siliceum.com/en/blog/post/spinning-around
 void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     ZoneScoped;
     SWR_PERF_BEGIN(RastTotalElapsed);
@@ -678,6 +675,8 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
                     for (uint32_t i = 0; i < _queue->BinsPerFrame; i += 64) {
                         auto counts = simd::load<uint8_t, 64>(&batch->Counts[i]);
                         uint64_t mask = simd::movemask(counts != 0);
+
+                        if (EnableBinStencil) mask &= BinStencilMask[i / 64u];
 
                         batch->Bitmap[i / 64u] = mask;
                         binCount += simd::popcnt(mask);
@@ -889,7 +888,7 @@ bool BinBatch::InsertBin(uint2 binPos, uint32_t packetIdx, v_mask mask) {
 
 void BinQueue::AllocBins(uint2 fbSize, uint32_t workerCount) {
     workerCount = std::min(workerCount, MaxRasterBinWorkers);
-    uint2 newGridSize = (fbSize + BinSize - 1u) >> BinShift;
+    uint2 newGridSize = (fbSize + Rasterizer::BinSize - 1u) >> Rasterizer::BinShift;
 
     if (BinGridSize.x == newGridSize.x && BinGridSize.y == newGridSize.y && workerCount == NumWorkers) return;
 
@@ -953,7 +952,7 @@ bool BinQueue::ReserveBatch(uint32_t workerId, uint32_t* id) {
 // Toggle between futex and mm_pause() spin loops for syncing.
 // Spin loops have lower latency but can degrade perf past core count,
 // see https://travisdowns.github.io/blog/2020/07/06/concurrency-costs.html
-#define SYNC_SPIN_ONLY 1
+#define SYNC_SPIN_ONLY 0
 
 void Rasterizer::Dispatch(void (*cb)(void* pUser, uint32_t workerId), void* pUser) { _runner->Dispatch(cb, pUser); }
 

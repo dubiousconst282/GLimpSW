@@ -11,14 +11,14 @@ enum class DebugLayer {
     MeshletId, TriangleId,
     OverdrawPixel, OverdrawQuad,
     VisResolveHeatmap, RaycastHeatmap,
-    VoxelGrid, ProbeIrradiance,
+    VoxelGrid, ProbeIrradiance, ShadowCascades,
 };
 static const char* kDebugLayerNames[] = {
     "None", "BaseColor", "Normals", "MetallicRoughness",
     "MeshletId", "TriangleId",
     "OverdrawPixel", "OverdrawQuad",
     "VisResolveHeatmap", "RaycastHeatmap",
-    "VoxelGrid", "ProbeIrradiance"
+    "VoxelGrid", "ProbeIrradiance", "ShadowCascades"
 };
 
 struct InstanceData {
@@ -26,15 +26,34 @@ struct InstanceData {
     glm::mat4x3 Transform;
 };
 
-// TODO: split into Drawing/Shading/Resolve contexts
-struct ShadingContext {
+struct DrawContext {
     static constexpr uint32_t  //
-        VisbMeshletBits = 11,  //
-        VisbDrawShift = VisbMeshletBits + std::countr_zero(swr::ShadedMeshlet::MaxPrims),
+        VisbMeshletBits = 12,  //
+        VisbInstanceShift = VisbMeshletBits + std::countr_zero(swr::ShadedMeshlet::MaxPrims),
         MaxMeshletsPerDraw = 1 << VisbMeshletBits,  //
-        MaxDrawCalls = 1 << (32 - VisbDrawShift);
+        MaxDrawCalls = 1 << (32 - VisbInstanceShift);
 
-    // Uniform: Per frame
+    static const swr::ShaderDispatchTable VisBufferShader, ShadowGenShader, OverdrawShader;
+
+    uint32_t NumMeshlets;  // required by rasterizer
+    uint32_t InstanceId;
+
+    swr::Framebuffer<swr::pixfmt::R32f>* DepthBuffer;
+    swr::Framebuffer<swr::pixfmt::RGBA8u>* ColorBuffer;
+    const Meshlet* Meshlets;
+    const Material* Materials;
+    const uint32_t* CullBitmap;
+
+    // For shadow rendering
+    int16_t2 WrapOffset;
+    int16_t WrapMask;
+    uint16_t CascadeIdx;
+    float DepthBiasScale;
+
+    float4x4 ObjectToClipMat;
+};
+
+struct ShadingContext {
     swr::Framebuffer<swr::pixfmt::R32f>* DepthBuffer;
     swr::Framebuffer<swr::pixfmt::RGBA8u>* ColorBuffer;
     const Material* Materials;
@@ -42,34 +61,23 @@ struct ShadingContext {
     uint32_t NumLights;
 
     float3 ViewPos;
-    float4x4 ProjMat, ViewMat, PrevViewMat;
+    float4x4 ProjMat, ViewMat;
+
     float4x4 WorldToClipMat;
-
-    swr::Framebuffer<swr::pixfmt::R32f>* ShadowDepthMap;
-    float4x4 ShadowProjMatrices[4];
-    float ShadowSampleRadius = 3;
-
-    // Uniform: Per instance
-    const Meshlet* InstanceMeshlets;
-    const v_mask* InstanceCullBitmap;
-    uint32_t InstanceId;
-
-    float4x4 ObjectToClipMat;
     float3x3 ObjectToWorldMat;
 
     // Uniform: Resolve pass
     const InstanceData* Instances;
     swr::HdrTexture2D* SkyboxTex;
     float SkyboxIntensity = 1.0;
+    float AmbientIntensity = 0.02f;
 
+    struct ShadowClipmap* ShadowMap = nullptr;
     struct GIProbeField* ProbeField = nullptr;
     BrickMap* BrickMap = nullptr;
 
     float Exposure = 1.0f;
     struct AutoExposureData* AutoExp = nullptr;
-
-    uint32_t CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
-                          float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* screenHiz);
 
     void Resolve(swr::Rasterizer& raster);
     void ResolveHalfRes(swr::Rasterizer& raster);
@@ -81,8 +89,103 @@ struct ShadingContext {
     void DrawProbesDebug();
 
     static void LoadBlueNoise();
+};
 
-    static const swr::ShaderDispatchTable VisBufferShader, ShadowGenShader, OverdrawShader;
+struct MeshletCuller {
+    float4x4 WorldToClipMat;
+    
+    // Optional, for occlusion culling
+    float4x4 HizProjMat;
+    float4x4 HizViewMat;
+    float2 FrameSize;
+    swr::Texture2D<swr::pixfmt::R32f>* HizBuffer = nullptr;
+
+    // For shadow page culling
+    struct ShadowClipmap* ShadowMap = nullptr;
+    uint32_t ShadowCascadeLevel = 0;
+
+    uint32_t CullMeshlets(uint32_t* outBitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat);
+};
+
+// https://github.com/JuanDiegoMontoya/Frogfood/wiki/Virtual-Shadow-Maps
+// https://ktstephano.github.io/rendering/stratusgfx/svsm
+// https://github.com/MatejSakmary/VSM_masters_thesis/blob/main/VSM_Thesis.pdf
+struct ShadowClipmap {
+    static constexpr uint32_t  //
+        MaxCascadeSize = 2048,
+        MaxCascades = 8,  // Max depth map resolution
+        PageSize = 64,    //
+        MaxPageGridSize = MaxCascadeSize / PageSize,
+        MaxPagesPerCascade = MaxPageGridSize * MaxPageGridSize,  //
+        MaxCascadeBitmapSize = (MaxPagesPerCascade + 31) / 32,
+        MaxHierPageMapLevels = simd::tzcnt(PageSize) - 3;
+
+    swr::FramebufferPtr<swr::pixfmt::R32f> DepthBuffer = nullptr;
+
+    float3 Origin;
+    float3 LightDir;
+
+    float BaseCascadeRange = 10;
+    float SampleRadius = 3;
+    uint32_t SampleCount = 8;
+
+    int2 PageWrapOffset;
+    int PageWrapMask;
+
+    float ScaleUV;
+    alignas(32) float SnapOffsetX[MaxCascades];
+    alignas(32) float SnapOffsetY[MaxCascades];
+    
+    float4x4 ProjMatrix;
+
+    alignas(64) uint32_t DirtyPageMap[MaxCascades][MaxCascadeBitmapSize * 4 / 3 + 1]; // visible & invalid. mipped
+    alignas(64) uint32_t VisiblePageMap[MaxCascades][MaxCascadeBitmapSize];
+    alignas(64) uint32_t InvalidPageMap[MaxCascades][MaxCascadeBitmapSize];
+
+    void SetResolution(uint32_t cascadeSize, uint32_t numCascades) {
+        assert(cascadeSize <= MaxCascadeSize && std::has_single_bit(cascadeSize) && numCascades < MaxCascades);
+        DepthBuffer = swr::CreateFramebuffer<swr::pixfmt::R32f>(cascadeSize, cascadeSize, 1, numCascades);
+        ScaleUV = (cascadeSize) * 0.5f;
+
+        PageWrapOffset = int2(0);
+        PageWrapMask = (int)(cascadeSize) - 1;
+
+        InvalidateAllPages();
+    }
+
+    v_float Sample(v_float3 worldPos, uint3 noisePos);
+    v_float SampleOne(v_float3 worldPos);
+
+    void SetPosition(float3 viewPos, float3 lightDir);
+    void InvalidateAllPages() { memset(InvalidPageMap, 255, sizeof(InvalidPageMap)); }
+
+    float4x4 GetWorldToCascadeMatrix(uint32_t level);
+
+    // Mark visible pages using frame's Hi-Z buffer.
+    void MarkVisiblePages(swr::Rasterizer& raster, swr::Texture2D<swr::pixfmt::R32f>& screenHiz, uint2 frameSize,
+                          const float4x4& worldToClipMat);
+    void UpdateHierPageBitmap();
+
+    constexpr uint32_t GetHierBitmapOffset(uint32_t level) {
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < level; i++) offset += MaxCascadeBitmapSize >> (i * 2);
+        return offset;
+    }
+
+    struct PageLoc {
+        v_int2 TexelPos;
+        v_int2 VirtualTexelPos;
+        v_int Level;
+        v_uint PageIdx;
+        v_float Depth;
+    };
+    PageLoc Project(v_float3 worldPos, int fracBits = 0);
+
+    uint32_t GetPhysicalPageIndex(int2 texelPos, int level) {
+        int2 offset = PageWrapOffset >> level & ~int(PageSize - 1);
+        uint2 pagePos = uint2((texelPos - offset) & PageWrapMask) / PageSize;
+        return pagePos.x + pagePos.y * MaxPageGridSize;
+    }
 };
 
 struct GIProbeField {

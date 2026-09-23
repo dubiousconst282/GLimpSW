@@ -161,6 +161,11 @@ using uint2 = glm::uvec2;
 using uint3 = glm::uvec3;
 using uint4 = glm::uvec4;
 
+using int16_t2 = glm::i16vec2;
+using int16_t4 = glm::i16vec4;
+using uint16_t2 = glm::u16vec2;
+using uint16_t4 = glm::u16vec4;
+
 namespace simd {
 
 #define SIMD_TFN_ANY template<is_vector T> SIMD_INLINE
@@ -226,10 +231,10 @@ SIMD_INLINE mdvec<vec<T>, 4> gather4(const T* ptr, v_int idx, v_int mask = -1) {
 
 // Gather variants optimized for small arrays
 SIMD_INLINE v_uint gather_preload64(const uint32_t data[64], v_uint idx) {
-    v_uint v0 = _mm512_load_si512(&data[0]);
-    v_uint v1 = _mm512_load_si512(&data[16]);
-    v_uint v2 = _mm512_load_si512(&data[32]);
-    v_uint v3 = _mm512_load_si512(&data[48]);
+    v_uint v0 = _mm512_loadu_si512(&data[0]);
+    v_uint v1 = _mm512_loadu_si512(&data[16]);
+    v_uint v2 = _mm512_loadu_si512(&data[32]);
+    v_uint v3 = _mm512_loadu_si512(&data[48]);
     v_uint p01 = _mm512_permutex2var_epi32(v0, idx, v1);
     v_uint p23 = _mm512_permutex2var_epi32(v2, idx, v3);
     return idx < 32 ? p01 : p23;
@@ -239,8 +244,8 @@ SIMD_INLINE v_float gather_preload64(const float data[64], v_uint idx) {
 }
 // Gather 64 bytes from 128-byte array
 SIMD_INLINE v_uint gather_preload128(const uint8_t data[128], v_uint idx) {
-    v_uint v0 = _mm512_load_si512(&data[0]);
-    v_uint v1 = _mm512_load_si512(&data[64]);
+    v_uint v0 = _mm512_loadu_si512(&data[0]);
+    v_uint v1 = _mm512_loadu_si512(&data[64]);
     return _mm512_permutex2var_epi8(v0, idx, v1);
 }
 
@@ -714,6 +719,6 @@ constexpr v_int v_exec = -1;
 #define simd_foreach_unique_lane(lane, vec, cond)            \
     if (v_int v__prev_exec = v_exec && (cond), v_exec; true) \
         if (simd::elem_type<decltype(vec)> lane; true)       \
-            for (simd::UniqueLaneIter v__iter = { vec, simd::movemask(v__prev_exec) }; v__iter.Next(v_exec, lane);)
+            for (simd::UniqueLaneIter v__iter = { vec, simd::uncanon_kreg(simd::movemask(v__prev_exec)) }; v__iter.Next(v_exec, lane);)
 
 #define simd_if(cond) if (v_int v__prev_exec = v_exec, v_exec = v__prev_exec && (cond); simd::any(v_exec))

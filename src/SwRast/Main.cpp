@@ -37,19 +37,36 @@ struct ModelDesc {
 struct RendererSettings {
     bool OcclusionCulling = true;
     bool EnableDDGI = false;
-    bool EnableShadows = false;
     bool DrawProbes = false;
+
+    bool EnableShadows = true;
+    bool DisableShadowCache = false;
+    bool DebugShadows = false;
+    uint32_t ShadowCascadeResolution = 2048;
+    uint32_t ShadowCascadeCount = 4;
+    float3 SunDirection = glm::normalize(float3(-0.413, -0.859, -0.300));
 
     DebugLayer DebugView = DebugLayer::None;
     float ExposureValue = -15.1f;
     float2 ExposureRange = float2(-4.0f, +8.0f);
 
+    float SunIntensity = 5.0f;
+    float AmbientFactor = 0.02f;
+    float SkyboxIntensity = 1.0f;
+
     std::unordered_map<ImGuiID, bool> OpenCollapsingHeaders;
 };
 YSON_SERIALIZER_STRUCT_INLINE(ModelDesc, Path, Transform);
 YSON_SERIALIZER_STRUCT_INLINE(Camera, Position, Euler, MoveSpeed);
-YSON_SERIALIZER_STRUCT_INLINE(RendererSettings, OcclusionCulling, EnableShadows, EnableDDGI, DrawProbes, DebugView, ExposureValue,
-                              ExposureRange, OpenCollapsingHeaders);
+YSON_SERIALIZER_STRUCT_INLINE(RendererSettings, OcclusionCulling,               //
+                              EnableDDGI, DrawProbes,                           //
+                              EnableShadows, DebugShadows, DisableShadowCache,  //
+                              ShadowCascadeResolution, ShadowCascadeCount, SunDirection,
+                              DebugView,                                                                 //
+                              ExposureValue, ExposureRange, SunIntensity, AmbientFactor, SkyboxIntensity,  //
+                              OpenCollapsingHeaders);
+
+YSON_SERIALIZER_STRUCT_INLINE(ShadowClipmap, BaseCascadeRange, SampleRadius, SampleCount);
 YSON_SERIALIZER_STRUCT_INLINE(GIProbeField, ProbeBaseOffset, ProbeSpacing, RaysPerProbe, MaxRayDist, MaxHysteresis, MultiBounce,
                               ForceUpdateAll, NormalBias);
 
@@ -59,20 +76,21 @@ GLFWwindow* _window;
 
 swr::FramebufferPtr<swr::pixfmt::RGBA8u> _colorFb;
 swr::FramebufferPtr<swr::pixfmt::R32f> _depthFb;
-swr::FramebufferPtr<swr::pixfmt::R32f> _shadowDepthFb;
 
 std::unique_ptr<swr::Rasterizer> _rast;
-swr::TexturePtr2D<swr::pixfmt::R32f> _prevDepthMap;
+swr::TexturePtr2D<swr::pixfmt::R32f> _hierDepth;
 GLuint _fbTexture = 0;
 
 Camera _cam;
 RendererSettings _settings;
 std::unique_ptr<Scene> _scene;
 swr::HdrTexture2D::Ptr _skyboxTex;
+
+std::unique_ptr<ShadowClipmap> _shadowMap;
 std::unique_ptr<BrickMap> _brickmap;
 std::unique_ptr<GIProbeField> _probes;
 
-SWR_PERF_DEF_COUNTER(MeshCull);
+SWR_PERF_DEF_COUNTER(Culling);
 SWR_PERF_DEF_COUNTER(FrameElapsed);
 
 GLuint CreateTexture(uint32_t width, uint32_t height, uint32_t mipLevels, GLuint fmt) {
@@ -95,7 +113,7 @@ void CreateFramebuffer(uint32_t width, uint32_t height) {
 
     uint32_t halfW = 1 << (32 - simd::lzcnt((width - 1) / 2));
     uint32_t halfH = 1 << (32 - simd::lzcnt((height - 1) / 2));
-    _prevDepthMap = swr::CreateTexture2D<swr::pixfmt::R32f>(halfW, halfH, 16);
+    _hierDepth = swr::CreateTexture2D<swr::pixfmt::R32f>(halfW, halfH, 16);
 
     if (_fbTexture != 0) glDeleteTextures(1, &_fbTexture);
     _fbTexture = CreateTexture(_colorFb->Width, _colorFb->Height, 1, GL_RGBA8);
@@ -112,7 +130,7 @@ void LoadScene(const std::vector<ModelDesc>& models) {
 
         _scene->Lights[offset] = {
             .Type = Light::kTypeDirectional,
-            .Direction = glm::normalize(-float3(0.589494, 0.684509, 0.428906)),
+            .Direction = _settings.SunDirection,
             .Color = float3(1, 1, 1),
             .Intensity = 5.0,
         };
@@ -132,7 +150,7 @@ void InitRenderer() {
 
     _rast = std::make_unique<swr::Rasterizer>(1);
 
-    _shadowDepthFb = swr::CreateFramebuffer<swr::pixfmt::R32f>(1024, 1024, 1, 1);
+    _shadowMap = std::make_unique<ShadowClipmap>();
     _probes = std::make_unique<GIProbeField>();
     _probes->ProbeBaseOffset = -float3(GIProbeField::GridSize) * _probes->ProbeSpacing / 2.0f;
 
@@ -165,6 +183,9 @@ void InitRenderer() {
         else if (rd.MatchArray("Models")) {
             LoadScene(rd.Parse<std::vector<ModelDesc>>());
         }  //
+        else if (rd.MatchObject("ShadowMap")) {
+            rd.Parse(*_shadowMap);
+        }  //
         else if (rd.MatchObject("ProbeGI")) {
             rd.Parse(*_probes);
         }  //
@@ -179,6 +200,7 @@ void InitRenderer() {
         }
     }
 
+    _shadowMap->SetResolution(_settings.ShadowCascadeResolution, _settings.ShadowCascadeCount);
     _probes->Reset(true);
 }
 void SaveSettings() {
@@ -187,6 +209,7 @@ void SaveSettings() {
 
     wr.Write("Camera", _cam);
     wr.Write("Renderer", _settings);
+    wr.Write("ShadowMap", *_shadowMap);
     wr.Write("ProbeGI", *_probes);
 
     wr.BeginObject("Rasterizer");
@@ -215,101 +238,67 @@ void SaveSettings() {
     fclose(fs);
 }
 
-void DrawModel(Model& model, ShadingContext& shader, const swr::ShaderDispatchTable& dispatcher,
-               std::vector<InstanceData>* instances,bool enableOcclusionCull) {
+struct DrawCallBuilder {
+    MeshletCuller Culler;
+    bool GenerateInstanceData = true;
+
+    std::vector<DrawContext> DrawCalls;
+    std::vector<InstanceData> Instances = { InstanceData() };  // 0th instance id must be reserved for "null"
+    std::vector<std::unique_ptr<uint32_t[]>> CullBitmaps;
+
+    void AddModel(Model& model, DrawContext& templateDraw);
+};
+
+void DrawCallBuilder::AddModel(Model& model, DrawContext& templateDraw) {
     ZoneScoped;
 
-    for (auto& node : model.Nodes) {
+    uint32_t cullBitmapPos = 0, cullBitmapSize = 0;
+    for (ModelNode& node : model.Nodes) {
+        cullBitmapSize += (node.MeshCount + 31) / 32;
+    }
+    auto cullBitmap = std::make_unique<uint32_t[]>(cullBitmapSize);
+
+    for (ModelNode& node : model.Nodes) {
         if (node.MeshCount == 0) continue;
 
-        constexpr uint32_t batchSize = std::min(16384u, ShadingContext::MaxMeshletsPerDraw);
-        v_mask cullBitmap[batchSize / simd::vec_width];
+        for (uint32_t i = 0; i < node.MeshCount; i += DrawContext::MaxMeshletsPerDraw) {
+            uint32_t meshCount = std::min(node.MeshCount - i, DrawContext::MaxMeshletsPerDraw);
+            Meshlet* meshes = &_scene->Meshlets[node.MeshOffset + i];
 
-        for (uint32_t i = 0; i < node.MeshCount; i += batchSize) {
-            uint32_t meshCount = std::min(node.MeshCount - i, batchSize);
+            SWR_PERF_BEGIN(Culling);
+            assert(cullBitmapPos < cullBitmapSize);
+            uint32_t visibleCount = Culler.CullMeshlets(&cullBitmap[cullBitmapPos], meshes, meshCount, node.GlobalTransform);
+            SWR_PERF_END(Culling);
 
-            SWR_PERF_BEGIN(MeshCull);
-            uint32_t visibleCount =
-                shader.CullMeshlets(cullBitmap, &_scene->Meshlets[node.MeshOffset + i], meshCount, node.GlobalTransform,
-                                    float2(_colorFb->Width, _colorFb->Height), enableOcclusionCull ? _prevDepthMap.get() : nullptr);
-            SWR_PERF_END(MeshCull);
+            if (visibleCount == 0) continue;
+                
+            DrawContext& draw = DrawCalls.emplace_back(templateDraw);
+            draw.NumMeshlets = meshCount;
+            draw.InstanceId = Instances.size();
+            draw.Meshlets = meshes;
+            draw.ObjectToClipMat = draw.ObjectToClipMat * float4x4(node.GlobalTransform);
 
-            if (visibleCount > 0) {
-                shader.InstanceMeshlets = &_scene->Meshlets[node.MeshOffset + i];
-                shader.InstanceCullBitmap = cullBitmap;
-                shader.ObjectToWorldMat = node.GlobalTransform;
-                shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform);
+            draw.CullBitmap = &cullBitmap[cullBitmapPos];
+            cullBitmapPos += (meshCount + 31) / 32u;
 
-                if (instances != nullptr) {
-                    shader.InstanceId = instances->size();
-                    instances->push_back({ .Meshlets = shader.InstanceMeshlets, .Transform = node.GlobalTransform });
-                }
-                _rast->DrawMeshlets(meshCount, { dispatcher, &shader });
+            if (GenerateInstanceData) {
+                Instances.push_back({ .Meshlets = draw.Meshlets, .Transform = node.GlobalTransform });
             }
         }
     }
-}
-
-constexpr uint32_t MaxShadowCascades = 4;
-
-void ComputeShadowMatrices(const Camera& cam, float3 lightDir, uint32_t renderSize, float4x4 worldToShadowMat[MaxShadowCascades]) {
-    float splitDist[MaxShadowCascades] = { 2.0f, 5.0f, 12.0f, 20.0f };
-    float maxDist = 30.0f;
-
-    float3 frustumCorners[8];
-    float4x4 clipToWorldMat = glm::inverse(cam.GetProjMatrix() * cam.GetViewMatrix(true));
-
-    for (int i = 0; i < 8; i++) {
-        int3 corner = i >> int3(0, 1, 2) & 1;
-        float4 pos = clipToWorldMat * float4(int2(corner) * 2 - 1, corner.z ? cam.NearZ / maxDist : 1, 1);
-        frustumCorners[i] = float3(pos) / pos.w;
-    }
-
-    for (uint32_t cascadeIdx = 0; cascadeIdx < MaxShadowCascades; cascadeIdx++) {
-        float tSplit0 = cascadeIdx == 0 ? 0 : splitDist[cascadeIdx - 1] / maxDist;
-        float tSplit1 = splitDist[cascadeIdx] / maxDist;
-
-        float3 corners[8];
-        float3 center = float3(0);
-
-        for (uint32_t i = 0; i < 4; i++) {
-            corners[i + 0] = glm::mix(frustumCorners[i], frustumCorners[i + 4], tSplit0);
-            corners[i + 4] = glm::mix(frustumCorners[i], frustumCorners[i + 4], tSplit1);
-            center += (corners[i + 0] + corners[i + 4]);
-        }
-        center /= 8;
-
-        // Using radius as projection bounds prevents shimmering on camera rotation
-        float radius = 0;
-        for (uint32_t i = 0; i < 8; i++) {
-            radius = glm::max(radius, glm::length(corners[i] - center));
-        }
-        radius /= 2;
-
-        float4x4 proj = glm::ortho(-radius, +radius, -radius, +radius, 0.0f, radius * 12);
-        float4x4 view = glm::lookAt(center + lightDir * radius, center, float3(0, 1, 0));
-        float4x4 viewProj = proj * view;
-
-        // Texel-space stabilization
-        float halfRenderSize = renderSize * 0.5f;
-        float2 clipOrigin = viewProj * float4(0, 0, 0, halfRenderSize);
-        float2 snapOffset = (clipOrigin - glm::round(clipOrigin)) / halfRenderSize;
-
-        viewProj[3][0] -= snapOffset.x;
-        viewProj[3][1] -= snapOffset.y;
-
-        worldToShadowMat[cascadeIdx] = viewProj;
-    }
+    CullBitmaps.emplace_back(std::move(cullBitmap));
 }
 
 // https://github.com/ocornut/imgui/issues/6215
 bool CollapsingHeaderWithSavedState(const char* label, bool defaultState) {
-    ImGuiID id = ImGui::GetID(label);
     auto [savedState, firstTime] = _settings.OpenCollapsingHeaders.emplace(ImGui::GetID(label), false);
 
     ImGui::SetNextItemOpen(firstTime ? defaultState : savedState->second, ImGuiCond_Once);
     return savedState->second = ImGui::CollapsingHeader(label);
 }
+
+void RenderShadowMap();
+void DrawShadowDebug();
 
 void RenderFrame() {
     FrameMark;
@@ -385,20 +374,20 @@ void RenderFrame() {
 
         ImGui::SliderFloat("Exposure", &_settings.ExposureValue, -15.1f, 15.0f, autoExposure ? "Auto" : "%+.1f");
         ImGui::DragFloatRange2("Exposure Range", &_settings.ExposureRange.x, &_settings.ExposureRange.y, 0.1f, -12.0f, 12.0f, "%.3f");
+    }
 
-        if (!autoExposure) {
-            s_ExposureData.Exposure = 1.0f / exp2f(-_settings.ExposureValue) * 1.2f;  // EV100 -> Lmax
-        }
-        s_ExposureData.HistRange = _settings.ExposureRange;
+    if (!autoExposure) {
+        s_ExposureData.Exposure = 1.0f / exp2f(-_settings.ExposureValue) * 1.2f;  // EV100 -> Lmax
+    }
+    s_ExposureData.HistRange = _settings.ExposureRange;
 
-        ImGui::SeparatorText("Camera");
+    if (CollapsingHeaderWithSavedState("Camera", false)) {
         ImGui::SliderFloat("Speed", &_cam.MoveSpeed, 0.5f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-
         ImGui::DragScalarN("Pos", ImGuiDataType_Double, &_cam.Position, 3, 0.01f * _cam.MoveSpeed, nullptr, nullptr, "%.4f");
 
         if (ImGui::IsItemActive() && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
             char text[128];
-            snprintf(text, sizeof(text), ".Position = { %.5f, %.5f, %.5f }, .Euler = { %.4f, %.4f }",  //
+            snprintf(text, sizeof(text), "Position: [%.5f, %.5f, %.5f], Euler: [%.4f, %.4f]",  //
                      _cam.Position.x, _cam.Position.y, _cam.Position.z, _cam.Euler.x, _cam.Euler.y);
             ImGui::SetClipboardText(text);
         }
@@ -415,42 +404,50 @@ void RenderFrame() {
 
     SWR_PERF_BEGIN(FrameElapsed);
 
-    ShadingContext shader = {
-        .ColorBuffer = _colorFb.get(),
-        .Materials = _scene->Materials.data(),
-        .Lights = _scene->Lights.data(),
-        .NumLights = _scene->Lights.size(),
-
-        .ViewPos = _cam.ViewPosition,
-        .PrevViewMat = prevCamViewMat,
-
-        .SkyboxTex = _skyboxTex.get(),
-        .BrickMap = _brickmap.get(),
-        .Exposure = s_ExposureData.Exposure,
-        .AutoExp = autoExposure ? &s_ExposureData : nullptr,
-    };
-
     Light* sunLight = _scene->Lights[0].Type == Light::kTypeDirectional ? &_scene->Lights[0] : nullptr;
-    static float shadowSampleRadius = 3;
-    static int shadowCascadeIdx = 2;
-    static bool shadowDebug = false;
 
     if (CollapsingHeaderWithSavedState("Shadows", _settings.EnableShadows)) {
         if (sunLight != nullptr) {
             ImGui::Checkbox("Enabled##Shadows", &_settings.EnableShadows);
 
-            float3 dir = sunLight->Direction;
+            float3 dir = _settings.SunDirection;
             static float2 angle = float2(atan2f(dir.z, dir.x), asinf(dir.y));
+
             if (ImGui::DragFloat2("Direction", &angle.x, 0.01f)) {
                 float r = cosf(angle.y);
-                sunLight->Direction = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
+                _settings.SunDirection = float3(cosf(angle.x) * r, sinf(angle.y), sinf(angle.x) * r);
+                sunLight->Direction = _settings.SunDirection;
             }
-        }
-        ImGui::DragFloat("Sample Radius", &shadowSampleRadius, 0.01, 1, 10, "%.1f");
-        ImGui::SliderInt("Active Cascade", &shadowCascadeIdx, 0, 3);
-        ImGui::Checkbox("Debug", &shadowDebug);
+            ImGui::DragFloat("Intensity", &_settings.SunIntensity, 0.1f, 0, 1000);
+            ImGui::DragFloat("Ambient Factor", &_settings.AmbientFactor, 0.001f, 0, 100);
 
-        ImGui::DragFloat("Intensity", &sunLight->Intensity, 0.1f, 0, 1000);
+            sunLight->Intensity = _settings.SunIntensity;
+        }
+
+        int resIdx = 31 - 9 - (int)simd::lzcnt(_settings.ShadowCascadeResolution);
+        bool wantChangeRes = false;
+        wantChangeRes |= ImGui::Combo("Resolution##Shadows", &resIdx, "512x512\0" "1024x1024\0" "2048x2048\0");
+        wantChangeRes |= ImGui::SliderInt("Cascades", (int*)&_settings.ShadowCascadeCount, 1, ShadowClipmap::MaxCascades);
+
+        if (wantChangeRes) {
+            _settings.ShadowCascadeResolution = 1 << (resIdx + 9);
+            _shadowMap->SetResolution(_settings.ShadowCascadeResolution, _settings.ShadowCascadeCount);
+        }
+
+        bool inval = false;
+        inval |= ImGui::DragFloat("Base Range", &_shadowMap->BaseCascadeRange, 0.01, 1, 32, "%.1f");
+
+        ImGui::DragFloat("Sample Radius", &_shadowMap->SampleRadius, 0.01, 0, 10, "%.1f");
+        ImGui::SliderInt("Sample Count", (int*)&_shadowMap->SampleCount, 1, 16);
+        ImGui::Checkbox("Disable Cache", &_settings.DisableShadowCache);
+        ImGui::Checkbox("Debug", &_settings.DebugShadows);
+
+        if (inval) _shadowMap->InvalidateAllPages();
+
+        if (_settings.DebugShadows) {
+            if (ImGui::Begin("Debug: Shadow Map")) DrawShadowDebug();
+            ImGui::End();
+        }
     }
 
     static bool s_HalfRes = false;
@@ -469,69 +466,100 @@ void RenderFrame() {
         ImGui::SliderInt("Max Hysteresis", (int*)&_probes->MaxHysteresis, 1, 128);
         ImGui::DragFloat("Ray Max Dist", &_probes->MaxRayDist, 0.1f, 1.0f, 100.0f);
         ImGui::DragFloat("Normal Bias", &_probes->NormalBias, 0.001, 0.01f, 0.5f);
-
-        static float skyboxIntensity = 1;
-        ImGui::DragFloat("Skybox Intensity", &skyboxIntensity, 0.01, 0.001f, 100.0f);
-        shader.SkyboxIntensity = skyboxIntensity;
+        ImGui::DragFloat("Skybox Intensity", &_settings.SkyboxIntensity, 0.01, 0.001f, 100.0f);
 
         ImGui::Checkbox("Multi-Bounce", &_probes->MultiBounce);
         ImGui::Checkbox("Force Update All", &_probes->ForceUpdateAll);
     }
-
-    if (sunLight != nullptr && _settings.EnableShadows) {
-        ZoneScopedN("ShadowMap");
-        SWR_PERF_DEF_COUNTER(ShadowElapsed);
-        SWR_PERF_BEGIN(ShadowElapsed);
-
-        ComputeShadowMatrices(_cam, sunLight->Direction, _shadowDepthFb->Width, shader.ShadowProjMatrices);
-        shader.ShadowDepthMap = _shadowDepthFb.get();
-        shader.ShadowSampleRadius = shadowSampleRadius;
-        shader.ShadowProjMatrices[0] = shader.ShadowProjMatrices[shadowCascadeIdx];  // TODO: sample cascades
-
-        _shadowDepthFb->Clear(0);
-        shader.DepthBuffer = _shadowDepthFb.get();
-        _rast->SetViewport(uint2(_shadowDepthFb->Width, _shadowDepthFb->Height));
-
-        shader.ProjMat = float4x4(1);
-        shader.ViewMat = float4x4(1);
-        shader.WorldToClipMat = shader.ShadowProjMatrices[0];
-
-        for (auto& model : _scene->Models) {
-            DrawModel(*model, shader, ShadingContext::ShadowGenShader, nullptr, false);
-        }
-        SWR_PERF_END(ShadowElapsed);
-    }
-
-    bool debugOverdraw = _settings.DebugView == DebugLayer::OverdrawPixel || _settings.DebugView == DebugLayer::OverdrawQuad;
-    auto& dispatchTable = debugOverdraw ? ShadingContext::OverdrawShader : ShadingContext::VisBufferShader;
 
     {
         ZoneScopedN("ClearFb");
         _colorFb->Clear(0);
         _depthFb->Clear(0);
 
-        shader.DepthBuffer = _depthFb.get();
         _rast->SetViewport(uint2(_colorFb->Width, _colorFb->Height));
     }
 
-    shader.ProjMat = camProjMat;
-    shader.ViewMat = camViewMat;
-    shader.WorldToClipMat = camProjViewMat;
-    shader.ProbeField = _settings.EnableDDGI ? _probes.get() : nullptr;
+    ShadingContext shader = {
+        .DepthBuffer = _depthFb.get(),
+        .ColorBuffer = _colorFb.get(),
+        .Materials = _scene->Materials.data(),
+        .Lights = _scene->Lights.data(),
+        .NumLights = _scene->Lights.size(),
 
-    auto instances = std::vector<InstanceData>();
-    instances.resize(1); // reserve 0th instance id for "null"
-    instances.reserve(1024);
+        .ViewPos = _cam.ViewPosition,
+        .ProjMat = camProjMat,
+        .ViewMat = camViewMat,
+        .WorldToClipMat = camProjViewMat,
+
+        .SkyboxTex = _skyboxTex.get(),
+        .SkyboxIntensity = _settings.SkyboxIntensity,
+        .AmbientIntensity = _settings.SunIntensity * _settings.AmbientFactor,
+        .ShadowMap = _settings.EnableShadows ? _shadowMap.get() : nullptr,
+        .ProbeField = _settings.EnableDDGI ? _probes.get() : nullptr,
+        .BrickMap = _brickmap.get(),
+        .Exposure = s_ExposureData.Exposure,
+        .AutoExp = autoExposure ? &s_ExposureData : nullptr,
+    };
+    DrawCallBuilder drawBuilder = {
+        .Culler = {
+            .WorldToClipMat = shader.WorldToClipMat,
+            .HizProjMat = shader.ProjMat,
+            .HizViewMat = prevCamViewMat,
+            .FrameSize = uint2(_colorFb->Width, _colorFb->Height),
+            .HizBuffer = _settings.OcclusionCulling ? _hierDepth.get() : nullptr,
+        },
+        .GenerateInstanceData = true,
+    };
+    DrawContext templateDraw = {
+        .DepthBuffer = _depthFb.get(),
+        .ColorBuffer = _colorFb.get(),
+        .Materials = _scene->Materials.data(),
+        .ObjectToClipMat = shader.WorldToClipMat,
+    };
 
     for (auto& model : _scene->Models) {
-        DrawModel(*model, shader, dispatchTable, &instances, _settings.OcclusionCulling);
+        drawBuilder.AddModel(*model, templateDraw);
+    }
+
+    bool debugOverdraw = _settings.DebugView == DebugLayer::OverdrawPixel || _settings.DebugView == DebugLayer::OverdrawQuad;
+    auto& dispatchTable = debugOverdraw ? DrawContext::OverdrawShader : DrawContext::VisBufferShader;
+    _rast->MultiDrawMeshlets(dispatchTable, drawBuilder.DrawCalls.size(), drawBuilder.DrawCalls.data(), sizeof(DrawContext));
+
+    shader.Instances = drawBuilder.Instances.data();
+
+    if (_settings.OcclusionCulling || _settings.EnableShadows) {
+        ZoneScopedN("BuildHiZ");
+
+        SWR_PERF_BEGIN(Culling);
+        swr::texutil::DownsampleDepth(*_depthFb, *_hierDepth);
+        SWR_PERF_END(Culling);
+    }
+    if (_settings.EnableShadows && sunLight != nullptr) {
+        SWR_PERF_DEF_COUNTER(ShadowElapsed);
+        SWR_PERF_BEGIN(ShadowElapsed);
+
+        static bool pinShadowPos = false;
+        static float3 pinnedShadowPos;
+
+        if (ImGui::IsKeyPressed(ImGuiKey_O)) {
+            pinShadowPos ^= true;
+            pinnedShadowPos = _cam.ViewPosition;
+        }
+
+        _shadowMap->SetPosition(pinShadowPos ? pinnedShadowPos : float3(_cam.ViewPosition), sunLight->Direction);
+        if (_settings.DisableShadowCache) _shadowMap->InvalidateAllPages();
+
+        _shadowMap->MarkVisiblePages(*_rast, *_hierDepth, uint2(_colorFb->Width, _colorFb->Height), camProjViewMat);
+        _shadowMap->UpdateHierPageBitmap();
+
+        RenderShadowMap();
+
+        SWR_PERF_END(ShadowElapsed);
     }
 
     SWR_PERF_DEF_COUNTER(Resolve);
     SWR_PERF_BEGIN(Resolve);
-
-    shader.DepthBuffer = _depthFb.get();
-    shader.Instances = instances.data();
 
     if (_settings.DebugView == DebugLayer::None) {
         ZoneScopedN("Resolve");
@@ -566,29 +594,6 @@ void RenderFrame() {
 
     ImGui::End();
 
-    if (shadowDebug) {
-        uint2 size = uint2(_colorFb->Width / 3, _colorFb->Height / 3);
-        uint2 offset = uint2(_colorFb->Width - size.x, _colorFb->Height - size.y) & ~3u;
-
-        for (uint32_t y = 0; y < size.y; y += 4) {
-            for (uint32_t x = 0; x < size.x; x += 4) {
-                v_int2 pos = int2(x, y) + swr::TilePixelOffsets;
-                pos = simd::conv<int>(simd::conv<float>(pos) * float2(_shadowDepthFb->Width / (float)size.x, _shadowDepthFb->Height / (float)size.y));
-                v_float depth = simd::as<v_float>(_shadowDepthFb->Fetch(pos));
-
-                v_float3 color = depth;
-                _colorFb->WriteTile(swr::pixfmt::RGBA8u::Pack({ color, 1 }), offset.x + x, offset.y + y);
-            }
-        }
-    }
-
-    if (_settings.OcclusionCulling) {
-        ZoneScopedN("BuildHiZ");
-
-        SWR_PERF_BEGIN(MeshCull);
-        swr::texutil::DownsampleDepth(*_depthFb, *_prevDepthMap);
-        SWR_PERF_END(MeshCull);
-    }
     {
         ZoneScopedN("UploadFrameToGPU");
         
@@ -622,10 +627,10 @@ void RenderFrame() {
     swr::perf::EndFrame();
 
     double frameElapsedAvg = swr::perf::GetAverage("FrameElapsed");
-    ImGui::Text("Frame: %.1fms (%.0f FPS), Cull: %.2fms, Resolve: %.2fms",   //
-                frameElapsedAvg / 1e6,                                       //
-                1e9 / frameElapsedAvg,                                       //
-                swr::perf::GetAverage("MeshCull") / 1e6,  //
+    ImGui::Text("Frame: %.1fms (%.0f FPS), Cull: %.2fms, Resolve: %.2fms",  //
+                frameElapsedAvg / 1e6,                                      //
+                1e9 / frameElapsedAvg,                                      //
+                swr::perf::GetAverage("Culling") / 1e6,                     //
                 swr::perf::GetAverage("Resolve") / 1e6);
 
     ImGui::Text("Raster: %.2fms (%.1fK/%.1fK tris, %.1fK clip, %.1fK bins)",  //
@@ -640,6 +645,153 @@ void RenderFrame() {
                 swr::perf::GetAverage("ProbeUpdateElapsed") / 1e6);
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+void RenderShadowMap() {
+    ZoneScopedN("Shadows");
+
+    auto depthBuffer = _shadowMap->DepthBuffer.get();
+    _rast->SetViewport(uint2(depthBuffer->Width, depthBuffer->Height));
+
+    for (uint32_t level = 0; level < depthBuffer->NumLayers; level++) {
+        const uint32_t* bitmap = _shadowMap->DirtyPageMap[level];
+        uint32_t numDirtyPages = 0;
+
+        for (uint32_t i = 0; i < ShadowClipmap::MaxCascadeBitmapSize; i++) {
+            for (uint32_t j : simd::BitIter(bitmap[i])) {
+                uint2 offset = uint2(i * 32 + j);
+                offset.x = offset.x % ShadowClipmap::MaxPageGridSize;
+                offset.y = offset.y / ShadowClipmap::MaxPageGridSize;
+                depthBuffer->ClearRect(offset * ShadowClipmap::PageSize, uint2(ShadowClipmap::PageSize), 0, level);
+            }
+            numDirtyPages += simd::popcnt(bitmap[i]);
+        }
+        if (numDirtyPages == 0) continue;
+
+        float4x4 worldToCascadeMat = _shadowMap->GetWorldToCascadeMatrix(level);
+
+        DrawCallBuilder drawBuilder = {
+            .Culler = {
+                .WorldToClipMat = worldToCascadeMat,
+                .HizViewMat = worldToCascadeMat,
+                .ShadowMap = _shadowMap.get(),
+                .ShadowCascadeLevel = level,
+            },
+            .GenerateInstanceData = false,
+        };
+        DrawContext templateDraw = {
+            .DepthBuffer = depthBuffer,
+            .Materials = _scene->Materials.data(),  // needed for alpha tests
+            .WrapOffset = int16_t2(_shadowMap->PageWrapOffset >> int(level) & ~int(ShadowClipmap::PageSize - 1)),
+            .WrapMask = int16_t(_shadowMap->PageWrapMask),
+            .CascadeIdx = uint16_t(level),
+            .DepthBiasScale = 1.0f + (_shadowMap->SampleRadius / float(1 << level)),
+            .ObjectToClipMat = worldToCascadeMat,
+        };
+
+        for (auto& model : _scene->Models) {
+            drawBuilder.AddModel(*model, templateDraw);
+        }
+
+        _rast->EnableBinStencil = true;
+        memset(_rast->BinStencilMask, 0, sizeof(_rast->BinStencilMask));
+
+        constexpr uint32_t binSize = swr::Rasterizer::BinSize;
+        uint2 binGridSize = (uint2(depthBuffer->Width, depthBuffer->Height) + binSize - 1u) / binSize;
+
+        for (uint32_t y = 0; y < binGridSize.y; y++) {
+            for (uint32_t x = 0; x < binGridSize.x; x++) {
+                uint32_t pageIdx = _shadowMap->GetPhysicalPageIndex(uint2(x, y) * binSize, (int)level);
+
+                if (bitmap[pageIdx / 32u] >> (pageIdx & 31u) & 1) {
+                    uint32_t binIdx = x + y * binGridSize.x;
+                    _rast->BinStencilMask[binIdx / 64u] |= 1ull << (binIdx & 63);
+                }
+            }
+        }
+        _rast->MultiDrawMeshlets(DrawContext::ShadowGenShader, drawBuilder.DrawCalls.size(), drawBuilder.DrawCalls.data(),
+                                 sizeof(DrawContext));
+    }
+    _rast->EnableBinStencil = false;
+}
+
+void DrawShadowDebug() {
+    auto depthBuffer = _shadowMap->DepthBuffer.get();
+
+    static int cascadeIdx = 0;
+    ImGui::SliderInt("Cascade", &cascadeIdx, 0, (int)depthBuffer->NumLayers - 1);
+
+    static GLuint debugTexId = 0;
+    uint32_t debugTexSize = 512;
+
+    if (debugTexId == 0) {
+        debugTexId = CreateTexture(debugTexSize, debugTexSize, 1, GL_R8);
+        GLint swizzle[] = { GL_RED, GL_RED, GL_RED, GL_ONE };
+        glTextureParameteriv(debugTexId, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
+    }
+    GLuint pbo;
+    glCreateBuffers(1, &pbo);
+    glNamedBufferStorage(pbo, debugTexSize * debugTexSize, nullptr, GL_MAP_WRITE_BIT);
+    uint8_t* pixels = (uint8_t*)glMapNamedBuffer(pbo, GL_WRITE_ONLY);
+
+    static float2 depthRange = float2(0.51, 0.52);
+    v_float2 srcRange = v_float2(FLT_MAX, -FLT_MAX);
+
+    for (uint32_t y = 0; y < debugTexSize; y++) {
+        for (uint32_t x = 0; x < debugTexSize; x += simd::vec_width) {
+            v_int2 pos = v_int2((int)x + simd::lane_idx<v_int>, (int)y);
+            pos = simd::conv<int>(simd::conv<float>(pos) / debugTexSize * float2(depthBuffer->Width, depthBuffer->Height));
+            v_float depth = simd::as<v_float>(depthBuffer->Fetch(pos, cascadeIdx));
+            v_float color = simd::approx_sqrt((depth - depthRange.x) / (depthRange.y - depthRange.x));
+
+            simd::store(&pixels[x + y * debugTexSize], simd::conv_sat<uint8_t>(color * 255));
+            simd::cmov(srcRange.x, simd::min(srcRange.x, depth), depth != 0);
+            simd::cmov(srcRange.y, simd::max(srcRange.y, depth), depth != 0);
+        }
+    }
+    float2 newRange = float2(__builtin_reduce_min(srcRange.x), __builtin_reduce_max(srcRange.y));
+    if (newRange.x != FLT_MAX) depthRange = glm::mix(depthRange, newRange, 0.1f);
+
+    glUnmapNamedBuffer(pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glTextureSubImage2D(debugTexId, 0, 0, 0, (GLsizei)debugTexSize, (GLsizei)debugTexSize, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glDeleteBuffers(1, &pbo);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 size = ImGui::GetContentRegionAvail();
+    ImGui::Dummy(size);
+
+    uint32_t pagesPerAxis = _shadowMap->DepthBuffer->Width / ShadowClipmap::PageSize;
+    float cellSize = size.x / pagesPerAxis;
+
+    for (uint32_t y = 0; y < pagesPerAxis; y++) {
+        for (uint32_t x = 0; x < pagesPerAxis; x++) {
+            uint32_t pageIdx = _shadowMap->GetPhysicalPageIndex(uint2(x, y) * ShadowClipmap::PageSize, cascadeIdx);
+            uint32_t pageX = pageIdx % ShadowClipmap::MaxPageGridSize;
+            uint32_t pageY = pageIdx / ShadowClipmap::MaxPageGridSize;
+
+            bool visible = _shadowMap->VisiblePageMap[cascadeIdx][pageIdx / 32u] >> (pageIdx & 31) & 1;
+            bool invalid = _shadowMap->InvalidPageMap[cascadeIdx][pageIdx / 32u] >> (pageIdx & 31) & 1;
+
+            ImVec2 minPos = pos + ImVec2(round(x * cellSize), round(y * cellSize));
+            ImVec2 maxPos = minPos + ImVec2(ceil(cellSize), ceil(cellSize));
+
+            ImVec2 uv0 = ImVec2(pageX, pageY) / pagesPerAxis;
+            ImVec2 uv1 = uv0 + ImVec2(1.0f / pagesPerAxis, 1.0f / pagesPerAxis);
+            dl->AddImage(ImTextureRef(debugTexId), minPos, maxPos, uv0, uv1);
+
+            if (!visible || invalid) dl->AddRectFilled(minPos, maxPos, invalid ? IM_COL32(255, 0, 255, 64) : IM_COL32(255, 0, 0, 96));
+        }
+    }
+    ImU32 gridLineColor = ImGui::ColorConvertFloat4ToU32(ImGui::GetStyleColorVec4(ImGuiCol_Separator));
+    for (uint32_t i = 0; i <= pagesPerAxis; i++) {
+        float offset = round(i * cellSize);
+        float w = i % 4 == 0 ? 2.0f : 1.0f;
+        dl->AddLineH(pos.x, pos.x + size.x, pos.y + offset, gridLineColor, w);
+        dl->AddLineV(pos.x + offset, pos.y, pos.y + size.x, gridLineColor, w);
+    }
 }
 
 };

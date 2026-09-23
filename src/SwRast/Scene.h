@@ -87,8 +87,11 @@ struct Model {
     std::vector<uint32_t> NodeIndicesPreDFS;
 
     ModelNode RootNode;
+    uint32_t MaxJointMatrices = 0;
 
     ~Model();
+
+    void UpdatePose(Animation* anim, double timestamp, glm::mat4x3* transforms, glm::mat4x3* joints);
 };
 
 template<typename T>

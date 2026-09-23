@@ -1,4 +1,6 @@
 #include "Shading.h"
+#include <glm/ext/matrix_clip_space.hpp>
+#include <glm/ext/matrix_transform.hpp>
 
 constexpr swr::SamplerDesc SurfaceSampler = {
     .Wrap = swr::WrapMode::Repeat,
@@ -11,16 +13,16 @@ constexpr swr::SamplerDesc EnvSampler = {
     .MinFilter = swr::FilterMode::Linear,
 };
 
-static void ShadeMeshlet(const ShadingContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
-    if (ctx.InstanceCullBitmap != nullptr) {
-        v_mask mask = ctx.InstanceCullBitmap[index / simd::vec_width];
+static void ShadeMeshlet(const DrawContext& ctx, uint32_t index, swr::ShadedMeshlet& output) {
+    if (ctx.CullBitmap != nullptr) {
+        uint32_t mask = ctx.CullBitmap[index / 32u];
 
-        if ((mask >> (index % simd::vec_width) & 1) == 0) {
+        if ((mask >> (index & 31u) & 1) == 0) {
             output.PrimCount = 0;
             return;
         }
     }
-    const Meshlet& mesh = ctx.InstanceMeshlets[index];
+    const Meshlet& mesh = ctx.Meshlets[index];
 
     // TODO: meshlet compression, the mem loads take longest here (>65%)
     // https://liamtyler.github.io/posts/meshlet_compression/
@@ -45,11 +47,14 @@ static float2 UnpackHalf2x16(uint32_t x) {
 }
 
 template<bool EnableAlphaTest, bool IsShadowRender>
-static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& vars) {
+static void FS_EncodeSurfaceId(const DrawContext& ctx, swr::FragmentVars& vars) {
     if constexpr (IsShadowRender) {
-        // Planar bias method, as described by Avelina9X
-        // https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
-        vars.Depth -= glm::max(vars.MaxDepthSlope, 5e-6f) * ctx.ShadowSampleRadius;
+        // Similar to https://www.reddit.com/r/GraphicsProgramming/comments/1oyeer3/bias_free_shadow_mapping_removing_shadow
+        vars.Depth -= glm::max(vars.MaxDepthSlope, 5e-6f) * ctx.DepthBiasScale;
+
+        uint2 tilePos = (vars.TilePos - uint2(ctx.WrapOffset)) & uint32_t(ctx.WrapMask);
+        [[assume(tilePos.x % 4 == 0), assume(tilePos.y % 4 == 0)]];
+        vars.TileOffset = ctx.DepthBuffer->GetTexelOffset(tilePos.x, tilePos.y, 0) + ctx.CascadeIdx * ctx.DepthBuffer->LayerStride;
     }
 
     // Depth test
@@ -59,7 +64,7 @@ static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& var
 
     if constexpr (EnableAlphaTest) {
         // TODO: try speeding up alpha tests with OMMs https://meshoptimizer.org/#opacity-micromaps
-        const Meshlet& mesh = ctx.InstanceMeshlets[vars.MeshletId];
+        const Meshlet& mesh = ctx.Meshlets[vars.MeshletId];
         const Material& material = ctx.Materials[mesh.MaterialId];
 
         v_float2 uv0 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[0]].x);
@@ -74,13 +79,13 @@ static void FS_EncodeSurfaceId(const ShadingContext& ctx, swr::FragmentVars& var
 
     if constexpr (!IsShadowRender) {
         v_uint surfaceId = vars.MeshletId * swr::ShadedMeshlet::MaxPrims + vars.PrimId;
-        surfaceId |= ctx.InstanceId << ShadingContext::VisbDrawShift;
+        surfaceId |= ctx.InstanceId << DrawContext::VisbInstanceShift;
 
         vars.StoreTile(ctx.ColorBuffer, surfaceId);
     }
 }
 
-static void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
+static void FS_Overdraw(const DrawContext& ctx, swr::FragmentVars& vars) {
     v_uint counter = vars.LoadTile(ctx.ColorBuffer);
 
     v_int isActive = _mm512_movm_epi32(vars.TileMask);
@@ -93,15 +98,15 @@ static void FS_Overdraw(const ShadingContext& ctx, swr::FragmentVars& vars) {
 
 // clang-format off
 const swr::ShaderDispatchTable
-    ShadingContext::VisBufferShader = swr::GetDispatchTable<&ShadeMeshlet,
-                                                            &FS_EncodeSurfaceId<0, 0>,
-                                                            &FS_EncodeSurfaceId<1, 0>
+    DrawContext::VisBufferShader = swr::GetDispatchTable<&ShadeMeshlet,
+                                                         &FS_EncodeSurfaceId<0, 0>,
+                                                         &FS_EncodeSurfaceId<1, 0>
                                                         >(),
-    ShadingContext::ShadowGenShader = swr::GetDispatchTable<&ShadeMeshlet,
-                                                            &FS_EncodeSurfaceId<0, 1>,
-                                                            &FS_EncodeSurfaceId<1, 1>
+    DrawContext::ShadowGenShader = swr::GetDispatchTable<&ShadeMeshlet,
+                                                         &FS_EncodeSurfaceId<0, 1>,
+                                                         &FS_EncodeSurfaceId<1, 1>
                                                         >(),
-    ShadingContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();
+    DrawContext::OverdrawShader = swr::GetDispatchTable<&ShadeMeshlet, &FS_Overdraw>();
 // clang-format on
 
 // https://userpages.cs.umbc.edu/olano/papers/2dh-tri
@@ -157,8 +162,8 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     v_uint materialId = UINT_MAX;
 
     simd_foreach_unique_lane(i, surfaceId, true) {
-        const InstanceData& instance = ctx.Instances[i >> ShadingContext::VisbDrawShift];
-        const Meshlet& mesh = instance.Meshlets[i / swr::ShadedMeshlet::MaxPrims % ShadingContext::MaxMeshletsPerDraw];
+        const InstanceData& instance = ctx.Instances[i >> DrawContext::VisbInstanceShift];
+        const Meshlet& mesh = instance.Meshlets[i / swr::ShadedMeshlet::MaxPrims % DrawContext::MaxMeshletsPerDraw];
         uint32_t triangleId = i % swr::ShadedMeshlet::MaxPrims;
 
         simd::cmov(materialId, mesh.MaterialId, v_exec);
@@ -177,7 +182,7 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     }
 
     v_float transform[4][3] = {};
-    v_uint instanceId = surfaceId >> ShadingContext::VisbDrawShift;
+    v_uint instanceId = surfaceId >> DrawContext::VisbInstanceShift;
 
     simd_foreach_unique_lane(i, instanceId, true) {
         const InstanceData& instance = ctx.Instances[i];
@@ -275,45 +280,16 @@ void ShadingContext::LoadBlueNoise() {
     fclose(fs);
 }
 
-static v_float2 GetTemporalBlueNoise(uint3 pos, uint32_t sampleIdx) {
+// 2x unorm8
+static v_uint GetTemporalBlueNoiseRaw(uint3 pos, uint32_t sampleIdx) {
     // R2 sequence
     pos.x += (sampleIdx * 3242174888 + 2147483647) >> 25;
     pos.y += (sampleIdx * 2447445413 + 2147483647) >> 25;
-    v_int q = simd::conv<int>(s_BlueNoise[pos.z & 63][pos.x >> 2 & 31][pos.y >> 2 & 31]);
-    return simd::conv<float>(q >> v_int2(0, 8) & 255) / 255.0f;
+    return simd::conv<uint32_t>(s_BlueNoise[pos.z & 63][pos.x >> 2 & 31][pos.y >> 2 & 31]);
 }
 
 static float2 Hammersley(uint32_t i, uint32_t numSamples) {
     return { i / float(numSamples), __builtin_elementwise_bitreverse(i) * float(1.0 / UINT_MAX) };
-}
-
-[[clang::always_inline]]
-static v_float SampleShadowMap(const ShadingContext& ctx, v_float3 worldPos, uint3 noisePos, uint32_t numSamples) {
-    auto* shadowMap = ctx.ShadowDepthMap;
-    v_float4 mappedPos = simd::mul(ctx.ShadowProjMatrices[0], v_float4(worldPos, 1));
-    mappedPos /= mappedPos.w;
-
-    v_int visibleCount = 0;
-
-    float2 uvScale = float2(shadowMap->ScaleU, shadowMap->ScaleV) * 0.5f;
-    v_float2 uv = v_float2(mappedPos) * uvScale + uvScale;
-
-    float jitterRadius = ctx.ShadowSampleRadius - 1;
-    float jitterBias = jitterRadius * 0.5f;
-    v_float2 noise = GetTemporalBlueNoise(noisePos, 0);
-
-    for (uint32_t i = 0; i < numSamples; i++) {
-        v_float2 jitter = Hammersley(i, numSamples);
-        jitter.x = simd::fract(jitter.x + noise.x);
-        jitter.y = simd::fract(jitter.y + noise.y);
-
-        v_int2 pos = simd::conv<int>(uv + jitter * jitterRadius - jitterBias);
-        v_int inbounds = v_uint(pos.x) < shadowMap->Width && v_uint(pos.y) < shadowMap->Height;
-
-        v_float depth = simd::as<v_float>(shadowMap->Fetch(pos, 0, 0, inbounds));
-        visibleCount += depth < mappedPos.z || !inbounds ? 1 : 0;
-    }
-    return simd::conv<float>(visibleCount) / numSamples;
 }
 
 static v_float pow5(v_float x) { return (x * x) * (x * x) * x; }
@@ -375,7 +351,6 @@ v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_f
 
     // TODO: clustered lights?
     // - https://themaister.net/blog/2020/01/10/clustered-shading-evolution-in-granite/
-    // - https://advances.realtimerendering.com/s2020/RenderingDoomEternal.pdf
     // - https://advances.realtimerendering.com/s2025/content/s2025_stb_lighting_v1.1_notes.pdf
 
     for (uint32_t i = 0; i < ctx.NumLights; i++) {
@@ -599,15 +574,15 @@ void ShadingContext::Resolve(swr::Rasterizer& raster) {
                     v_float3 irradiance = 0;
                     v_float shadowMask = 1;
 
-                    if (ShadowDepthMap != nullptr) {
-                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+                    if (ShadowMap != nullptr && simd::any(simd::dot(surf.Normal, -Lights[0].Direction) > 0)) {
+                        shadowMask = ShadowMap->Sample(worldPos, uint3(x, y, 0));
                     }
                     if (ProbeField != nullptr) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, simd::normalize(ViewPos - worldPos));
-                    } else {
+                    } else if (AmbientIntensity > 0) {
                         // ambient hack
                         v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
-                        irradiance = Lights[0].Intensity * 0.02f * (NdotL * NdotL + 0.2);
+                        irradiance = AmbientIntensity * (NdotL * NdotL + 0.2);
                     }
                     finalColor = EvalLighting(*this, surf, worldPos, irradiance, shadowMask);
                 }
@@ -761,15 +736,15 @@ void ShadingContext::ResolveHalfRes(swr::Rasterizer& raster) {
                     v_float shadowMask = 1;
                     //v_float shadowMask = simd::conv<float>(FbLoadUpsample8x8_U8(halfShadowMap, uint2(x, y))) / 255.0;
 
-                    if (ShadowDepthMap != nullptr) {
-                        shadowMask = SampleShadowMap(*this, worldPos, uint3(x, y, 0), 8);
+                    if (ShadowMap != nullptr) {
+                        shadowMask = ShadowMap->Sample(worldPos, uint3(x, y, 0));
                     }
                     if (ProbeField != nullptr) {
                         irradiance = swr::pixfmt::R11G11B10f::Unpack(UpSample8x8(halfDiffuseMap, uint2(x, y)));
-                    } else {
+                    } else if (AmbientIntensity > 0) {
                         // ambient hack
                         v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
-                        irradiance = Lights[0].Intensity * 0.02f * (NdotL * NdotL + 0.2);
+                        irradiance = AmbientIntensity * (NdotL * NdotL + 0.2);
                     }
                     finalColor = EvalLighting(*this, surf, worldPos, irradiance, shadowMask);
                 }
@@ -886,7 +861,7 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
 
         if (layer == DebugLayer::BaseColor || layer == DebugLayer::Normals ||                    //
             layer == DebugLayer::MetallicRoughness || layer == DebugLayer::VisResolveHeatmap ||  //
-            layer == DebugLayer::ProbeIrradiance                                                 //
+            layer == DebugLayer::ProbeIrradiance || layer == DebugLayer::ShadowCascades          //
         ) {
             surface = ResolveSurface(*this, tileData, tileNdc, fbSize);
         }
@@ -923,6 +898,25 @@ void ShadingContext::ResolveDebug(swr::Rasterizer& raster, DebugLayer layer) {
             v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(tileNdc, skyMask ? 1.0f : depth, 1.0f))));
             finalColor = SampleDiffuse(*ProbeField, worldPos, surface.Normal, simd::normalize(ViewPos - worldPos));
             finalColor = Tonemap_Unreal(finalColor * Exposure);
+        } else if (layer == DebugLayer::ShadowCascades && ShadowMap != nullptr) {
+            v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(tileNdc, skyMask ? 1.0f : depth, 1.0f))));
+            ShadowClipmap::PageLoc loc = ShadowMap->Project(worldPos);
+
+            finalColor = v_float3(swr::pixfmt::RGBA8u::Unpack(surface.Albedo));
+            finalColor *= ShadowMap->Sample(worldPos, uint3(tileBasePos, 0)) * 0.8 + 0.2;
+
+            float h = 0.1f;
+            finalColor.x += (loc.Level & 1) != 0 ? h : 0;
+            finalColor.y += (loc.Level & 2) != 0 ? h : 0;
+            finalColor.z += (loc.Level & 4) != 0 ? h : 0;
+
+            finalColor += (loc.TexelPos.x % ShadowClipmap::PageSize == 0) || (loc.TexelPos.y % ShadowClipmap::PageSize == 0) ? 0.5f : 0;
+
+            uint32_t level = (uint32_t)loc.Level[0];
+            uint32_t idx = loc.PageIdx[0];
+            if (ShadowMap->DirtyPageMap[level][idx / 32u] >> (idx & 31u) & 1) {
+                finalColor += v_float3(h, 0, h) * 3;
+            }
         }
 
         if (layer == DebugLayer::VisResolveHeatmap || layer == DebugLayer::RaycastHeatmap) {
@@ -973,26 +967,34 @@ static bool ProjectSphere(float3 c, float r, float3 proj, float4& bb) {
     return true;
 }
 
-// TODO: two-pass culling - https://medium.com/@mil_kru/two-pass-occlusion-culling-4100edcad501
-uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat,  //
-                                      float2 frameSize, swr::Texture2D<swr::pixfmt::R32f>* screenHiz) {
-    float4 frustumPlanes[6];
-    float4x4 objectToPrevViewMat = PrevViewMat * modelMat;
-    float4x4 objectToClipMatT = glm::transpose(WorldToClipMat * modelMat);
+static void SetupFrustumPlanes(float4x4 projMat, float4 planes[6]) {
+    float4x4 projMatT = glm::transpose(projMat);
 
     // Gribb & Hartmann
     for (int i = 0; i < 3; i++) {
-        float4 planeA = objectToClipMatT[3] + objectToClipMatT[i];  // Left,  Bottom, Near
-        float4 planeB = objectToClipMatT[3] - objectToClipMatT[i];  // Right, Top,    Far
+        float4 planeA = projMatT[3] + projMatT[i];  // Left,  Bottom, Near
+        float4 planeB = projMatT[3] - projMatT[i];  // Right, Top,    Far
         planeA /= glm::length(float3(planeA));
         planeB /= glm::length(float3(planeB));
-        frustumPlanes[i * 2 + 0] = planeA;
-        frustumPlanes[i * 2 + 1] = planeB;
+        planes[i * 2 + 0] = planeA;
+        planes[i * 2 + 1] = planeB;
     }
+}
 
+// TODO: two-pass culling - https://medium.com/@mil_kru/two-pass-occlusion-culling-4100edcad501
+uint32_t MeshletCuller::CullMeshlets(uint32_t* bitmap, const Meshlet* meshlets, uint32_t count, const float4x4& modelMat) {
+    float4 frustumPlanes[6];
+    SetupFrustumPlanes(WorldToClipMat * modelMat, frustumPlanes);
+
+    float4x4 objectToHizViewMat = HizViewMat * modelMat;
     float objectToWorldScale = glm::length(float3(modelMat[0])); // assuming uniform
-    float3 projFactors = float3(ProjMat[0][0], ProjMat[1][1], ProjMat[3][2]);  // f/ar, -f, znear
+
+    if (ShadowMap != nullptr) objectToWorldScale = glm::length(float3(objectToHizViewMat[0]));
+
+    float3 projFactors = float3(HizProjMat[0][0], HizProjMat[1][1], HizProjMat[3][2]);  // f/ar, -f, znear
     uint32_t visibleCount = 0;
+
+    assert((HizBuffer != nullptr) + (ShadowMap != nullptr) < 2); // either or none can be set
 
     for (uint32_t offset = 0; offset < count; offset += simd::vec_width) {
         v_int visible = (simd::lane_idx<v_uint> + offset) < count;
@@ -1009,34 +1011,32 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
         }
 
         // Occlusion culling
-        if (screenHiz != nullptr && simd::any(visible)) {
-            v_float3 boundCenterVS = v_float3(simd::mul(objectToPrevViewMat, v_float4(boundCenter, 1)));
+        simd_if(HizBuffer != nullptr && visible) {
+            v_float3 boundCenterVS = v_float3(simd::mul(objectToHizViewMat, v_float4(boundCenter, 1)));
             v_float boundRadiusVS = boundRadius * objectToWorldScale;
 
             v_float4 screenBB;
-            v_int projMask = visible & ProjectSphere(boundCenterVS, boundRadiusVS, projFactors, screenBB);
-
-            if (simd::any(projMask)) {
-                v_float2 bbSize = v_float2(screenBB.z - screenBB.x, screenBB.w - screenBB.y) * frameSize;
+            simd_if(ProjectSphere(boundCenterVS, boundRadiusVS, projFactors, screenBB)) {
+                v_float2 bbSize = v_float2(screenBB.z - screenBB.x, screenBB.w - screenBB.y) * FrameSize;
                 v_int mipLevel = simd::ilog2(simd::max(bbSize.x, bbSize.y));
-                mipLevel = simd::clamp(mipLevel, 1, (int)screenHiz->MipLevels - 1);
+                mipLevel = simd::clamp(mipLevel, 1, (int)HizBuffer->MipLevels - 1);
 
-                v_int x0 = simd::max(simd::conv<int>(screenBB.x * frameSize.x), 0) >> mipLevel;
-                v_int y0 = simd::max(simd::conv<int>(screenBB.y * frameSize.y), 0) >> mipLevel;
-                v_int x1 = simd::min(simd::conv<int>(screenBB.z * frameSize.x), int(frameSize.x) - 1) >> mipLevel;
-                v_int y1 = simd::min(simd::conv<int>(screenBB.w * frameSize.y), int(frameSize.y) - 1) >> mipLevel;
+                v_int x0 = simd::max(simd::conv<int>(screenBB.x * FrameSize.x), 0) >> mipLevel;
+                v_int y0 = simd::max(simd::conv<int>(screenBB.y * FrameSize.y), 0) >> mipLevel;
+                v_int x1 = simd::min(simd::conv<int>(screenBB.z * FrameSize.x), int(FrameSize.x) - 1) >> mipLevel;
+                v_int y1 = simd::min(simd::conv<int>(screenBB.w * FrameSize.y), int(FrameSize.y) - 1) >> mipLevel;
 
                 v_float depthSphere = projFactors.z / (-boundCenterVS.z - boundRadiusVS);
                 v_float depthVisible = FLT_MAX;
 
                 for (v_int y = y0; simd::any(y <= y1); y += 1) {
                     for (v_int x = x0; simd::any(x <= x1); x += 1) {
-                        v_int activeMask = projMask && x <= x1 && y <= y1;
-                        v_uint value = screenHiz->Fetch(v_int2(x, y), 0, mipLevel - 1, activeMask);
+                        v_int activeMask = v_exec && x <= x1 && y <= y1;
+                        v_uint value = HizBuffer->Fetch(v_int2(x, y), 0, mipLevel - 1, activeMask);
                         simd::cmov(depthVisible, simd::min(depthVisible, simd::as<v_float>(value)), activeMask);
                     }
                 }
-                visible &= !projMask || depthSphere > depthVisible;
+                visible &= !v_exec || depthSphere > depthVisible;
 
 #if 0
                 for (uint32_t i = 0; i < 16; i++) {
@@ -1063,10 +1063,323 @@ uint32_t ShadingContext::CullMeshlets(v_mask* bitmap, const Meshlet* meshlets, u
 #endif
             }
         }
-        bitmap[offset / simd::vec_width] = simd::movemask(visible);
+        // Page culling
+        simd_if(ShadowMap != nullptr && visible) {
+            int gridSize = ShadowMap->DepthBuffer->Width / ShadowClipmap::PageSize;
+            int pageWrapMask = gridSize - 1;
+            int2 pageWrapOffset = ShadowMap->PageWrapOffset >> int(ShadowCascadeLevel + simd::tzcnt(ShadowClipmap::PageSize));
+
+            v_float2 boundCenterVS = v_float2(simd::mul(objectToHizViewMat, v_float4(boundCenter, 1))) ;
+            v_float boundRadiusVS = boundRadius * objectToWorldScale;
+            v_float4 screenBB = v_float4(boundCenterVS - boundRadiusVS, boundCenterVS + boundRadiusVS) * 0.5 + 0.5;
+
+            // v_int mipLevel = simd::ilog2(boundRadiusVS * gridSize);
+            // mipLevel = simd::clamp(mipLevel, 0, ShadowClipmap::MaxHierPageMapLevels - 1);
+            v_int mipLevel = 0; // TODO: fix mips
+
+            v_int x0 = simd::max(simd::conv<int>(screenBB.x * gridSize), 0) >> mipLevel;
+            v_int y0 = simd::max(simd::conv<int>(screenBB.y * gridSize), 0) >> mipLevel;
+            v_int x1 = simd::min(simd::conv<int>(screenBB.z * gridSize), gridSize - 1) >> mipLevel;
+            v_int y1 = simd::min(simd::conv<int>(screenBB.w * gridSize), gridSize - 1) >> mipLevel;
+
+            // [...a..b.]  (case 1, continuous)
+            // [..b..a..]  (case 2, wrap)
+            v_int pageX0 = (x0 - pageWrapOffset.x) & pageWrapMask;
+            v_int pageX1 = (x1 - pageWrapOffset.x) & pageWrapMask;
+            v_int rowMask = (~0 << pageX0) ^ (~1 << pageX1) ^ (pageX0 > pageX1 ? ~0 : 0);
+
+            v_int spansDirtyPage = !v_exec || x0 > x1;
+
+            for (v_int y = y0; simd::any(y <= y1 && !spansDirtyPage); y += 1) {
+                v_int pageY = (y - pageWrapOffset.y) & pageWrapMask;
+                v_int rowOffset = pageY * ShadowClipmap::MaxPageGridSize;
+
+                static_assert(ShadowClipmap::MaxPageGridSize <= 32);
+                v_uint dirtyMask = simd::gather_preload64(ShadowMap->DirtyPageMap[ShadowCascadeLevel], v_uint(rowOffset) / 32u);
+
+                spansDirtyPage |= y <= y1 && (dirtyMask & rowMask) != 0;
+            }
+            visible &= spansDirtyPage;
+        }
+        ((v_mask*)bitmap)[offset / simd::vec_width] = simd::movemask(visible);
         visibleCount += simd::popcnt(simd::movemask(visible));
     }
     return visibleCount;
+}
+
+static int s_ShadowJitterLUT[16][16];
+
+[[gnu::constructor]]
+static void InitShadowJitterLUT() {
+    for (uint32_t c = 1; c <= 16; c++) {
+        for (uint32_t i = 0; i < 16; i++) {
+            int2 jitter = int2(Hammersley(i, c) * 255.0f + 0.5f);
+            s_ShadowJitterLUT[c - 1][i] = jitter.x | jitter.y << 16;
+        }
+    }
+}
+
+[[clang::always_inline]]
+v_float ShadowClipmap::SampleOne(v_float3 worldPos) {
+    PageLoc loc = Project(worldPos);
+    v_int inbounds = loc.Level < (int)DepthBuffer->NumLayers;
+
+    v_float depth = simd::as<v_float>(DepthBuffer->Fetch(loc.TexelPos, loc.Level, 0, inbounds));
+    return depth < loc.Depth || !inbounds ? 1.0f : 0;
+}
+[[clang::always_inline]]
+v_float ShadowClipmap::Sample(v_float3 worldPos, uint3 noisePos) {
+    constexpr int fracBits = 6;
+
+    PageLoc loc = Project(worldPos, fracBits);
+    v_int inbounds = loc.Level < (int)DepthBuffer->NumLayers;
+    if (!simd::any(inbounds)) return 1.0f;
+
+    v_uint noise = GetTemporalBlueNoiseRaw(noisePos, 0);
+    noise = (noise & 0xFF00) << 8 | (noise & 0x00FF);
+    v_int jitterRadius = int(SampleRadius * (1 << fracBits)) >> loc.Level;
+
+    v_int visibleCount = 0;
+    v_int2 centerPos = loc.VirtualTexelPos << 8;
+    v_int2 wrapOffset = v_int2(PageWrapOffset) >> loc.Level & ~int(PageSize - 1);
+
+    for (uint32_t i = 0; i < SampleCount; i++) {
+       v_int jitter = _mm512_add_epi8(noise, _mm512_set1_epi32(s_ShadowJitterLUT[SampleCount - 1][i]));
+       jitter = _mm512_sub_epi16(jitter, _mm512_set1_epi16(127));
+
+       v_int2 samplePos;
+       samplePos.x = _mm512_dpwssd_epi32(centerPos.x, jitter & 0xFFFF, jitterRadius);
+       samplePos.y = _mm512_dpwssd_epi32(centerPos.y, jitter >> 16, jitterRadius);
+
+       samplePos >>= (fracBits + 8);
+       samplePos = (samplePos - wrapOffset) & PageWrapMask;
+
+       // FIXME: sample next page on overflow
+       v_float depth = simd::as<v_float>(DepthBuffer->Fetch(samplePos, loc.Level, 0, inbounds));
+       visibleCount += depth < loc.Depth || !inbounds ? 1 : 0;
+    }
+    return simd::conv<float>(visibleCount) / SampleCount;
+}
+
+void ShadowClipmap::SetPosition(float3 viewPos, float3 lightDir) {
+    float range = BaseCascadeRange;
+    float4x4 proj = glm::ortho(-range, +range, -range, +range, -1000.0f, 1000.0f);
+    float4x4 view = glm::lookAt(lightDir, float3(0), float3(0, 1, 0));
+
+    ProjMatrix = proj * view;
+
+    for (uint32_t level = 0; level < DepthBuffer->NumLayers; level++) {
+        float stepSize = DepthBuffer->Width / float(PageSize << level) * 0.5f;
+        float2 snapOffset = glm::fract(float2(ProjMatrix[3]) * stepSize) / stepSize;
+
+        if (level == 0) {
+            // Add view offset in cascade space to avoid changing depth range
+            float2 viewOffset = float2(ProjMatrix * float4(viewPos, 1));
+            snapOffset += glm::floor((viewOffset - snapOffset) * stepSize) / stepSize;
+
+            ProjMatrix[3][0] -= snapOffset.x;
+            ProjMatrix[3][1] -= snapOffset.y;
+
+            SnapOffsetX[0] = 0;
+            SnapOffsetY[0] = 0;
+        } else {
+            SnapOffsetX[level] = -snapOffset.x;
+            SnapOffsetY[level] = -snapOffset.y;
+        }
+    }
+
+    float baseStepSize = DepthBuffer->Width / float(PageSize) * 0.5f;
+    int2 newWrapOffset = int2(glm::floor(ProjMatrix[3][0] * baseStepSize), glm::floor(ProjMatrix[3][1] * baseStepSize));
+    int2 oldWrapOffset = PageWrapOffset / int(PageSize);
+
+    PageWrapOffset = newWrapOffset * int(PageSize);
+
+    if (lightDir != LightDir) {
+        LightDir = lightDir;
+        InvalidateAllPages();
+        return;
+    }
+
+    // Invalidate pages in shifted borders (pages not intersecting prev and curr window)
+    for (int level = 0; level < DepthBuffer->NumLayers; level++) {
+        int2 diff = (newWrapOffset >> level) - (oldWrapOffset >> level);
+        if (diff.x == 0 && diff.y == 0) continue;
+
+        int maxPages = DepthBuffer->Width / PageSize;
+        assert(std::has_single_bit((uint32_t)maxPages));
+
+        int borderW = glm::min(glm::abs(diff.x), maxPages);
+        int borderH = glm::min(glm::abs(diff.y), maxPages);
+
+        for (int y = 0; y < maxPages; y++) {
+            int x0 = diff.x < 0 ? maxPages - borderW : 0;
+            int x1 = x0 + borderW;
+
+            if (diff.y < 0 ? (y >= maxPages - borderH) : (y < borderH)) {
+                x0 = 0;
+                x1 = maxPages;
+            }
+            for (int x = x0; x < x1; x++) {
+                uint32_t i = GetPhysicalPageIndex(int2(x, y) * int(PageSize), level);
+                InvalidPageMap[level][i / 32u] |= 1u << (i & 31);
+            }
+        }
+    }
+}
+
+float4x4 ShadowClipmap::GetWorldToCascadeMatrix(uint32_t level) {
+    if (level == 0) return ProjMatrix;
+
+    float scale = 1.0f / (1 << level);
+    float4x4 proj = ProjMatrix;
+    proj *= float4(scale, scale, 1, 1);
+
+    float stepSize = DepthBuffer->Width / float(PageSize) * 0.5f;
+    proj[3][0] = glm::floor(proj[3][0] * stepSize) / stepSize;
+    proj[3][1] = glm::floor(proj[3][1] * stepSize) / stepSize;
+
+    return proj;
+}
+
+static v_float2 GetSnapOffset(ShadowClipmap* sm, v_int level) {
+    return {
+        _mm512_permutexvar_epi32(level, simd::load(sm->SnapOffsetX)),
+        _mm512_permutexvar_epi32(level, simd::load(sm->SnapOffsetY)),
+    };
+}
+[[clang::always_inline]]
+ShadowClipmap::PageLoc ShadowClipmap::Project(v_float3 worldPos, int fracBits) {
+    v_float4 ndc = simd::mul(ProjMatrix, v_float4(worldPos, 1));  // div not needed for ortho
+
+    v_int level = simd::clamp(simd::ilog2(simd::max_abs(ndc.x, ndc.y)) + 1, 0, MaxCascades - 1);
+    v_float2 uv = v_float2(ndc) + GetSnapOffset(this, level);
+
+    // fixup unaligned cascade overlap
+    simd_if(simd::as<v_int>(simd::max_abs(uv.x, uv.y)) >= (level << 23) + (127 << 23)) {
+        level += v_exec ? 1 : 0;
+        uv = v_float2(ndc) + GetSnapOffset(this, level);
+    }
+    float scale = ScaleUV * (1 << fracBits);
+    v_float levelScale = simd::as<v_float>(simd::as<int>(scale) - (level << 23));  // scale * (2^-level)
+    v_int2 texelPos = simd::conv<int>(uv * levelScale + scale);
+
+    v_int2 wrappedPos = (texelPos - (v_int2(PageWrapOffset) >> level & ~int(PageSize - 1))) & PageWrapMask;
+    v_uint2 pagePos = simd::as<v_uint2>(wrappedPos) / PageSize;
+
+    return {
+        .TexelPos = wrappedPos,
+        .VirtualTexelPos = texelPos,
+        .Level = level,
+        .PageIdx = pagePos.x + pagePos.y * MaxPageGridSize,
+        .Depth = ndc.z,
+    };
+}
+
+void ShadowClipmap::MarkVisiblePages(swr::Rasterizer& raster, swr::Texture2D<swr::pixfmt::R32f>& screenHiz, uint2 frameSize,
+                                     const float4x4& worldToClipMat) {
+    float4x4 clipToWorldMat = glm::inverse(worldToClipMat);
+
+    frameSize /= 2;  // Hiz starts at half res
+    float2 scaleNdc = 2.0f / float2(frameSize);
+    float2 centerNdc = 0.5f * scaleNdc - 1.0f;
+
+    memset(VisiblePageMap, 0, sizeof(VisiblePageMap));
+
+    raster.DispatchGroups(frameSize, ResolveGroupSize, [&](uint4 groupRect) {
+        assert(screenHiz.Layout == swr::TextureLayout::TiledY8);
+
+        v_uint prevPageIdx = -1u;
+        int numCascades = (int)DepthBuffer->NumLayers;
+
+        for (uint32_t y = groupRect.y; y < groupRect.w; y += 8) {
+            for (uint32_t x = groupRect.x; x < groupRect.z; x += 8) {
+                uint32_t tileOffset = screenHiz.GetTexelOffset(x, y, 0);
+
+                uint32_t pageBuffer[64];
+                uint32_t pageCount = 0;
+
+                for (uint32_t i = 0; i < 64; i += simd::vec_width) {
+                    v_float depth = simd::load<v_float>(&screenHiz.Data[tileOffset + i]);
+                    if (!simd::any(depth > 0)) continue;
+
+                    v_int2 screenPos = {
+                        v_int(x + ((i + simd::lane_idx<v_uint>) >> 3)),
+                        v_int(y + ((i + simd::lane_idx<v_uint>) & 7)),
+                    };
+                    v_float2 screenNdc = simd::conv<float>(screenPos) * scaleNdc + centerNdc;
+                    v_float3 worldPos = v_float3(simd::perspective_div(simd::mul(clipToWorldMat, v_float4(screenNdc, depth, 1.0f))));
+
+                    PageLoc proj = Project(worldPos);
+                    v_uint pageIdx = proj.PageIdx | proj.Level << 24;
+
+                    v_uint shiftedIdx = _mm512_permutex2var_epi32(prevPageIdx, simd::lane_idx<v_uint> + 15, pageIdx);
+                    v_mask isValid = simd::movemask(depth > 0 && proj.Level < numCascades && pageIdx != shiftedIdx);
+                    prevPageIdx = pageIdx;
+
+                    if (isValid != 0) {
+                        simd::store(&pageBuffer[pageCount], _mm512_maskz_compress_epi32(isValid, pageIdx));
+                        pageCount += simd::popcnt(isValid);
+                    }
+                }
+
+                for (uint32_t i = 0; i < pageCount; i++) {
+                    uint32_t level = pageBuffer[i] >> 24;
+                    uint32_t pageIdx = pageBuffer[i] & 0xFFFFFF;
+
+                    uint32_t* bitmap = &VisiblePageMap[level][pageIdx / 32u];
+                    uint32_t mask = (1ull << (pageIdx & 31));
+
+                    if ((*bitmap & mask) == 0) __atomic_fetch_or(bitmap, mask, __ATOMIC_RELAXED);
+                }
+            }
+        }
+    });
+}
+
+static uint32_t HpbReduceOr(uint64_t a, uint64_t b) {
+    a |= (a >> 1);
+    b |= (b >> 1);
+    return _pext_u64(a | b, 0x5555'5555'5555'5555ull);
+}
+void ShadowClipmap::UpdateHierPageBitmap() {
+    for (uint32_t level = 0; level < DepthBuffer->NumLayers; level++) {
+        static_assert(MaxPageGridSize <= 64);
+
+        uint32_t* src = &DirtyPageMap[level][0];
+        uint32_t* dst = &DirtyPageMap[level][MaxCascadeBitmapSize];
+
+        for (uint32_t i = 0; i < MaxCascadeBitmapSize; i++) {
+            src[i] = VisiblePageMap[level][i] & InvalidPageMap[level][i];
+            InvalidPageMap[level][i] &= ~src[i];
+        }
+
+        if (MaxPageGridSize >= 64) {
+            for (uint32_t i = 0; i < 64; i += 2) {
+                uint64_t a = src[i * 2 + 0] | uint64_t(src[i * 2 + 1]) << 32;
+                uint64_t b = src[i * 2 + 2] | uint64_t(src[i * 2 + 3]) << 32;
+                *dst++ = HpbReduceOr(a, b);  // 64x2 -> 32x1
+            }
+            src = dst - 32;
+        }
+        if (MaxPageGridSize >= 32) {
+            for (uint32_t i = 0; i < 32; i += 4) {
+                uint64_t a = src[i + 0] | uint64_t(src[i + 2]) << 32;
+                uint64_t b = src[i + 1] | uint64_t(src[i + 3]) << 32;
+                *dst++ = HpbReduceOr(a, b);  // 32x4 -> 16x2
+            }
+            src = dst - 8;
+        }
+        if (MaxPageGridSize >= 16) {
+            for (uint32_t i = 0; i < 8; i += 4) {
+                uint64_t a = 0, b = 0;
+                for (uint32_t j = 0; j < 4; j++) {
+                    a |= uint64_t(src[i + j] & 0xFFFF) << (j * 16);
+                    b |= uint64_t(src[i + j] >> 16) << (j * 16);
+                }
+                *dst++ = HpbReduceOr(a, b);  // 2x 16x4 -> 8x2
+            }
+        }
+    }
 }
 
 // Point in sphere for given UV in range [0..1)
@@ -1206,10 +1519,7 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
                     if (ProbeField->MultiBounce) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
                     }
-                    v_float shadowMask = 0;
-                    if (ShadowDepthMap != nullptr) {
-                        shadowMask = SampleShadowMap(*this, worldPos, uint3(0, 0, 0), 1);
-                    }
+                    v_float shadowMask = ShadowMap ? ShadowMap->SampleOne(worldPos) : 1.0f;
                     simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, shadowMask), v_exec);
                 }
                 simd_if(isMiss) {

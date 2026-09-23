@@ -343,6 +343,26 @@ struct Texture2D {
         }
         _mm_sfence();
     }
+    void ClearRect(uint2 offset, uint2 size, uint32_t color, uint32_t layer = 0, uint32_t mipLevel = 0) {
+        assert(offset.x % 4 == 0 && offset.y % 4 == 0);
+        assert(offset.x + size.x <= (Width >> mipLevel));
+        assert(offset.y + size.y <= (Height >> mipLevel));
+
+        uint32_t* dstLayer = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+
+        for (uint32_t y = 0; y < size.y; y += 4) {
+            uint32_t* ptr = &dstLayer[GetTexelOffset(offset.x, offset.y + y, mipLevel)];
+
+            for (uint32_t x = 0; x < size.x; x += 4, ptr += 16) {
+                if constexpr (Layout_ == TextureLayout::TiledX4) {
+                    _mm512_stream_si512(ptr, _mm512_set1_epi32((int32_t)color));
+                } else {
+                    WriteTile(v_uint(color), x, y, layer, mipLevel);
+                }
+            }
+        }
+        _mm_sfence();
+    }
 
     // Copy pixel array in linear layout to texture.
     void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) {

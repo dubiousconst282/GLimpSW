@@ -33,18 +33,39 @@ int main(int argc, const char** args) {
 
     camera.Update({ .DeltaTime = 1 / 60.0, .DisplaySize = float2(fbSize) }, 0);
 
+    ShadingContext shader = {
+        .DepthBuffer = depthFb.get(),
+        .ColorBuffer = colorFb.get(),
+        .Materials = scene.Materials.data(),
+        .Lights = scene.Lights.data(),
+        .NumLights = scene.Lights.size(),
+        .ViewPos = camera.ViewPosition,
+        .WorldToClipMat = camera.GetProjMatrix() * camera.GetViewMatrix(true),
+        .Exposure = 1.0f,
+    };
     auto instances = std::vector<InstanceData>(1);
-    auto instanceCounts = std::vector<uint32_t>();
+    auto drawCalls = std::vector<DrawContext>();
 
     for (auto& model : scene.Models) {
         for (auto& node : model->Nodes) {
             if (node.MeshCount == 0) continue;
 
-            for (uint32_t i = 0; i < node.MeshCount; i += ShadingContext::MaxMeshletsPerDraw) {
-                uint32_t meshCount = std::min(node.MeshCount - i, ShadingContext::MaxMeshletsPerDraw);
+            for (uint32_t i = 0; i < node.MeshCount; i += DrawContext::MaxMeshletsPerDraw) {
+                uint32_t meshCount = std::min(node.MeshCount - i, DrawContext::MaxMeshletsPerDraw);
+                Meshlet* meshes = &scene.Meshlets[node.MeshOffset + i];
 
-                instances.push_back({ .Meshlets = &scene.Meshlets[node.MeshOffset + i], .Transform = node.GlobalTransform });
-                instanceCounts.push_back(meshCount);
+                drawCalls.push_back({
+                    .NumMeshlets = meshCount,
+                    .InstanceId = uint32_t(instances.size()),
+
+                    .DepthBuffer = shader.DepthBuffer,
+                    .ColorBuffer = shader.ColorBuffer,
+                    .Meshlets = meshes,
+                    .Materials = shader.Materials,
+
+                    .ObjectToClipMat = shader.WorldToClipMat * float4x4(node.GlobalTransform),
+                });
+                instances.push_back({ .Meshlets = meshes, .Transform = node.GlobalTransform });
             }
         }
     }
@@ -65,17 +86,6 @@ int main(int argc, const char** args) {
     ctx.unit("frame").timeUnit(std::chrono::microseconds(1), "us");
     ctx.relative(true);
 
-    ShadingContext shader = {
-        .DepthBuffer = depthFb.get(),
-        .ColorBuffer = colorFb.get(),
-        .Materials = scene.Materials.data(),
-        .Lights = scene.Lights.data(),
-        .NumLights = scene.Lights.size(),
-        .ViewPos = camera.ViewPosition,
-        .WorldToClipMat = camera.GetProjMatrix() * camera.GetViewMatrix(true),
-        .Exposure = 1.0f,
-    };
-
     auto raster = swr::Rasterizer(1);
     raster.SetViewport(fbSize);
 
@@ -84,14 +94,8 @@ int main(int argc, const char** args) {
         colorFb->Clear(0);
         depthFb->Clear(0);
 
-        for (uint32_t i = 1; i < instances.size(); i++) {
-            shader.InstanceMeshlets = instances[i].Meshlets;
-            shader.InstanceId = i;
-            shader.ObjectToWorldMat = instances[i].Transform;
-            shader.ObjectToClipMat = shader.WorldToClipMat * float4x4(instances[i].Transform);
+        raster.MultiDrawMeshlets(DrawContext::VisBufferShader, drawCalls.size(), drawCalls.data(), sizeof(DrawContext));
 
-            raster.DrawMeshlets(instanceCounts[i - 1], { ShadingContext::VisBufferShader, &shader });
-        }
         // swr::perf::EndFrame();
         // printf("Tris=%ld\n", swr::perf::GetCurrent("RastTrisDrawn"));
     });
@@ -108,5 +112,5 @@ int main(int argc, const char** args) {
 
     auto pixels = simd::alloc_buffer<uint32_t>(fbSize.x * fbSize.y);
     resolvedColorFb->GetPixels(pixels.get(), fbSize.x);
-    stbi_write_png("logs/bench_view.png", (int)fbSize.x, (int)fbSize.y, 4, pixels.get(), (int)fbSize.x * 4);
+    stbi_write_png("priv/bench_view.png", (int)fbSize.x, (int)fbSize.y, 4, pixels.get(), (int)fbSize.x * 4);
 }

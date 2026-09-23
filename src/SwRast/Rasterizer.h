@@ -127,12 +127,18 @@ struct ShaderBinding {
 
 struct Rasterizer {
     static constexpr uint32_t MaxRenderSize = 2896;  // Determined by integer overflow bound around edge equations. 2**(31/2 - 4)
+    static constexpr uint32_t BinShift = 6, BinSize = 1 << BinShift;
+    static constexpr uint32_t MaxBinGridSize = (MaxRenderSize + BinSize - 1) / BinSize;
 
     // Debug
     bool EnableBinning = true;        // Use binned rasterizer (if disabled, may artifact due to thread racing)
     bool EnableClipping = true;       // Enable non-trivial clipping
     bool EnableGuardband = true;      // Enable guardband clipping
     bool EnableBinIntersect = true;   // For large triangles, perform intersections with bins
+
+    // Per-bin stencil mask
+    bool EnableBinStencil = false;
+    uint64_t BinStencilMask[(MaxBinGridSize * MaxBinGridSize + 63) / 64] = {};
 
     Rasterizer(uint32_t numThreads = 0);
     ~Rasterizer();
@@ -146,6 +152,17 @@ struct Rasterizer {
     }
 
     void DrawMeshlets(uint32_t count, ShaderBinding shader);
+
+    // Draw multiple instances of meshlets. `descriptors` is an array of per-instance shader context structs,
+    // each starting with a `uint32_t` field specifying number of meshlets to be drawn.
+    void MultiDrawMeshlets(const ShaderDispatchTable& shader, uint32_t drawCount, void* descriptors, uint32_t descriptorStride) {
+        // TODO: remove old API and proper impl to avoid sync points
+        for (uint32_t i = 0; i < drawCount; i++) {
+            void* ctx = (uint8_t*)descriptors + i * descriptorStride;
+            uint32_t meshCount = *(uint32_t*)ctx;
+            DrawMeshlets(meshCount, { .Dispatch = shader, .Context = ctx });
+        }
+    }
 
     // Note: nodebug/noinline attributes are for improving readability in callstack/tracy.
 
