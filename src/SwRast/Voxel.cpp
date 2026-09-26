@@ -11,6 +11,7 @@ constexpr uint32_t VoxelizerChunkSize = 512;
 constexpr uint32_t VoxelizerBrickGridSize = VoxelizerChunkSize / 16;
 
 struct VoxelizerContext {
+    uint32_t NumMeshlets;
     const Meshlet* Meshlets;
     const Material* Materials;
     glm::mat4x3 ObjectToWorldMat;
@@ -270,7 +271,8 @@ void BrickMap::VoxelizeScene(const Scene& scene, float3 centerPos) {
             ctx.ObjectToWorldMat = clipMatrix * float4x4(node.GlobalTransform);
             ctx.Meshlets = &scene.Meshlets[node.MeshOffset];
 
-            raster.DrawMeshlets(node.MeshCount, { shader, &ctx });
+            ctx.NumMeshlets = node.MeshCount;
+            raster.MultiDrawMeshlets(shader, 1, &ctx, sizeof(VoxelizerContext));
         }
     }
 

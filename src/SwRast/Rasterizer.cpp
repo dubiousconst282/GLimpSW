@@ -4,10 +4,8 @@
 #include <thread>
 
 #include <tracy/Tracy.hpp>
-#include <tracy/TracyC.h>
 
-#define TracyZoneSpanBegin(ctx, name, color) if (!ctx.active) { TracyCZoneNC(zone, name, color, true); ctx = zone; }
-#define TracyZoneSpanEnd(ctx) if (ctx.active) { TracyCZoneEnd(ctx); ctx.active = false; }
+// #pragma clang optimize off
 
 // #undef assert
 // static void assert_fail(const char* expr) { fprintf(stderr, "Assert failure: %s\n", expr); abort(); }
@@ -24,15 +22,22 @@ namespace swr {
 static constexpr uint32_t         // mem per batch
     MaxPacketsPerBatch = 384,     // 240KB
     MaxClipPacketsPerBatch = 64,  // 25KB
-    MaxPacketsPerBin = 254;       // 510KB (at 1080p)
+    MaxPacketsPerBin = 255;       // 508KB (at 1080p)
 
 static constexpr uint32_t MaxBinGridSize = Rasterizer::MaxBinGridSize;
 static constexpr uint32_t MaxRasterBinWorkers = 32;
 static constexpr uint32_t MaxBatches = 64;
+static constexpr float BatchesPerWorker = 2.5;
+
 static constexpr uint64_t BatchScore_Reserved = ~0ull;
 
 struct BinBatch {
     uint16_t GridStride;
+    uint32_t NextPacketIdx, NextClipPacketIdx;
+
+    const ShaderDispatchTable* Shader;
+    void* ShaderCtx;
+
     uint64_t Bitmap[(MaxBinGridSize * MaxBinGridSize + 63) / 64];
 
     alignas(64) uint8_t Counts[MaxBinGridSize * MaxBinGridSize];
@@ -41,20 +46,35 @@ struct BinBatch {
     TriangleClipData ClipData[MaxClipPacketsPerBatch];
     uint32_t BinRefs[];
 
+    void Clear() {
+        memset(Counts, 0, sizeof(Counts));
+        NextPacketIdx = NextClipPacketIdx = 0;
+    }
+
     bool InsertBin(uint2 binPos, uint32_t packetIdx, v_mask mask);
 };
-
 struct BinQueue {
     uint2 BinGridSize;
     uint16_t BinsPerFrame = 0, NumWorkers = 0, NumBatches = 0;
     uint64_t BinsPerRowRcp = 0;
     uint64_t BinWorkPattern = 0;
 
-    std::vector<std::unique_ptr<BinBatch, simd::AlignedDeleter>> Batches;
+    void* DrawDescriptors;
+    uint32_t DrawCount, DrawStride;
+
+    std::vector<BinBatch*> Batches;
+    simd::AlignedBuffer<uint8_t> BatchMem;
+
+    alignas(64) std::atomic<uint64_t> MeshCursor; // MeshOffset | MeshCount << 24 | DrawIdx << 48
     alignas(64) std::atomic<uint64_t> Scoreboard[MaxBatches];
 
     void AllocBins(uint2 fbSize, uint32_t workerCount);
-    bool ReserveBatch(uint32_t workerId, uint32_t* id);
+
+    bool ReserveBatch(uint32_t workerId, uint32_t* batchId);
+    void CommitBatch(uint32_t batchId, const uint64_t* binStencilMask);
+
+    bool GetNextMeshRange(MeshFetchState* state);
+    void* GetDrawDesc(uint32_t idx) { return (uint8_t*)DrawDescriptors + idx * DrawStride; }
 };
 
 enum class ClipPlane {
@@ -73,7 +93,6 @@ struct ClipCodes {
 struct Clipper {
     static constexpr uint32_t MaxOutPackets = 8;
 
-    float2 GuardBandFactor;
     uint32_t OutIdx = 0;
 
     v_mask OutMasks[MaxOutPackets];
@@ -89,7 +108,7 @@ struct Clipper {
     void Setup(v_float4 v0, v_float4 v1, v_float4 v2);
 
     // Clip non-trivial triangles into output buffer.
-    void ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode);
+    void ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode, float2 guardBandFactor);
 
     void FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast);
 
@@ -132,16 +151,6 @@ private:
     void WorkerFn(uint32_t workerId);
 };
 
-struct Barrier {
-    Barrier(uint32_t threadCount) : _threadCount(threadCount), _token(threadCount) {}
-
-    void Wait();
-    bool AnyWaiting() { return uint32_t(_token.load(std::memory_order::relaxed)) != _threadCount; }
-
-    alignas(std::hardware_constructive_interference_size) std::atomic<uint64_t> _token;
-    uint32_t _threadCount;
-};
-
 Rasterizer::Rasterizer(uint32_t numThreads) {
     _queue = std::make_unique<BinQueue>();
     SetThreadCount(numThreads);
@@ -159,7 +168,7 @@ void Rasterizer::SetThreadCount(uint32_t count) {
 static v_float4 GatherPos(const ShadedMeshlet& mesh, const uint8_t* indices) {
     static_assert(ShadedMeshlet::MaxVertices == 64);
 
-    v_uint idx = _mm512_cvtepu8_epi32(_mm_loadu_epi8(indices));
+    v_uint idx = simd::conv<uint32_t>(simd::load(indices));
     return {
         simd::gather_preload64(mesh.Position[0], idx),
         simd::gather_preload64(mesh.Position[1], idx),
@@ -168,96 +177,92 @@ static v_float4 GatherPos(const ShadedMeshlet& mesh, const uint8_t* indices) {
     };
 }
 
-void Rasterizer::DrawMeshletsST(uint32_t count, ShaderBinding shader) {
-    float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
-    if (!EnableGuardband) guardBandFactor = float2(1.0f);
+void Rasterizer::DrawMeshletST(uint32_t meshIdx, const ShaderDispatchTable& shader, void* shaderCtx) {
+    ShadedMeshlet mesh;
+    shader.ShadeMeshlet(shaderCtx, meshIdx, mesh);
+    if (mesh.PrimCount == 0) return;
 
-    Dispatch([&](uint32_t workerId) {
-        for (uint32_t meshIdx = workerId; meshIdx < count; meshIdx += _runner->GetThreadCount()) {
-            ShadedMeshlet mesh;
-            shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
-            if (mesh.PrimCount == 0) continue;
+    SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
 
-            SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
+    float2 guardBandFactor = EnableGuardband ? float(MaxRenderSize) / float2(_viewSize) : float2(1.0f);
 
-            for (uint32_t primOffset = 0; primOffset < mesh.PrimCount; primOffset += simd::vec_width) {
-                v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
-                v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][primOffset]);
-                v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][primOffset]);
+    for (uint32_t primOffset = 0; primOffset < mesh.PrimCount; primOffset += simd::vec_width) {
+        v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
+        v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][primOffset]);
+        v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][primOffset]);
 
-                if (mesh.ReorientToMaxAxis) [[unlikely]] {
-                    v_float3 normal = simd::cross(v_float3(v1 - v0), v_float3(v2 - v0));
-                    v_int domAxis = simd::abs(normal.x) > simd::max_abs(normal.y, normal.z) ? 0 :  //
-                                    simd::abs(normal.y) > simd::abs(normal.z) ? 1 : 2;
+        if (mesh.ReorientToMaxAxis) [[unlikely]] {
+            v_float3 normal = simd::cross(v_float3(v1 - v0), v_float3(v2 - v0));
+            v_int domAxis = simd::abs(normal.x) > simd::max_abs(normal.y, normal.z) ? 0 :  //
+                                simd::abs(normal.y) > simd::abs(normal.z) ? 1 :
+                                                                            2;
 
-                    for (uint32_t i = 0; i < 3; i++) {
-                        v_float4& pos = i == 0 ? v0 : i == 1 ? v1 : v2;
-                        v_float4 tmp = pos;
-                        // 0 yzx
-                        // 1 xzy
-                        // 2 xyz
-                        simd::cmov(pos.x, tmp.y, domAxis == 0);
-                        simd::cmov(pos.y, tmp.z, domAxis != 2);
-                        simd::cmov(pos.z, tmp.x, domAxis == 0);
-                        simd::cmov(pos.z, tmp.y, domAxis == 1);
-                        pos.z = pos.z * 0.5 + 0.5;
-                    }
-                    // Save dom axis so frag shader can unswizzle coords later
-                    uint8_t* idx0 = &mesh.Indices[0][primOffset];
-                    _mm_storeu_epi8(idx0, _mm_loadu_epi8(idx0) | _mm512_cvtepi32_epi8(domAxis << 6));
-                }
-                ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
+            for (uint32_t i = 0; i < 3; i++) {
+                v_float4& pos = i == 0 ? v0 : i == 1 ? v1 : v2;
+                v_float4 tmp = pos;
+                // 0 yzx
+                // 1 xzy
+                // 2 xyz
+                simd::cmov(pos.x, tmp.y, domAxis == 0);
+                simd::cmov(pos.y, tmp.z, domAxis != 2);
+                simd::cmov(pos.z, tmp.x, domAxis == 0);
+                simd::cmov(pos.z, tmp.y, domAxis == 1);
+                pos.z = pos.z * 0.5 + 0.5;
+            }
+            // Save dom axis so frag shader can unswizzle coords later
+            uint8_t* idx0 = &mesh.Indices[0][primOffset];
+            _mm_storeu_epi8(idx0, _mm_loadu_epi8(idx0) | _mm512_cvtepi32_epi8(domAxis << 6));
+        }
+        ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
 
-                if (primOffset + simd::vec_width > mesh.PrimCount) {
-                    v_mask trailMask = (1u << (mesh.PrimCount % simd::vec_width)) - 1;
-                    cc.AcceptMask &= trailMask;
-                    cc.NonTrivialMask &= trailMask;
-                }
+        if (primOffset + simd::vec_width > mesh.PrimCount) {
+            v_mask trailMask = (1u << (mesh.PrimCount % simd::vec_width)) - 1;
+            cc.AcceptMask &= trailMask;
+            cc.NonTrivialMask &= trailMask;
+        }
 
-                if (cc.NonTrivialMask != 0 && EnableClipping) [[unlikely]] {
-                    Clipper clipper;
-                    clipper.GuardBandFactor = guardBandFactor;
-                    clipper.Setup(v0, v1, v2);
-                    clipper.ClipTriangles(cc, _viewHalfSize, mesh.CullMode);
+        // Check and process clipped tris first to avoid spilling vert regs in hot path
+        if (cc.NonTrivialMask != 0 && EnableClipping) [[unlikely]] {
+            Clipper clipper;
+            clipper.Setup(v0, v1, v2);
+            clipper.ClipTriangles(cc, _viewHalfSize, mesh.CullMode, guardBandFactor);
 
-                    for (uint32_t i = 0; i < clipper.OutIdx; i += simd::vec_width) {
-                        TrianglePacket& tris = clipper.OutTris[i / simd::vec_width];
-                        v_mask drawMask = clipper.OutMasks[i / simd::vec_width];
+            for (uint32_t i = 0; i < clipper.OutIdx; i += simd::vec_width) {
+                TrianglePacket& tris = clipper.OutTris[i / simd::vec_width];
+                v_mask drawMask = clipper.OutMasks[i / simd::vec_width];
 
-                        tris.MeshletId = meshIdx;
-                        tris.BasePrimId = primOffset;
+                tris.MeshletId = meshIdx;
+                tris.BasePrimId = primOffset;
 
-                        memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                        memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                        memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
+                memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
 
-                        auto drawFn = shader.Dispatch.DrawClippedTriangle[mesh.FragmentShaderId];
-                        drawFn(shader.Context, tris, drawMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
+                auto drawFn = shader.DrawClippedTriangle[mesh.FragmentShaderId];
+                drawFn(shaderCtx, tris, drawMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
 
-                        SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
-                    }
-                }
-                if (cc.AcceptMask != 0) {
-                    TrianglePacket tris;
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
-                    acceptMask &= cc.AcceptMask;
-                    if (acceptMask == 0) continue;
-
-                    tris.MeshletId = meshIdx;
-                    tris.BasePrimId = primOffset;
-                    memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                    memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                    memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
-
-                    auto drawFn = shader.Dispatch.DrawTriangle[mesh.FragmentShaderId];
-                    drawFn(shader.Context, tris, acceptMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
-
-                    SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
-                }
+                SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
             }
         }
-        perf::FlushThreadCounters();
-    });
+        if (cc.AcceptMask != 0) {
+            TrianglePacket tris;
+            v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
+            acceptMask &= cc.AcceptMask;
+
+            if (acceptMask != 0) {
+                tris.MeshletId = meshIdx;
+                tris.BasePrimId = primOffset;
+                memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
+                memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
+                memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
+
+                auto drawFn = shader.DrawTriangle[mesh.FragmentShaderId];
+                drawFn(shaderCtx, tris, acceptMask, 0x7FFF'7FFF'0000'0000ull, _viewHalfSize);
+
+                SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
+            }
+        }
+    }
 }
 
 // https://fgiesen.wordpress.com/2013/02/08/triangle-rasterization-in-practice
@@ -275,18 +280,18 @@ v_mask TrianglePacket::Setup(v_float4 v0, v_float4 v1, v_float4 v2, int2 vpHalfS
     // Cull backfacing or degenerate triangles
     if (visibleMask == 0) return 0;
 
-    float2 fixScale = vpHalfSize * 16;
+    float2 fixScale = vpHalfSize << 4;
     v_int x0 = simd::round2i(v0.x * fixScale.x), y0 = simd::round2i(v0.y * fixScale.y);
     v_int x1 = simd::round2i(v1.x * fixScale.x), y1 = simd::round2i(v1.y * fixScale.y);
     v_int x2 = simd::round2i(v2.x * fixScale.x), y2 = simd::round2i(v2.y * fixScale.y);
 
-    Pos0 = (x0 & 0xFFFF) | (y0 << 16);
-    Pos1 = (x1 & 0xFFFF) | (y1 << 16);
-    Pos2 = (x2 & 0xFFFF) | (y2 << 16);
+    Pos0 = (x0 & 0xFFFF) | simd::uncanon(y0 << 16);  // uncanon to workaround clang emitting slow permi2w
+    Pos1 = (x1 & 0xFFFF) | simd::uncanon(y1 << 16);
+    Pos2 = (x2 & 0xFFFF) | simd::uncanon(y2 << 16);
 
     // Cull thin triangles covering no samples, or outside viewport (some of them will get here due to guard-band)
     v_uint2 boundBox = GetBoundingBox(vpHalfSize, false);
-    visibleMask &= _mm512_cmpeq_epi32_mask(_mm512_movm_epi16(_mm512_cmpge_epi16_mask(boundBox.x, boundBox.y)), _mm512_set1_epi32(0));
+    visibleMask &= _mm512_cmpeq_epi32_mask(_mm512_min_epi16(boundBox.x, _mm512_sub_epi16(boundBox.y, _mm512_set1_epi16(1))), boundBox.x);
 
     Z0 = v0.z, Z1 = v1.z, Z2 = v2.z;
     W0 = v0.w, W1 = v1.w, W2 = v2.w;
@@ -418,7 +423,7 @@ void Clipper::Setup(v_float4 v0, v_float4 v1, v_float4 v2) {
     }
     OutIdx = 0;
 }
-void Clipper::ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode) {
+void Clipper::ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode, float2 guardBandFactor) {
     SWR_PERF_INC(RastTrisClipped, simd::popcnt(cc.NonTrivialMask));
 
     for (uint32_t primId : simd::BitIter(cc.NonTrivialMask)) {
@@ -433,7 +438,7 @@ void Clipper::ClipTriangles(ClipCodes cc, int2 vpHalfSize, FaceCullMode cullMode
         for (uint32_t planeId : simd::BitIter(cc.OutCodes[primId])) {
             uint8_t outIndices[sizeof(indices)];
             uint32_t outCount = 0;
-            float planeScale = planeId < 4 ? GuardBandFactor[planeId / 2] : 1.0f;
+            float planeScale = planeId < 4 ? guardBandFactor[planeId / 2] : 1.0f;
 
             for (uint32_t vi = 0; vi < vertCount; vi++) {
                 uint8_t ia = indices[vi], ib = indices[(vi + 1) % vertCount];
@@ -513,35 +518,65 @@ void Clipper::FlushPacket(int2 vpHalfSize, FaceCullMode cullMode, bool isLast) {
     if (mask == 0) OutIdx -= (OutIdx % simd::vec_width);
 }
 
-// TODO:
+struct MeshFetchState {
+    uint32_t NextMeshIdx = 0, LastMeshIdx = 0, DrawIdx = 0;
+
+    uint32_t MeshIdx = 0, PrimOffset = 0;
+    uint32_t ClipOutPos = 0, ClipEndPos = 0;
+
+    ShadedMeshlet Mesh;
+    Clipper Clipper;
+};
+// TODO perf ideas:
+// - release batches as soon as possible (sort smaller batches first?)
+// - try steal mesh ranges from workers in raster (release ranges at commit?)
 // - scoreboard contention (swizzle indices to different cachelines % workerId)
 // - futex wait instead of mm_pause (for batch stall and worker exit checks, https://www.siliceum.com/en/blog/post/spinning-around)
-// - release batches as soon as possible (sort smaller batches first?)
-// - dynamic / work steal mesh indices (atomics are WAY too slow)
-void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
-    ZoneScoped;
+void Rasterizer::MultiDrawMeshlets(const ShaderDispatchTable& shader, uint32_t drawCount, void* descriptors, uint32_t descriptorStride) {
+    if (drawCount == 0) return;
+
+    ZoneScopedN("Draw");
     SWR_PERF_BEGIN(RastTotalElapsed);
 
-    if (!EnableBinning) {
-        DrawMeshletsST(meshCount, shader);
+    if (!EnableBinning) [[unlikely]] {
+        Dispatch([&](uint32_t workerId) {
+            for (uint32_t drawIdx = 0; drawIdx < drawCount; drawIdx++) {
+                void* ctx = (uint8_t*)descriptors + drawIdx * descriptorStride;
+                uint32_t meshCount = simd::load<uint32_t>(ctx);
+
+                for (uint32_t meshIdx = workerId; meshIdx < meshCount; meshIdx += _runner->GetThreadCount()) {
+                    DrawMeshletST(meshIdx, shader, ctx);
+                }
+            }
+            perf::FlushThreadCounters();
+        });
         SWR_PERF_END(RastTotalElapsed);
         return;
     }
-    float2 guardBandFactor = (float)MaxRenderSize / float2(_viewSize);
-    if (!EnableGuardband) guardBandFactor = float2(1.0f);
 
     _queue->AllocBins(_viewSize, _runner->GetThreadCount());
 
-    std::atomic<uint32_t> finishedMeshCount = 0;
-    std::atomic<uint64_t> activeWorkers = (1ull << _queue->NumWorkers) - 1;
-
+    // Setup draw state
     for (uint32_t i = 0; i < _queue->NumBatches; i++) {
-        _queue->Scoreboard[i] = i < _queue->NumWorkers ? BatchScore_Reserved : 0;
-        memset(_queue->Batches[i]->Counts, 0, sizeof(BinBatch::Counts));
+        _queue->Scoreboard[i].store(i < _queue->NumWorkers ? BatchScore_Reserved : 0, std::memory_order::relaxed);
+
+        BinBatch* batch = _queue->Batches[i];
+        batch->Clear();
+        batch->Shader = &shader;
+        batch->ShaderCtx = descriptors;
     }
 
-#define DBG(msg, ...) // printf("[W%d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
-    //printf("Draw(%d)\n", meshCount);
+    uint32_t firstDrawMeshCount = simd::load<uint32_t>(descriptors);
+    _queue->MeshCursor.store(uint64_t(firstDrawMeshCount) << 24, std::memory_order::relaxed);
+
+    _queue->DrawDescriptors = descriptors;
+    _queue->DrawCount = drawCount;
+    _queue->DrawStride = descriptorStride;
+
+    std::atomic<uint64_t> activeWorkers = (1ull << _queue->NumWorkers) - 1;
+
+    #define DBG(msg, ...) // printf("[W%d] " msg "\n", workerId __VA_OPT__(,) __VA_ARGS__)
+    // printf("Draw(%d %d)\n", drawCount, firstDrawMeshCount);
 
     Dispatch([&](uint32_t workerId) {
         if (workerId >= _queue->NumWorkers) return;
@@ -549,169 +584,39 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
         ZoneScopedN("MeshWorker");
         DBG("Begin");
 
-        ShadedMeshlet mesh = { .PrimCount = 0 };
-        uint32_t nextMeshIdx = workerId, meshIdx = nextMeshIdx;
-        uint32_t primOffset = 0;
-
-        Clipper clipper;
-        clipper.GuardBandFactor = guardBandFactor;
-        uint32_t clipReadOffset = 0;
-
         uint32_t batchId = workerId;
-        uint32_t batchMeshCount = 0;
-        uint32_t nextPacketIdx = 0, nextClipPacketIdx = 0;
-        BinBatch* batch = _queue->Batches[batchId].get();
+        BinBatch* batch = _queue->Batches[batchId];
 
-        TracyCZoneCtx meshZone = {};
+        MeshFetchState fetchState;
+        bool endOfInput = false;
+        int exitAttempts = 0;
 
         while (true) {
-            bool batchFull = false;
-            bool isIdle = true;
-            bool clipPending = clipReadOffset < clipper.OutIdx;
+            if (endOfInput) {
+                uint64_t activeMask = activeWorkers.load(std::memory_order::acquire);
+                uint64_t workerBit = 1ull << workerId;
 
-            // Fetch another meshlet
-            if (nextMeshIdx < meshCount && primOffset >= mesh.PrimCount && !clipPending) {
-                TracyZoneSpanBegin(meshZone, "FetchMeshlet", 0x55BB55);
-                isIdle = false;
-
-                meshIdx = nextMeshIdx;
-                nextMeshIdx += _queue->NumWorkers;
-                batchMeshCount++;
-
-                shader.Dispatch.ShadeMeshlet(shader.Context, meshIdx, mesh);
-                if (mesh.PrimCount == 0) continue;
-
-                SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
-                primOffset = 0;
+                // Repeat once all threads have announced EOI, to flush any final batches
+                if (activeMask == 0 && ++exitAttempts == 2) break;
+                if (activeMask & workerBit) activeWorkers.fetch_and(~workerBit, std::memory_order::release);
+            } else if (FillBatch(batch, fetchState)) {
+                DBG("Commit b=%d n=%d", batchId, batch->NextPacketIdx);
+                assert(batch->ShaderCtx != nullptr);
+                _queue->CommitBatch(batchId, EnableBinStencil ? BinStencilMask : nullptr);
+                batch = nullptr;  // invalidate
+            } else {
+                endOfInput = true;
             }
 
-            // Process pending primitives
-            for (; primOffset < mesh.PrimCount && !batchFull && !clipPending; primOffset += simd::vec_width) {
-                isIdle = false;
+            while (true) {
+                RasterizeBins(workerId);
 
-                v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][primOffset]);
-                v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][primOffset]);
-                v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][primOffset]);
-                ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
-
-                if (primOffset + simd::vec_width > mesh.PrimCount) {
-                    v_mask trailMask = (1u << (mesh.PrimCount % simd::vec_width)) - 1;
-                    cc.AcceptMask &= trailMask;
-                    cc.NonTrivialMask &= trailMask;
+                if (batch != nullptr || _queue->ReserveBatch(workerId, &batchId)) {
+                    DBG("AcqBatch %d", batchId);
+                    batch = _queue->Batches[batchId];
+                    break;
                 }
-
-                if (cc.NonTrivialMask != 0 && EnableClipping) [[unlikely]] {
-                    clipper.Setup(v0, v1, v2);
-                    clipper.ClipTriangles(cc, _viewHalfSize, mesh.CullMode);
-
-                    for (uint32_t i = 0; i < clipper.OutIdx; i += simd::vec_width) {
-                        TrianglePacket& tris = clipper.OutTris[i / simd::vec_width];
-                        v_mask drawMask = clipper.OutMasks[i / simd::vec_width];
-
-                        tris.MeshletId = meshIdx;
-                        tris.BasePrimId = primOffset;
-                        tris.FragmentShaderId = mesh.FragmentShaderId;
-
-                        memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                        memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                        memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
-
-                        SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
-                    }
-                    clipPending = true;
-                    clipReadOffset = 0;
-                }
-
-                if (cc.AcceptMask != 0) {
-                    assert(nextPacketIdx < MaxPacketsPerBatch);
-                    TrianglePacket& tris = batch->Triangles[nextPacketIdx];
-                    v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
-
-                    acceptMask &= cc.AcceptMask;
-                    if (acceptMask == 0) continue;
-
-                    SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
-
-                    tris.MeshletId = meshIdx;
-                    tris.BasePrimId = primOffset;
-                    tris.FragmentShaderId = mesh.FragmentShaderId;
-                    tris.ClipData = nullptr;
-
-                    memcpy(tris.VertexId[0], &mesh.Indices[0][primOffset], 16);
-                    memcpy(tris.VertexId[1], &mesh.Indices[1][primOffset], 16);
-                    memcpy(tris.VertexId[2], &mesh.Indices[2][primOffset], 16);
-
-                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, false);
-                    batchFull |= !DistributeToBins(batch, nextPacketIdx, acceptMask, boundBox.x, boundBox.y);
-                    batchFull |= ++nextPacketIdx >= MaxPacketsPerBatch;
-                }
-            }
-
-            // Process pending clipper output
-            for (; !batchFull && clipReadOffset < clipper.OutIdx; clipReadOffset += simd::vec_width) {
-                isIdle = false;
-
-                uint32_t i = clipReadOffset / simd::vec_width;
-
-                batch->Triangles[nextPacketIdx] = clipper.OutTris[i];
-                batch->Triangles[nextPacketIdx].ClipData = &batch->ClipData[nextClipPacketIdx];
-                batch->ClipData[nextClipPacketIdx] = clipper.OutData[i];
-
-                v_uint2 boundBox = clipper.OutTris[i].GetBoundingBox(_viewHalfSize, false);
-                batchFull |= !DistributeToBins(batch, nextPacketIdx, clipper.OutMasks[i], boundBox.x, boundBox.y);
-                batchFull |= ++nextPacketIdx >= MaxPacketsPerBatch;
-                batchFull |= ++nextClipPacketIdx >= MaxClipPacketsPerBatch;
-            }
-
-            // Rasterize
-            if (batchFull || isIdle) {
-                TracyZoneSpanEnd(meshZone);
-
-                // Commit bins
-                if (nextPacketIdx > 0) {
-                    uint64_t commitMask = 0;
-                    uint32_t binCount = 0;
-
-                    for (uint32_t i = 0; i < _queue->BinsPerFrame; i += 64) {
-                        auto counts = simd::load<uint8_t, 64>(&batch->Counts[i]);
-                        uint64_t mask = simd::movemask(counts != 0);
-
-                        if (EnableBinStencil) mask &= BinStencilMask[i / 64u];
-
-                        batch->Bitmap[i / 64u] = mask;
-                        binCount += simd::popcnt(mask);
-
-                        for (uint32_t j = 0; j < _queue->NumWorkers; j++) {
-                            if (mask & (_queue->BinWorkPattern << j)) commitMask |= 1u << j;
-                        }
-                    }
-                    SWR_PERF_INC(RastBinsDispatched, binCount);
-                    DBG("Commit p=%d b=%d %08lx", nextPacketIdx, batchId, commitMask);
-
-                    _queue->Scoreboard[batchId].store(commitMask, std::memory_order::acq_rel);
-                }
-
-                while (true) {
-                    RasterizeBins(shader, workerId);
-
-                    // Reserve next batch
-                    if (nextPacketIdx == 0 || _queue->ReserveBatch(workerId, &batchId)) {
-                        batch = _queue->Batches[batchId].get();
-                        nextPacketIdx = 0;
-                        nextClipPacketIdx = 0;
-                        break;
-                    }
-                    _mm_pause();
-                }
-
-                // Exit if no more meshes
-                if (isIdle) {
-                    uint32_t prevCount = finishedMeshCount.fetch_add(batchMeshCount, std::memory_order::relaxed);
-                    if (prevCount >= meshCount - batchMeshCount) {
-                        if (activeWorkers.fetch_and(~(1ull << workerId), std::memory_order::acq_rel) == 0) break;
-                    }
-                    batchMeshCount = 0;
-                }
+                _mm_pause();
             }
         }
         DBG("Exit");
@@ -720,27 +625,144 @@ void Rasterizer::DrawMeshlets(uint32_t meshCount, ShaderBinding shader) {
     SWR_PERF_END(RastTotalElapsed);
 }
 
-void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
-    // Find pending batches for this worker
+bool Rasterizer::FillBatch(BinBatch* batch, MeshFetchState& state) {
+    ZoneScopedC(0x55BB55);
+
+    float2 guardBandFactor = EnableGuardband ? float(MaxRenderSize) / float2(_viewSize) : float2(1.0f);
+    batch->ShaderCtx = _queue->GetDrawDesc(state.DrawIdx);
+
+    while (true) {
+        ShadedMeshlet& mesh = state.Mesh;
+
+        // Fetch another meshlet
+        if (state.PrimOffset >= mesh.PrimCount) {
+            if (state.NextMeshIdx >= state.LastMeshIdx) {
+                uint32_t prevDrawIdx = state.DrawIdx;
+
+                if (!_queue->GetNextMeshRange(&state)) {
+                    return batch->NextPacketIdx > 0;
+                }
+                if (state.DrawIdx != prevDrawIdx) {
+                    if (batch->NextPacketIdx > 0) return true;
+                    batch->ShaderCtx = _queue->GetDrawDesc(state.DrawIdx);
+                }
+            }
+            state.MeshIdx = state.NextMeshIdx++;
+            batch->Shader->ShadeMeshlet(batch->ShaderCtx, state.MeshIdx, mesh);
+            if (mesh.PrimCount == 0) continue;
+
+            state.PrimOffset = 0;
+            SWR_PERF_INC(RastTrisProcessed, mesh.PrimCount);
+        }
+
+        // Process pending primitives
+        while (state.PrimOffset < mesh.PrimCount && state.ClipOutPos >= state.ClipEndPos) {
+            uint32_t offset = state.PrimOffset;
+            state.PrimOffset += simd::vec_width;
+
+            v_float4 v0 = GatherPos(mesh, &mesh.Indices[0][offset]);
+            v_float4 v1 = GatherPos(mesh, &mesh.Indices[1][offset]);
+            v_float4 v2 = GatherPos(mesh, &mesh.Indices[2][offset]);
+            ClipCodes cc = Clipper::ComputeClipCodes(v0, v1, v2, guardBandFactor);
+
+            if (offset + simd::vec_width > mesh.PrimCount) {
+                v_mask trailMask = (1u << (mesh.PrimCount % simd::vec_width)) - 1;
+                cc.AcceptMask &= trailMask;
+                cc.NonTrivialMask &= trailMask;
+            }
+
+            // Check and process clipped tris first to avoid spilling vert regs in hot path
+            if (cc.NonTrivialMask != 0 && EnableClipping) [[unlikely]] {
+                state.Clipper.Setup(v0, v1, v2);
+                state.Clipper.ClipTriangles(cc, _viewHalfSize, mesh.CullMode, guardBandFactor);
+
+                state.ClipOutPos = 0;
+                state.ClipEndPos = state.Clipper.OutIdx;
+
+                for (uint32_t i = 0; i < state.Clipper.OutIdx; i += simd::vec_width) {
+                    TrianglePacket& tris = state.Clipper.OutTris[i / simd::vec_width];
+
+                    tris.MeshletId = state.MeshIdx;
+                    tris.BasePrimId = offset;
+                    tris.FragmentShaderId = mesh.FragmentShaderId;
+
+                    memcpy(tris.VertexId[0], &mesh.Indices[0][offset], 16);
+                    memcpy(tris.VertexId[1], &mesh.Indices[1][offset], 16);
+                    memcpy(tris.VertexId[2], &mesh.Indices[2][offset], 16);
+                }
+            }
+
+            if (cc.AcceptMask != 0) {
+                assert(batch->NextPacketIdx < MaxPacketsPerBatch);
+                TrianglePacket& tris = batch->Triangles[batch->NextPacketIdx];
+                v_mask acceptMask = tris.Setup(v0, v1, v2, _viewHalfSize, mesh.CullMode);
+
+                acceptMask &= cc.AcceptMask;
+                if (acceptMask != 0) {
+                    SWR_PERF_INC(RastTrisDrawn, simd::popcnt(acceptMask));
+
+                    tris.MeshletId = state.MeshIdx;
+                    tris.BasePrimId = offset;
+                    tris.FragmentShaderId = mesh.FragmentShaderId;
+                    tris.ClipData = nullptr;
+
+                    memcpy(tris.VertexId[0], &mesh.Indices[0][offset], 16);
+                    memcpy(tris.VertexId[1], &mesh.Indices[1][offset], 16);
+                    memcpy(tris.VertexId[2], &mesh.Indices[2][offset], 16);
+
+                    v_uint2 boundBox = tris.GetBoundingBox(_viewHalfSize, false);
+                    bool batchFull = !DistributeToBins(batch, batch->NextPacketIdx, acceptMask, boundBox.x, boundBox.y);
+                    batchFull |= ++batch->NextPacketIdx >= MaxPacketsPerBatch;
+                    if (batchFull) return true;
+                }
+            }
+        }
+
+        // Process pending clipper output
+        while (state.ClipOutPos < state.ClipEndPos) {
+            uint32_t i = state.ClipOutPos / simd::vec_width;
+            state.ClipOutPos += simd::vec_width;
+
+            TrianglePacket& tri = batch->Triangles[batch->NextPacketIdx];
+            TriangleClipData& cd = batch->ClipData[batch->NextClipPacketIdx];
+
+            tri = state.Clipper.OutTris[i];
+            cd = state.Clipper.OutData[i];
+            tri.ClipData = &cd;
+
+            v_mask drawMask = state.Clipper.OutMasks[i];
+            SWR_PERF_INC(RastTrisDrawn, simd::popcnt(drawMask));
+
+            v_uint2 boundBox = tri.GetBoundingBox(_viewHalfSize, false);
+            bool batchFull = !DistributeToBins(batch, batch->NextPacketIdx, drawMask, boundBox.x, boundBox.y);
+            batchFull |= ++batch->NextPacketIdx >= MaxPacketsPerBatch;
+            batchFull |= ++batch->NextClipPacketIdx >= MaxClipPacketsPerBatch;
+            if (batchFull) return true;
+        }
+    }
+}
+
+void Rasterizer::RasterizeBins(uint32_t workerId) {
+    // Find pending batches assigned to this worker
     uint64_t binPattern = _queue->BinWorkPattern << workerId;
-    uint64_t workerCommitBit = 1ull << workerId;
-    uint64_t committedBatchMask = 0;
+    uint64_t workerAssignmentBit = 1ull << workerId;
+    uint64_t pendingBatchMask = 0;
 
     #pragma nounroll
     for (uint32_t i = 0; i < _queue->NumBatches; i += 8) {
         simd::vec<uint64_t, 8> score = _mm512_load_epi64(&_queue->Scoreboard[i]);
-        uint64_t pendingMask = simd::movemask(score != BatchScore_Reserved && (score & workerCommitBit) != 0);
-        committedBatchMask |= pendingMask << i;
+        uint64_t assignedMask = simd::movemask(score != BatchScore_Reserved && (score & workerAssignmentBit) != 0);
+        pendingBatchMask |= assignedMask << i;
     }
 
-    if (committedBatchMask == 0) return;
+    if (pendingBatchMask == 0) return;
     
     ZoneScopedNC("RasterBin", 0xEE5555);
 
     // Rasterize
     for (uint32_t binChunkOffset = 0; binChunkOffset < _queue->BinsPerFrame; binChunkOffset += 64) {
-        for (uint32_t batchId : simd::BitIter(committedBatchMask)) {
-            BinBatch* batch = _queue->Batches[batchId].get();
+        for (uint32_t batchId : simd::BitIter(pendingBatchMask)) {
+            BinBatch* batch = _queue->Batches[batchId];
             uint64_t mask = batch->Bitmap[binChunkOffset / 64u] & binPattern;
             if (mask == 0) continue;
 
@@ -761,19 +783,19 @@ void Rasterizer::RasterizeBins(ShaderBinding shader, uint32_t workerId) {
                     TrianglePacket& tris = batch->Triangles[ids[i] >> 16];
                     v_mask acceptMask = v_mask(ids[i] & 0xFFFF);
 
-                    auto drawFn = shader.Dispatch.DrawTriangle[tris.FragmentShaderId];
+                    auto drawFn = batch->Shader->DrawTriangle[tris.FragmentShaderId];
                     if (tris.ClipData != nullptr) [[unlikely]] {
-                        drawFn = shader.Dispatch.DrawClippedTriangle[tris.FragmentShaderId];
+                        drawFn = batch->Shader->DrawClippedTriangle[tris.FragmentShaderId];
                     }
-                    drawFn(shader.Context, tris, acceptMask, binRect, _viewHalfSize);
+                    drawFn(batch->ShaderCtx, tris, acceptMask, binRect, _viewHalfSize);
                 }
             }
         }
     }
 
     // Retire batches
-    for (uint32_t batchId : simd::BitIter(committedBatchMask)) {
-        _queue->Scoreboard[batchId].fetch_and(~workerCommitBit, std::memory_order::acq_rel);
+    for (uint32_t batchId : simd::BitIter(pendingBatchMask)) {
+        _queue->Scoreboard[batchId].fetch_and(~workerAssignmentBit, std::memory_order::acq_rel);
     }
 }
 
@@ -879,11 +901,11 @@ bool BinBatch::InsertBin(uint2 binPos, uint32_t packetIdx, v_mask mask) {
     uint32_t slot = Counts[binId]++;
 
     static_assert(simd::vec_width <= 16);
-    static_assert(MaxPacketsPerBin < UINT8_MAX);
+    static_assert(MaxPacketsPerBin <= UINT8_MAX);
     assert(slot < MaxPacketsPerBin);
 
     BinRefs[binId * MaxPacketsPerBin + slot] = (packetIdx << 16) | mask;
-    return slot < MaxPacketsPerBin;
+    return slot < MaxPacketsPerBin - 1;
 }
 
 void BinQueue::AllocBins(uint2 fbSize, uint32_t workerCount) {
@@ -896,17 +918,21 @@ void BinQueue::AllocBins(uint2 fbSize, uint32_t workerCount) {
     BinsPerFrame = uint16_t(newGridSize.x * newGridSize.y);
 
     NumWorkers = uint16_t(workerCount);
-    NumBatches = uint16_t(std::min(MaxBatches, workerCount * 5 / 2));
+    NumBatches = uint16_t(std::min((float)MaxBatches, workerCount * BatchesPerWorker));
 
     BinsPerRowRcp = ((1ull << 32) / BinGridSize.x) + 1;  // magic div coeff, good for up to 16 bits
 
     Batches.clear();
     Batches.reserve(NumBatches);
 
+    uint32_t batchSize = sizeof(BinBatch) + BinsPerFrame * MaxPacketsPerBin * sizeof(uint32_t);
+    batchSize = (batchSize + 63) & ~63u;
+    BatchMem = simd::alloc_buffer<uint8_t>(batchSize * NumBatches, 64);
+
     for (uint32_t i = 0; i < NumBatches; i++) {
-        BinBatch* batch = (BinBatch*)_mm_malloc(sizeof(BinBatch) + BinsPerFrame * MaxPacketsPerBin * sizeof(uint32_t), alignof(BinBatch));
+        BinBatch* batch = (BinBatch*)&BatchMem[i * batchSize];
         batch->GridStride = BinGridSize.x;
-        Batches.emplace_back(batch);
+        Batches.push_back(batch);
     }
 
     BinWorkPattern = 0;
@@ -927,7 +953,7 @@ void BinQueue::AllocBins(uint2 fbSize, uint32_t workerCount) {
     //     // uint32_t offset = (k * N) >> (32 - m);
     // }
 }
-bool BinQueue::ReserveBatch(uint32_t workerId, uint32_t* id) {
+bool BinQueue::ReserveBatch(uint32_t workerId, uint32_t* batchId) {
     uint64_t freeMask = 0;
 
     #pragma nounroll
@@ -941,8 +967,64 @@ bool BinQueue::ReserveBatch(uint32_t workerId, uint32_t* id) {
         uint64_t expected = 0;
 
         if (Scoreboard[i].compare_exchange_strong(expected, BatchScore_Reserved, std::memory_order::release)) {
-            *id = i;
-            memset(Batches[i]->Counts, 0, sizeof(BinBatch::Counts));
+            Batches[i]->Clear();
+            *batchId = i;
+            return true;
+        }
+    }
+    return false;
+}
+void BinQueue::CommitBatch(uint32_t batchId, const uint64_t* binStencilMask) {
+    BinBatch* batch = Batches[batchId];
+    uint64_t assignedWorkers = 0;
+    uint32_t binCount = 0;
+
+    for (uint32_t i = 0; i < BinsPerFrame; i += 64) {
+        auto counts = simd::load<uint8_t, 64>(&batch->Counts[i]);
+        uint64_t mask = simd::movemask(counts != 0);
+
+        if (binStencilMask != nullptr) mask &= binStencilMask[i / 64u];
+
+        batch->Bitmap[i / 64u] = mask;
+        binCount += simd::popcnt(mask);
+
+        for (uint32_t j = 0; j < NumWorkers; j++) {
+            if (mask & (BinWorkPattern << j)) assignedWorkers |= 1u << j;
+        }
+    }
+    SWR_PERF_INC(RastBinsDispatched, binCount);
+
+    Scoreboard[batchId].store(assignedWorkers, std::memory_order::acq_rel);
+}
+bool BinQueue::GetNextMeshRange(MeshFetchState* state) {
+    constexpr uint32_t avgMeshesPerBatch = MaxPacketsPerBatch * simd::vec_width / (ShadedMeshlet::MaxPrims * 0.3);
+
+    while (true) {
+        uint64_t cursor = MeshCursor.load(std::memory_order::acquire);
+        uint64_t newCursor = cursor;
+
+        uint32_t meshOffset = cursor >> 0 & 0xFFFFFF;
+        uint32_t meshCount = cursor >> 24 & 0xFFFFFF;
+        uint32_t drawIdx = cursor >> 48;
+
+        if (meshOffset >= meshCount) {
+            if (++drawIdx >= DrawCount) break;
+
+            meshOffset = 0;
+            meshCount = simd::load<uint32_t>(GetDrawDesc(drawIdx));
+
+            assert(meshCount <= 0xFFFFFF && drawIdx <= 0xFFFF);
+            newCursor = uint64_t(meshCount) << 24 | uint64_t(drawIdx) << 48;
+        }
+
+        uint32_t maxChunkSize = std::min(meshCount / NumWorkers + 4u, avgMeshesPerBatch);
+        uint32_t acquiredCount = std::min(meshCount - meshOffset, maxChunkSize);
+        newCursor += acquiredCount;
+        
+        if (MeshCursor.compare_exchange_weak(cursor, newCursor, std::memory_order::release)) {
+            state->NextMeshIdx = meshOffset;
+            state->LastMeshIdx = meshOffset + acquiredCount;
+            state->DrawIdx = drawIdx;
             return true;
         }
     }
@@ -1009,30 +1091,6 @@ void ThreadedRunner::WorkerFn(uint32_t workerId) {
         if (_numBusy.fetch_sub(1, std::memory_order::acq_rel) == 1) {
             _numBusy.notify_all();
         }
-    }
-}
-void Barrier::Wait() {
-    ZoneScoped;
-
-    uint64_t currToken = _token.fetch_sub(1, std::memory_order::acq_rel);
-    uint32_t prevGen = uint32_t(currToken >> 32);
-    uint32_t prevCount = uint32_t(currToken);
-
-    if (prevCount == 1) {
-        _token.fetch_add((1ull << 32) + _threadCount, std::memory_order::release);
-#if !SYNC_SPIN_ONLY
-        _token.notify_all();
-#endif
-    } else {
-        while ((currToken >> 32) == prevGen) {
-#if SYNC_SPIN_ONLY
-            _mm_pause();
-#else
-            _token.wait(currToken, std::memory_order::acquire);
-#endif
-            currToken = _token.load(std::memory_order::acquire);
-        }
-        assert((currToken >> 32) == (prevGen + 1));
     }
 }
 

@@ -120,10 +120,6 @@ struct ShaderDispatchTable {
     template<typename T, typename R, typename... Types>
     static std::remove_reference_t<T> GetContextType(R (*fn)(T, Types...));
 };
-struct ShaderBinding {
-    const ShaderDispatchTable& Dispatch;
-    void* Context;
-};
 
 struct Rasterizer {
     static constexpr uint32_t MaxRenderSize = 2896;  // Determined by integer overflow bound around edge equations. 2**(31/2 - 4)
@@ -131,7 +127,7 @@ struct Rasterizer {
     static constexpr uint32_t MaxBinGridSize = (MaxRenderSize + BinSize - 1) / BinSize;
 
     // Debug
-    bool EnableBinning = true;        // Use binned rasterizer (if disabled, may artifact due to thread racing)
+    bool EnableBinning = true;        // Use binned rasterizer (otherwise, racy syncless immediate mode which artifacts)
     bool EnableClipping = true;       // Enable non-trivial clipping
     bool EnableGuardband = true;      // Enable guardband clipping
     bool EnableBinIntersect = true;   // For large triangles, perform intersections with bins
@@ -151,18 +147,9 @@ struct Rasterizer {
         _viewHalfSize = size / 2u;
     }
 
-    void DrawMeshlets(uint32_t count, ShaderBinding shader);
-
     // Draw multiple instances of meshlets. `descriptors` is an array of per-instance shader context structs,
     // each starting with a `uint32_t` field specifying number of meshlets to be drawn.
-    void MultiDrawMeshlets(const ShaderDispatchTable& shader, uint32_t drawCount, void* descriptors, uint32_t descriptorStride) {
-        // TODO: remove old API and proper impl to avoid sync points
-        for (uint32_t i = 0; i < drawCount; i++) {
-            void* ctx = (uint8_t*)descriptors + i * descriptorStride;
-            uint32_t meshCount = *(uint32_t*)ctx;
-            DrawMeshlets(meshCount, { .Dispatch = shader, .Context = ctx });
-        }
-    }
+    void MultiDrawMeshlets(const ShaderDispatchTable& shader, uint32_t drawCount, void* descriptors, uint32_t descriptorStride);
 
     // Note: nodebug/noinline attributes are for improving readability in callstack/tracy.
 
@@ -340,13 +327,12 @@ private:
     uint2 _viewSize, _viewHalfSize;
     std::unique_ptr<struct BinQueue> _queue;
     std::unique_ptr<struct ThreadedRunner> _runner;
+    
+    void DrawMeshletST(uint32_t meshIdx, const ShaderDispatchTable& shader, void* shaderCtx);
 
-    void DrawMeshletsST(uint32_t count, ShaderBinding shader);
-
+    bool FillBatch(struct BinBatch* batch, struct MeshFetchState& state);
     bool DistributeToBins(struct BinBatch* batch, uint32_t packetIdx, v_mask acceptMask, v_uint triMinPos, v_uint triMaxPos);
-    void RasterizeBins(ShaderBinding shader, uint32_t workerId);
-
-    void WorkerFn(uint32_t workerId);
+    void RasterizeBins(uint32_t workerId);
 };
 
 template<auto MeshFn, auto... FragFn>

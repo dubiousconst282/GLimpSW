@@ -23,6 +23,7 @@ set(NFD_PORTAL ON)
 CPMAddPackage("gh:btzy/nativefiledialog-extended#v1.3.0")
 
 set(TRACY_ENABLE ON)
+set(TRACY_ON_DEMAND ON)
 CPMAddPackage("gh:wolfpld/tracy#v0.14.1")
 
 # Glad
