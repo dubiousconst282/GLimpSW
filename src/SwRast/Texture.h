@@ -265,16 +265,14 @@ inline v_float dFdy(v_float p) {
     return _mm512_sub_ps(b, a);
 }
 // Calculates mip-level using derivatives from scaled sample UVs (dxu, dxv, dyu, dyv).
-inline v_int CalcMipLevel(v_float4 grad) {
-    v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y);
-    v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w);
-    return simd::ilog2(simd::max(dx, dy)) >> 1;
-}
-inline v_int CalcMipLevel(v_float4 grad, v_float2 scale) {
+inline v_int CalcMipLevel(v_float4 grad, v_float2 scale = 1) {
+    // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#7.18.10%20Mipmap%20Selection
+    // https://pema.dev/2025/05/09/mipmaps-too-much-detail/
     grad *= v_float4(scale, scale);
     v_float dx = simd::fma(grad.x, grad.x, grad.y * grad.y);
     v_float dy = simd::fma(grad.z, grad.z, grad.w * grad.w);
-    return simd::ilog2(simd::max(dx, dy)) >> 1;
+    constexpr int expBias = -(127 << 23) + (1 << 22);             // ~ log2(max(dx, dy)) + 0.5
+    return (simd::as<v_int>(simd::max(dx, dy)) + expBias) >> 24;  // note log2(x) * 0.5 = log2(sqrt(x))
 }
 
 inline v_float2 MapOctahedron(v_float3 norm) {
@@ -335,7 +333,7 @@ struct Texture2D {
     void Clear(uint32_t color, uint32_t layer = 0, uint32_t mipLevel = 0) {
         // Non-temporal fill is ~2-3x faster than memset(), but makes rasterization a bit slower. Still a small win overall.
         // https://en.algorithmica.org/hpc/cpu-cache/bandwidth/
-        uint32_t* ptr = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        uint32_t* ptr = &Data[GetLayerOffset(layer, mipLevel)];
         uint32_t* end = &ptr[(Width >> mipLevel) * (Height >> mipLevel)];
 
         for (; ptr < end; ptr += 16) {
@@ -348,7 +346,7 @@ struct Texture2D {
         assert(offset.x + size.x <= (Width >> mipLevel));
         assert(offset.y + size.y <= (Height >> mipLevel));
 
-        uint32_t* dstLayer = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        uint32_t* dstLayer = &Data[GetLayerOffset(layer, mipLevel)];
 
         for (uint32_t y = 0; y < size.y; y += 4) {
             uint32_t* ptr = &dstLayer[GetTexelOffset(offset.x, offset.y + y, mipLevel)];
@@ -366,9 +364,7 @@ struct Texture2D {
 
     // Copy pixel array in linear layout to texture.
     void SetPixels(const void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) {
-        assert(layer < NumLayers && mipLevel < MipLevels);
-
-        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        uint32_t* dst = &Data[GetLayerOffset(layer, mipLevel)];
         const uint32_t* src = (const uint32_t*)pixels;
         uint32_t w = Width >> mipLevel, h = Height >> mipLevel;
 
@@ -388,9 +384,7 @@ struct Texture2D {
 
     // Copy texture data to pixel array in linear layout.
     void GetPixels(void* pixels, uint32_t stride, uint32_t layer = 0, uint32_t mipLevel = 0) const {
-        assert(layer < NumLayers && mipLevel < MipLevels);
-
-        const uint32_t* src = &Data[(layer * LayerStride) + MipOffsets[mipLevel]];
+        const uint32_t* src = &Data[GetLayerOffset(layer, mipLevel)];
         uint32_t* dest = (uint32_t*)pixels;
         uint32_t w = Width >> mipLevel, h = Height >> mipLevel;
 
@@ -446,9 +440,7 @@ struct Texture2D {
     void WriteTile(v_uint value, uint32_t x, uint32_t y, uint32_t layer = 0, uint32_t mipLevel = 0) {
         assert(x + 3 < Width && y + 3 < Height);
         assert(x % 4 == 0 && y % 4 == 0);
-        assert(layer < NumLayers && mipLevel < MipLevels);
-
-        uint32_t* dst = &Data[(layer * LayerStride) + MipOffsets[mipLevel] + GetTexelOffset(x, y, mipLevel)];
+        uint32_t* dst = &Data[GetLayerOffset(layer, mipLevel) + GetTexelOffset(x, y, mipLevel)];
 
         if constexpr (Layout_ == TextureLayout::Linear) {
             uint32_t stride = Width >> mipLevel;
@@ -481,27 +473,24 @@ struct Texture2D {
     }
 
     // Fetch raw texels from storage. All coordinates must be in-bounds.
-    [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int2 pos, v_int layer = 0, v_int mipLevel = 0, v_int laneMask = -1) const {
-        v_int offset = layer * (int)LayerStride;
-
-        if (simd::any(mipLevel > 0)) {
-            offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
-        }
-        return simd::gather(Data, offset + GetTexelOffset(pos.x, pos.y, mipLevel), laneMask);
+    [[gnu::pure, gnu::always_inline]] v_uint Fetch(v_int2 pos, v_int layer = 0, v_int mipLevel = 0, v_int v_exec = -1) const {
+        v_int offset = GetLayerOffset(layer, mipLevel);
+        offset += GetTexelOffset(pos.x, pos.y, mipLevel);
+        return simd::gather(Data, offset, v_exec);
     }
 
     // Sample with implicit derivatives.
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleImplicitLod(v_float2 pos, v_int layer = 0) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleImplicitLod(v_float2 pos, v_int layer = 0, v_int v_exec = -1) const {
         v_float su = pos.x * ScaleLerpU, sv = pos.y * ScaleLerpV;
 
         v_float4 grad = { texutil::dFdx(su), texutil::dFdx(sv), texutil::dFdy(su), texutil::dFdy(sv) };
         v_int mipLevel = texutil::CalcMipLevel(grad) - LerpFracBits;
-        return SampleLevel<SD>(pos, layer, mipLevel);
+        return SampleLevel<SD>(pos, layer, mipLevel, v_exec);
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLevel(v_float2 pos, v_int layer, v_int mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLevel(v_float2 pos, v_int layer, v_int mipLevel, v_int v_exec = -1) const {
         // Scale and round UVs 
         v_float su = pos.x * ScaleLerpU, sv = pos.y * ScaleLerpV;
         v_int ix = simd::round2i(su), iy = simd::round2i(sv);
@@ -530,16 +519,15 @@ struct Texture2D {
         mipLevel = simd::clamp(mipLevel, 0, maxLevel);
 
         // Calculate offsets and mip position
-        v_int offset = layer * (int)LayerStride;
-
+        v_int offset = GetLayerOffset(layer, mipLevel);
         ix >>= mipLevel, iy >>= mipLevel;
-        offset += _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
 
         // Sample
         if (filter == FilterMode::Linear) [[unlikely]] {
-            return SampleLinear(ix, iy, offset, mipLevel);
+            return SampleLinear(ix, iy, offset, mipLevel, v_exec);
         } else {
-            v_uint res = simd::gather(Data, offset + GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, mipLevel));
+            offset += GetTexelOffset(ix >> LerpFracBits, iy >> LerpFracBits, mipLevel);
+            v_uint res = simd::gather(Data, offset, v_exec);
 
             if constexpr (std::is_same<typename Format::LerpedTy, v_uint>()) {
                 return res;
@@ -550,16 +538,16 @@ struct Texture2D {
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctImplicitLod(const v_float3& dir) const {
-        return SampleImplicitLod<SD>(texutil::MapOctahedron(dir));
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctImplicitLod(const v_float3& dir, v_int v_exec = -1) const {
+        return SampleImplicitLod<SD>(texutil::MapOctahedron(dir), 0, v_exec);
     }
 
     template<SamplerDesc SD>
-    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctLevel(const v_float3& dir, v_float mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleOctLevel(const v_float3& dir, v_float mipLevel, v_int v_exec = -1) const {
         v_float2 uv = texutil::MapOctahedron(dir);
 
         v_int baseMip = simd::conv<int>(mipLevel);
-        auto baseSample = SampleLevel<SD>(uv, 0, baseMip);
+        auto baseSample = SampleLevel<SD>(uv, 0, baseMip, v_exec);
 
         v_float mipFrac = mipLevel - simd::conv<float>(baseMip);
         if (simd::any(mipFrac > 0.0f) && simd::any(baseMip < (int32_t)(MipLevels - 1))) {
@@ -606,40 +594,54 @@ struct Texture2D {
         return 0;
     }
 
+    v_int GetLayerOffset(v_int layer, v_int mipLevel) const {
+        assert(simd::all(layer < NumLayers && mipLevel < MipLevels));
+
+        [[assume(MipOffsets[0] == 0)]];
+        v_int mipOffset = _mm512_permutexvar_epi32(mipLevel, _mm512_load_epi32(MipOffsets));
+        return layer * (int)LayerStride + mipOffset;
+    }
+    uint32_t GetLayerOffset(uint32_t layer, uint32_t mipLevel) const {
+        assert(layer < NumLayers && mipLevel < MipLevels);
+
+        [[assume(MipOffsets[0] == 0)]];
+        return layer * LayerStride + MipOffsets[mipLevel];
+    }
+
 private:
 
     // Interpolates texels overlapping the specified pixel coords (in N.LerpFracBits fixed-point). No bounds check.
-    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLinear(v_int ixf, v_int iyf, v_int offset, v_int mipLevel) const {
+    [[gnu::pure, gnu::always_inline]] Format::LerpedTy SampleLinear(v_int ixf, v_int iyf, v_int offset, v_int mipLevel, v_int v_exec) const {
         ixf = simd::max(ixf - (LerpFracMask / 2), 0);
         iyf = simd::max(iyf - (LerpFracMask / 2), 0);
 
         v_int ix = ixf >> LerpFracBits;
         v_int iy = iyf >> LerpFracBits;
 
-        v_int inboundX = ((ix + 1) << mipLevel) < (int32_t)Width;
-        v_int inboundY = ((iy + 1) << mipLevel) < (int32_t)Height;
+        v_int inboundX = (ix + 1) < (int(Width) >> mipLevel);
+        v_int inboundY = (iy + 1) < (int(Height) >> mipLevel);
 
         v_uint data00, data10, data01, data11;
 
         if constexpr (Layout_ == TextureLayout::Linear) {
             v_int indices00 = offset + GetTexelOffset(ix, iy, mipLevel);
-            v_int indices01 = indices00 + (inboundY ? (int)Width : 0);
-            v_uint2 lo = simd::gather2(Data, indices00);
-            v_uint2 hi = simd::gather2(Data, indices01);
+            v_int indices01 = indices00 + (inboundY ? (Width >> mipLevel) : 0);
+            v_uint2 lo = simd::gather2(Data, indices00, v_exec);
+            v_uint2 hi = simd::gather2(Data, indices01, v_exec);
             data00 = lo.x, data10 = lo.y;
             data01 = hi.x, data11 = hi.y;
         } else if constexpr (Layout_ == TextureLayout::TiledY8) {
             v_int indices00 = offset + GetTexelOffset(ix, iy, mipLevel);
-            data00 = simd::gather(Data + 0, indices00);
-            data10 = simd::gather(Data + 8, indices00);
+            data00 = simd::gather(Data + 0, indices00, v_exec);
+            data10 = simd::gather(Data + 8, indices00, v_exec);
             v_int indices01 = offset + GetTexelOffset(ix, iy + (inboundY ? 1 : 0), mipLevel);
-            data01 = simd::gather(Data + 0, indices01);
-            data11 = simd::gather(Data + 8, indices01);
+            data01 = simd::gather(Data + 0, indices01, v_exec);
+            data11 = simd::gather(Data + 8, indices01, v_exec);
         } else {
-            data00 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 0, mipLevel));
-            data10 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 0, mipLevel));
-            data01 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 1, mipLevel));
-            data11 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 1, mipLevel));
+            data00 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 0, mipLevel), v_exec);
+            data10 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 0, mipLevel), v_exec);
+            data01 = simd::gather(Data, offset + GetTexelOffset(ix + 0, iy + 1, mipLevel), v_exec);
+            data11 = simd::gather(Data, offset + GetTexelOffset(ix + 1, iy + 1, mipLevel), v_exec);
         }
 
         if constexpr (std::is_same<Format, pixfmt::RGBA8u>()) {
@@ -682,7 +684,7 @@ private:
 
     void GenerateMip(uint32_t level, uint32_t layer) {
         uint32_t w = Width >> level, h = Height >> level;
-        uint32_t* srcData = &Data[(layer * LayerStride) + MipOffsets[level - 1]];
+        uint32_t* srcData = &Data[GetLayerOffset(layer, level - 1)];
         int parentLevel = (int)(level - 1);
 
         for (uint32_t y = 0; y < h; y += 4) {
@@ -749,8 +751,8 @@ inline TexturePtr2D<F, L> CreateTexture2D(uint32_t width, uint32_t height, uint3
 }
 
 template<pixfmt::TexelFormat F>
-inline TexturePtr2D<F, TextureLayout::TiledX4> CreateFramebuffer(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
-    return CreateTexture<Texture2D<F, TextureLayout::TiledX4>>(width, height, maxLevels, numLayers);
+inline FramebufferPtr<F> CreateFramebuffer(uint32_t width, uint32_t height, uint32_t maxLevels = 1, uint32_t numLayers = 1) {
+    return CreateTexture<Framebuffer<F>>(width, height, maxLevels, numLayers);
 }
 
 };  // namespace swr

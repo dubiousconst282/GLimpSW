@@ -2,10 +2,17 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 
-constexpr swr::SamplerDesc SurfaceSampler = {
+// Sampling lower mips with nearest gives better perf. The aliasing introduced is
+// quite noticeable on normal/rough/metalness maps, but not so much on color data.
+constexpr swr::SamplerDesc ColorSampler = {
     .Wrap = swr::WrapMode::Repeat,
     .MagFilter = swr::FilterMode::Linear,
-    .MinFilter = swr::FilterMode::Nearest,  // Downsample with nearest for better perf, quality loss is quite subtle.
+    .MinFilter = swr::FilterMode::Nearest,
+};
+constexpr swr::SamplerDesc AttribSampler = {
+    .Wrap = swr::WrapMode::Repeat,
+    .MagFilter = swr::FilterMode::Linear,
+    .MinFilter = swr::FilterMode::Linear,
 };
 constexpr swr::SamplerDesc EnvSampler = {
     .Wrap = swr::WrapMode::ClampToEdge,
@@ -71,7 +78,7 @@ static void FS_EncodeSurfaceId(const DrawContext& ctx, swr::FragmentVars& vars) 
         v_float2 uv1 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[1]].x);
         v_float2 uv2 = UnpackHalf2x16(mesh.Attribs[vars.VertexId[2]].x);
         v_float2 uv = vars.Interpolate(uv0, uv1, uv2);
-        v_uint color = material.Texture->SampleImplicitLod<SurfaceSampler>(uv);
+        v_uint color = material.Texture->SampleImplicitLod<ColorSampler>(uv, 0, simd::unmovemask(vars.TileMask));
 
         vars.TileMask &= simd::movemask(color >= uint32_t(material.AlphaCutoff << 24));
     }
@@ -221,13 +228,12 @@ static SurfaceAttribs ResolveSurface(const ShadingContext& ctx, v_uint surfaceId
     v_uint packedNMR = 0xFF00'8080; // 100% roughness, norm(0,0,+1)
 
     simd_foreach_unique_lane(i, materialId, materialId != UINT_MAX) {
-        // TODO: should probably add access mask to texture sampling, since UVs might vary wildly across different tris/lanes
         const swr::RgbaTexture2D& tex = *ctx.Materials[i].Texture;
         v_int mipLevel = swr::texutil::CalcMipLevel(texGrad, v_float2(tex.ScaleU, tex.ScaleV));
-        simd::cmov(packedAlbedo, tex.SampleLevel<SurfaceSampler>(texCoord, 0, mipLevel), v_exec);
+        simd::cmov(packedAlbedo, tex.SampleLevel<ColorSampler>(texCoord, 0, mipLevel, v_exec), v_exec);
 
         if (tex.NumLayers >= 2) {
-            simd::cmov(packedNMR, tex.SampleLevel<SurfaceSampler>(texCoord, 1, mipLevel), v_exec);
+            simd::cmov(packedNMR, tex.SampleLevel<AttribSampler>(texCoord, 1, mipLevel, v_exec), v_exec);
         }
     }
 
