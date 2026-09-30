@@ -58,11 +58,11 @@ struct RendererSettings {
 };
 YSON_SERIALIZER_STRUCT_INLINE(ModelDesc, Path, Transform);
 YSON_SERIALIZER_STRUCT_INLINE(Camera, Position, Euler, MoveSpeed);
-YSON_SERIALIZER_STRUCT_INLINE(RendererSettings, OcclusionCulling,               //
-                              EnableDDGI, DrawProbes,                           //
-                              EnableShadows, DebugShadows, DisableShadowCache,  //
+YSON_SERIALIZER_STRUCT_INLINE(RendererSettings, OcclusionCulling,  //
+                              EnableDDGI, DrawProbes,              //
+                              EnableShadows, DebugShadows,         //
                               ShadowCascadeResolution, ShadowCascadeCount, SunDirection,
-                              DebugView,                                                                 //
+                              DebugView,                                                                   //
                               ExposureValue, ExposureRange, SunIntensity, AmbientFactor, SkyboxIntensity,  //
                               OpenCollapsingHeaders);
 
@@ -271,7 +271,7 @@ void DrawCallBuilder::AddModel(Model& model, DrawContext& templateDraw) {
             SWR_PERF_END(Culling);
 
             if (visibleCount == 0) continue;
-                
+
             DrawContext& draw = DrawCalls.emplace_back(templateDraw);
             draw.NumMeshlets = meshCount;
             draw.InstanceId = Instances.size();
@@ -293,8 +293,10 @@ void DrawCallBuilder::AddModel(Model& model, DrawContext& templateDraw) {
 bool CollapsingHeaderWithSavedState(const char* label, bool defaultState) {
     auto [savedState, firstTime] = _settings.OpenCollapsingHeaders.emplace(ImGui::GetID(label), false);
 
-    ImGui::SetNextItemOpen(firstTime ? defaultState : savedState->second, ImGuiCond_Once);
-    return savedState->second = ImGui::CollapsingHeader(label);
+    ImGui::SetNextItemOpen(firstTime ? defaultState : savedState->second, ImGuiCond_Appearing);
+    bool open = ImGui::CollapsingHeader(label);
+    if (!ImGui::IsWindowCollapsed()) savedState->second = open;
+    return open;
 }
 
 void RenderShadowMap();
@@ -548,10 +550,16 @@ void RenderFrame() {
         }
 
         _shadowMap->SetPosition(pinShadowPos ? pinnedShadowPos : float3(_cam.ViewPosition), sunLight->Direction);
+
         if (_settings.DisableShadowCache) _shadowMap->InvalidateAllPages();
 
-        _shadowMap->MarkVisiblePages(*_rast, *_hierDepth, uint2(_colorFb->Width, _colorFb->Height), camProjViewMat);
-        _shadowMap->UpdateHierPageBitmap();
+        if (!_settings.EnableDDGI) {
+            _shadowMap->MarkVisiblePages(*_rast, *_hierDepth, uint2(_colorFb->Width, _colorFb->Height), camProjViewMat);
+        } else {
+            _shadowMap->MarkAllPagesVisible();
+        }
+
+        _shadowMap->UpdateDirtyBitmap();
 
         RenderShadowMap();
 

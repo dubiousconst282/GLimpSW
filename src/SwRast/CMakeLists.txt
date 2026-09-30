@@ -3,7 +3,7 @@ add_library(SwRast STATIC
     ImageHelpers.cpp
     Scene.cpp
 )
-target_compile_options(SwRast PUBLIC "-march=native" "-mprefer-vector-width=512" "-ffast-math" "-Wno-unused" "-Wsign-conversion")
+target_compile_options(SwRast PUBLIC "-march=native" "-mprefer-vector-width=512" "-ffast-math" "-Wno-unused" "-Wsign-conversion" "-fno-stack-protector")
 target_compile_definitions(SwRast PUBLIC GLM_FORCE_XYZW_ONLY GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_link_libraries(SwRast PUBLIC
     glm::glm

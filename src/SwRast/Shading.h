@@ -157,14 +157,16 @@ struct ShadowClipmap {
     v_float SampleOne(v_float3 worldPos);
 
     void SetPosition(float3 viewPos, float3 lightDir);
-    void InvalidateAllPages() { memset(InvalidPageMap, 255, sizeof(InvalidPageMap)); }
-
     float4x4 GetWorldToCascadeMatrix(uint32_t level);
 
     // Mark visible pages using frame's Hi-Z buffer.
     void MarkVisiblePages(swr::Rasterizer& raster, swr::Texture2D<swr::pixfmt::R32f>& screenHiz, uint2 frameSize,
                           const float4x4& worldToClipMat);
-    void UpdateHierPageBitmap();
+
+    void InvalidateAllPages();
+    void MarkAllPagesVisible();
+
+    void UpdateDirtyBitmap();
 
     constexpr uint32_t GetHierBitmapOffset(uint32_t level) {
         uint32_t offset = 0;

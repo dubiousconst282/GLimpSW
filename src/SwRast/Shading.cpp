@@ -388,6 +388,7 @@ v_float3 EvalLighting(const ShadingContext& ctx, const SurfaceAttribs& surf, v_f
 }
 
 // TODO: Store border data for proper octahedron filtering
+[[clang::always_inline]]
 static v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 15;
 
@@ -419,6 +420,7 @@ static v_float2 SampleProbeDepth(GIProbeField& field, v_int probeIdx, v_float3 d
 
     return A + (B - A) * simd::fract(oct.y);
 }
+[[clang::always_inline]]
 static v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_float3 dir) {
     v_float2 oct = swr::texutil::MapOctahedron(dir) * 7;
 
@@ -450,8 +452,6 @@ static v_float3 SampleProbeIrradiance(GIProbeField& field, v_int probeIdx, v_flo
     v_float3 B = v01 + (v11 - v01) * simd::fract(oct.x);
     return A + (B - A) * simd::fract(oct.y);
 }
-
-[[clang::always_inline]]
 static v_float3 SampleDiffuse(GIProbeField& field, v_float3 surfacePos, v_float3 surfaceNormal, v_float3 viewDir) {
     v_float3 biasedSurfacePos = surfacePos + (surfaceNormal + viewDir * 3) * field.NormalBias;
 
@@ -1079,17 +1079,13 @@ uint32_t MeshletCuller::CullMeshlets(uint32_t* bitmap, const Meshlet* meshlets, 
             v_float boundRadiusVS = boundRadius * objectToWorldScale;
             v_float4 screenBB = v_float4(boundCenterVS - boundRadiusVS, boundCenterVS + boundRadiusVS) * 0.5 + 0.5;
 
-            // v_int mipLevel = simd::ilog2(boundRadiusVS * gridSize);
-            // mipLevel = simd::clamp(mipLevel, 0, ShadowClipmap::MaxHierPageMapLevels - 1);
-            v_int mipLevel = 0; // TODO: fix mips
+            v_int x0 = simd::max(simd::conv<int>(screenBB.x * gridSize), 0);
+            v_int y0 = simd::max(simd::conv<int>(screenBB.y * gridSize), 0);
+            v_int x1 = simd::min(simd::conv<int>(screenBB.z * gridSize), gridSize - 1);
+            v_int y1 = simd::min(simd::conv<int>(screenBB.w * gridSize), gridSize - 1);
 
-            v_int x0 = simd::max(simd::conv<int>(screenBB.x * gridSize), 0) >> mipLevel;
-            v_int y0 = simd::max(simd::conv<int>(screenBB.y * gridSize), 0) >> mipLevel;
-            v_int x1 = simd::min(simd::conv<int>(screenBB.z * gridSize), gridSize - 1) >> mipLevel;
-            v_int y1 = simd::min(simd::conv<int>(screenBB.w * gridSize), gridSize - 1) >> mipLevel;
-
-            // [...a..b.]  (case 1, continuous)
-            // [..b..a..]  (case 2, wrap)
+            // [..a---b.]  (case 1, continuous)
+            // [-b...a--]  (case 2, wrap)
             v_int pageX0 = (x0 - pageWrapOffset.x) & pageWrapMask;
             v_int pageX1 = (x1 - pageWrapOffset.x) & pageWrapMask;
             v_int rowMask = (~0 << pageX0) ^ (~1 << pageX1) ^ (pageX0 > pageX1 ? ~0 : 0);
@@ -1342,12 +1338,27 @@ void ShadowClipmap::MarkVisiblePages(swr::Rasterizer& raster, swr::Texture2D<swr
     });
 }
 
+void ShadowClipmap::InvalidateAllPages() { memset(InvalidPageMap, 255, sizeof(InvalidPageMap)); }
+void ShadowClipmap::MarkAllPagesVisible() {
+    memset(VisiblePageMap, 0, sizeof(VisiblePageMap));
+
+    // TODO: avoid marking pages that overlap lower cascades
+    int pageGridSize = DepthBuffer->Width / ShadowClipmap::PageSize;
+    uint32_t rowMask = uint32_t((1ull << pageGridSize) - 1);
+
+    for (uint32_t level = 0; level < DepthBuffer->NumLayers; level++) {
+        for (uint32_t y = 0; y < pageGridSize; y++) {
+            VisiblePageMap[level][y] = rowMask;
+        }
+    }
+}
+
 static uint32_t HpbReduceOr(uint64_t a, uint64_t b) {
     a |= (a >> 1);
     b |= (b >> 1);
     return _pext_u64(a | b, 0x5555'5555'5555'5555ull);
 }
-void ShadowClipmap::UpdateHierPageBitmap() {
+void ShadowClipmap::UpdateDirtyBitmap() {
     for (uint32_t level = 0; level < DepthBuffer->NumLayers; level++) {
         static_assert(MaxPageGridSize <= 64);
 
@@ -1524,6 +1535,10 @@ void ShadingContext::UpdateProbes(swr::Rasterizer& raster) {
                     v_float3 irradiance = 0;
                     if (ProbeField->MultiBounce) {
                         irradiance = SampleDiffuse(*ProbeField, worldPos, surf.Normal, rayDir);
+                    } else if (AmbientIntensity > 0) {
+                        // ambient hack
+                        v_float NdotL = simd::dot(surf.Normal, -Lights[0].Direction) * 0.5 + 0.5;
+                        irradiance = AmbientIntensity * (NdotL * NdotL + 0.2);
                     }
                     v_float shadowMask = ShadowMap ? ShadowMap->SampleOne(worldPos) : 1.0f;
                     simd::cmov(radiance, EvalLighting(*this, surf, worldPos, irradiance, shadowMask), v_exec);
