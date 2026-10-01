@@ -4,28 +4,19 @@ High performance AVX512 software rasterizer
 ---
 
 <div>
-  <img width="49%" src="./docs/images/show_new_sponza.jpg" />
-  <img width="49%" src="./docs/images/show_new_bistro.jpg" />
+  <img width="49%" src="./docs/images/show_sponza.avif" />
+  <img width="49%" src="./docs/images/show_bistro.avif" />
+  <img width="49%" src="./docs/images/show_intel_sponza2.avif" />
+  <img width="49%" src="./docs/images/show_intel_sponza1.avif" />
 </div>
 
 _Sample screenshots, rendered at 1080p on a 4 core TigerLake CPU, running at 2.8-3.2GHz_
-
-
-<div>
-  <img src="./docs/images/show_old_sponza.jpg" width="49%" alt="Crytek Sponza">
-  <img src="./docs/images/show_old_helmet.jpg" width="49%" alt="Damaged Helmet">
-  <img src="./docs/images/show_old_pinnace.jpg" width="49%" alt="Polyhaven Ship Pinnace">
-  <img src="./docs/images/show_old_bistro.jpg" width="49%" alt="Amazon Bistro">
-</div>
-
-_Sample screenshots from the [previous version](https://github.com/dubiousconst282/GLimpSW/tree/old-deferred), same config, +TAA, +SSAO, +IBL_
-
 
 ## Implementation Notes
 Some things I have and haven't tried.
 
 ### Raster Pipeline
-Prior the rewrite, the raster pipeline was based around the traditional vertex shader model and was rather poorly optimized. All single-threaded except for bin rasterization and full-screen passes.
+[Prior the rewrite](https://github.com/dubiousconst282/GLimpSW/tree/old-deferred), the raster pipeline was based around the traditional vertex shader model and was rather poorly optimized. All single-threaded except for bin rasterization and full-screen passes.
 
 One major source of inefficiency was in the lack of shaded vertex reuse based on the index buffer, since finding and referencing duplicates in an efficient way did not seem feasible without fast conflict and gather instructions, therefore the vertex shader would always be invoked three times per triangle. Vertex shading in by itself was also rather expansive because it would spend a lot of time gathering and copying custom attributes, most of which would be immediately thrown away after clipping and culling (typically at least half of all triangles are culled in this early step).
 
@@ -98,8 +89,8 @@ The rest of the pipeline is pretty traditional, with a few details I find intere
 ### DDGI with Voxels
 
 <div align="center"> 
-  <img width="49%" src="./docs/images/ddgi_on.jpg" />
-  <img width="49%" src="./docs/images/ddgi_off.jpg" />
+  <img width="49%" src="./docs/images/ddgi_on.avif" />
+  <img width="49%" src="./docs/images/ddgi_off.avif" />
 </div>
 
 I wanted to try implement probe-based GI using ray tracing. For that, I decided to use a voxelized representation of the scene, both because past experience and because they are much faster to trace than standard triangle BVHs. Godot actually does the same for SDFGI/HDDAGI, and the results seemed reasonable.
@@ -142,14 +133,14 @@ Tinybvh's AVX2 traversal had a throughput of ~7.7M camera and ~17.3M anyhit rays
 
 The new voxel tracer runs at around 25-30M camera rays/sec, though probe rays are much slower at 6-7M/sec due to divergence (where a few rays take much longer to finish). I haven't spent much time trying things apart from the obvious premature micro-opts, but that's still somewhat workable. Updating 2048 probes with 64 rays each takes ~6ms on 4 threads, with 20% being spent on convolution.
 
-It uses a compressed brickmap structure which is essentially a sparse contree/64-tree, but with only 3 levels and a flat top-level grid. This removes the need of a stack and long-latency chain of gathers during traversal, is easier to work with, and also more compact, since it can avoid/use smaller leaf node pointers.
+It uses a compressed brickmap structure similar to a contree/64-tree, but with only 3 levels and a flat top-level grid. This removes the need of a stack and long-latency chain of gathers during traversal, is easier to work with, and also more compact, since it can avoid/use smaller leaf node pointers.
 
 The naive SIMT-style packet traversal was up to 8x faster than scalar in early tests, though this model is typically suboptimal in the case of BVHs, as they are far more divergent-ey and memory intensive, whereas voxel occupancy is reasonably compact.
 
-### Virtual Shadow Maps (at home)
+### Virtual Shadow Maps
 
 <div align="center">
-  <img src="./docs/images/vsm_debug.jpg" width="50%">
+  <img src="./docs/images/vsm_debug.avif" width="50%">
 </div>
 
 While traditional Cascaded Shadow Maps can provide reasonable quality and performance on GPUs, rendering the scene several times per frame is a huge expanse given our bandwidth constraints. Worse is that there seems to be no good way to cache them without sacrificing resolution and having to eventually invalidate and redraw them entirely.
@@ -221,8 +212,8 @@ On a GPU implementation, such a fragment shader needs to bypass the usual frameb
 Page culling can be optimized by querying mipmaps of the bitmap (generated with OR-reduction) depending on the projected bound rect size, similarly to Hi-Z occlusion culling. In practice, I found that looping over the full bitmap, checking rows by ANDing with a span-mask and early bail is also acceptably fast.
 
 ```cpp
-// [...a..b.]  (case 1, continuous)
-// [..b..a..]  (case 2, wrap)
+// [..a---b.]  (case 1, continuous)
+// [-b...a--]  (case 2, wrap)
 v_int pageX0 = (x0 - pageWrapOffset.x) & pageWrapMask;
 v_int pageX1 = (x1 - pageWrapOffset.x) & pageWrapMask;
 v_int rowMask = (~0 << pageX0) ^ (~1 << pageX1) ^ (pageX0 > pageX1 ? ~0 : 0);
@@ -282,7 +273,7 @@ void IntersectTriangle(float4 v0, float4 v1, float4 v2, float2 screenNdc, float2
 
 #### Triangle Attrib Cache
 
-<img width="32%" src="./docs/images/visbuf_rle_debug.png" align="right">
+<img width="40%" src="./docs/images/visbuf_rle_debug.png" align="right">
 
 As a way to reduce the number of vertex fetches and transforms, I tried to implement triangle caching using a simple RLE compression scheme based on the compress/expand instructions.
 
@@ -351,8 +342,8 @@ As noted in [CudaRast11](https://research.nvidia.com/publication/2011-08_high-pe
 They also incur less predictable branches (and lower ipc due to bad spec? and/or maybe fewer oooe opportunities) in traversal due to varying sizes and alignment, though the overall impact seems to be relatively small (~9% mispreds). It's not obvious how this could be avoided efficiently, perhaps short of dispatching specialized/unrolled rasterizers based on triangle sizes (similar to [CuRast26](https://github.com/m-schuetz/CuRast)). Hierarchical traversal might be less susceptible to mispreds, ignoring setup overhead, since traversal can simply loop over set bits in the tile coverage mask.
 
 <div align="center">
-  <img width="30%" src="./docs/images/rast_perf_bistro_annotated.png"/>
-  <img width="30%" src="./docs/images/rast_perf_largequad.png"/>
+  <img width="35%" src="./docs/images/rast_perf_bistro_annotated.png"/>
+  <img width="35%" src="./docs/images/rast_perf_largequad.png"/>
   
 _Disassembly and Tracy profile for Bistro, vs. uniform grid of quads (~340x340 pixels across)_
 </div>
